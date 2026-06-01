@@ -54,6 +54,31 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Pool", meta=(ClampMin=0))
 	int32 PoolSize = 20;
 
+	// Inner radius: entities here get pool slots before any outer-ring entities.
+	// Overflow (unpromoted) entities within this radius also receive a steering force toward the player.
+	// Must be strictly less than PromoteRadius.
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Pool", meta=(ClampMin=100.f, ForceUnits="cm"))
+	float MustPromoteRadius = 800.f;
+
+	// Walk speed applied to unpromoted (ISM) entities within MustPromoteRadius as a steering force.
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Pool", meta=(ClampMin=0.f, ForceUnits="cm/s"))
+	float HordeWalkSpeed = 120.f;
+
+	// Distance at which a horde entity is promoted to a full actor (server only).
+	// Must be strictly less than DemoteRadius — the gap between them is the hysteresis band.
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Pool", meta=(ClampMin=100.f, ForceUnits="cm"))
+	float PromoteRadius = 2500.f;
+
+	// Distance at which a promoted actor is demoted back to the horde.
+	// Must be strictly greater than PromoteRadius.
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Pool", meta=(ClampMin=100.f, ForceUnits="cm"))
+	float DemoteRadius = 4000.f;
+
+	// Minimum seconds an entity must spend in its current tier before a tier transition is allowed.
+	// Prevents flip-flop when a player lingers near the boundary.
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Pool", meta=(ClampMin=0.f))
+	float MinTimeInTierSeconds = 1.5f;
+
 	// Blueprint subclass of AATR_EchoManager. Leave empty to use the base C++ class.
 	// Assign your BP here to get designer-configured ISM meshes.
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Pool")

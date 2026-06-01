@@ -39,12 +39,30 @@ public:
 	// --- State ---
 
 	// SoA row this Actor was promoted from. INDEX_NONE when pooled.
+	// Replicated so clients can register in their local IndexToActor and suppress ISM.
+	UPROPERTY(ReplicatedUsing = OnRep_SourceIndex)
 	int32 SourceIndex = INDEX_NONE;
 
 	// Local cache of Sub->AnimState[SourceIndex]. Flushed to SoA on demotion.
 	// Drive your AnimBlueprint from this.
-	UPROPERTY(BlueprintReadOnly, Category = "Echo")
+	UPROPERTY(ReplicatedUsing = OnRep_AnimStateCache, BlueprintReadOnly, Category = "Echo")
 	uint8 AnimStateCache = 0;
+
+	// Set true by StateTree tasks that must not be interrupted (e.g., grab, death sequence).
+	// RunPromotionPass skips demotion while this is true.
+	// StateTree is responsible for clearing it in ExitState; EnterPool resets it as a safety net.
+	UPROPERTY(BlueprintReadWrite, Category = "Echo")
+	bool bBlockDemotion = false;
+
+	// --- Mesh Transform Offsets ---
+	// Set in Blueprint class defaults to correct pivot and facing mismatches between
+	// the ISM representation and the skeletal mesh. Applied once in BeginPlay.
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Echo|Mesh")
+	FVector MeshLocationOffset = FVector::ZeroVector;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Echo|Mesh")
+	FRotator MeshRotationOffset = FRotator::ZeroRotator;
 
 	// --- Lifecycle ---
 
@@ -60,8 +78,16 @@ public:
 	// Called by UATR_EchoSubsystem::DemoteEcho before returning to pool.
 	void WriteBackToSoA(UATR_EchoSubsystem* Sub) const;
 
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
 protected:
 	virtual void BeginPlay() override;
+
+	// Previous SourceIndex on this machine — lets OnRep unregister the old slot before registering the new one.
+	int32 ClientPrevSourceIndex = INDEX_NONE;
+
+	UFUNCTION() void OnRep_SourceIndex();
+	UFUNCTION() void OnRep_AnimStateCache();
 
 public:
 	virtual void Tick(float DeltaTime) override;

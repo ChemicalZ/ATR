@@ -107,12 +107,19 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 	// Pre-allocate SoA to full capacity — never resized again.
 	// No UPROPERTY means GC never touches these; safe for worker threads.
+	MustPromoteRadius    = Settings->MustPromoteRadius;
+	HordeWalkSpeed       = Settings->HordeWalkSpeed;
+	PromoteRadius        = Settings->PromoteRadius;
+	DemoteRadius         = Settings->DemoteRadius;
+	MinTimeInTierSeconds = Settings->MinTimeInTierSeconds;
+
 	Forces.SetNumZeroed(InitializeCount);
 	Accelerations.SetNumZeroed(InitializeCount);
 	Velocities.SetNumZeroed(InitializeCount);
 	Positions.SetNumZeroed(InitializeCount);
 	AnimState.SetNumZeroed(InitializeCount);
 	AnimFrame.SetNumZeroed(InitializeCount);
+	PromotionTimes.SetNumZeroed(InitializeCount);
 	IndexToActor.SetNumZeroed(InitializeCount); // all nullptr
 
 	bInitialized = true;
@@ -174,31 +181,33 @@ void UATR_EchoSubsystem::Tick(float DeltaTime)
 
 	const ENetMode NetMode = GetWorld()->GetNetMode();
 
-	// Authoritative sim runs on server and standalone only.
-	// Clients will extrapolate/receive state (Phase 3).
+	// Grid first — steering pass, promotion pass, and ISM all need it.
+	// Clients rebuild from received snapshot positions; server from authoritative SoA.
+	if (ActiveEntities > 0)
+		RebuildGrid();
+
 	if (NetMode != NM_Client && ActiveEntities > 0)
 	{
+		// Steering writes horde velocities before SimTick integrates them.
+		RunSteeringPass();
+
 		TickAccumulator += DeltaTime;
 		const float SimInterval = 1.f / static_cast<float>(FMath::Max(1, SimHz));
-
 		while (TickAccumulator >= SimInterval)
 		{
 			SimTick(SimInterval);
 			TickAccumulator -= SimInterval;
 		}
-	}
 
-	// Grid rebuilt every frame — clients rebuild from received positions.
-	if (ActiveEntities > 0)
-		RebuildGrid();
+		// Promotion pass after integration — IndexToActor is stable for UpdateISM.
+		RunPromotionPass();
+	}
 
 	if (Manager)
 	{
-		// ISM rendered on everything except dedicated server (no GPU there)
 		if (NetMode != NM_DedicatedServer)
 			Manager->UpdateISM(this);
 
-		// Snapshot packing + multicast: server and listen-server only
 		if (NetMode != NM_Client)
 			Manager->ServerTick(this, DeltaTime);
 	}
@@ -240,9 +249,10 @@ int32 UATR_EchoSubsystem::AddEcho(FVector3f Position)
 	Velocities[Idx]    = FVector3f::ZeroVector;
 	Accelerations[Idx] = FVector3f::ZeroVector;
 	Forces[Idx]        = FVector3f::ZeroVector;
-	AnimState[Idx]     = 0;
-	AnimFrame[Idx]     = 0;
-	IndexToActor[Idx]  = nullptr;
+	AnimState[Idx]      = 0;
+	AnimFrame[Idx]      = 0;
+	PromotionTimes[Idx] = 0.f;
+	IndexToActor[Idx]   = nullptr;
 	return Idx;
 }
 
@@ -263,8 +273,9 @@ void UATR_EchoSubsystem::RemoveEcho(int32 Index)
 		Velocities[Index]    = Velocities[Last];
 		Accelerations[Index] = Accelerations[Last];
 		Forces[Index]        = Forces[Last];
-		AnimState[Index]     = AnimState[Last];
-		AnimFrame[Index]     = AnimFrame[Last];
+		AnimState[Index]      = AnimState[Last];
+		AnimFrame[Index]      = AnimFrame[Last];
+		PromotionTimes[Index] = PromotionTimes[Last];
 
 		// Patch the moved entity's Actor so it knows its new slot
 		if (IndexToActor[Last])
@@ -281,8 +292,9 @@ void UATR_EchoSubsystem::PromoteToActive(int32 SoAIndex, AATR_ActiveEcho* Actor)
 	if (!ensureAlways(Actor && SoAIndex >= 0 && SoAIndex < ActiveEntities)) return;
 	if (!ensureAlways(!IndexToActor[SoAIndex])) return; // double-promote guard
 
-	IndexToActor[SoAIndex] = Actor;
-	Actor->SourceIndex     = SoAIndex;
+	IndexToActor[SoAIndex]    = Actor;
+	Actor->SourceIndex         = SoAIndex;
+	PromotionTimes[SoAIndex]  = GetWorld()->GetTimeSeconds();
 }
 
 void UATR_EchoSubsystem::DemoteToHorde(AATR_ActiveEcho* Actor)
@@ -293,8 +305,9 @@ void UATR_EchoSubsystem::DemoteToHorde(AATR_ActiveEcho* Actor)
 	if (!ensureAlways(Idx >= 0 && Idx < ActiveEntities)) return;
 
 	Actor->WriteBackToSoA(this);  // flush Actor state → SoA before severing link
-	IndexToActor[Idx]  = nullptr;
-	Actor->SourceIndex = INDEX_NONE;
+	IndexToActor[Idx]   = nullptr;
+	PromotionTimes[Idx] = 0.f;
+	Actor->SourceIndex  = INDEX_NONE;
 }
 
 AATR_ActiveEcho* UATR_EchoSubsystem::PromoteEcho(int32 SoAIndex)
@@ -321,4 +334,140 @@ void UATR_EchoSubsystem::DemoteEcho(AATR_ActiveEcho* Actor)
 	DemoteToHorde(Actor);  // WriteBackToSoA + clear IndexToActor + SourceIndex = INDEX_NONE
 	Actor->EnterPool();    // hide, disable collision, stop AI and StateTree
 	EchoPool.Add(Actor);
+}
+
+// ─── RunPromotionPass ─────────────────────────────────────────────────────────
+
+void UATR_EchoSubsystem::RunPromotionPass()
+{
+	// Server-authoritative — clients never promote/demote locally.
+	if (GetWorld()->GetNetMode() == NM_Client) return;
+	if (ActiveEntities == 0) return;
+
+	const float Now       = GetWorld()->GetTimeSeconds();
+	const float DemRadSq  = DemoteRadius * DemoteRadius;
+
+	// ── Promote ──────────────────────────────────────────────────────────────
+	// Use the spatial grid (rebuilt this frame) to find candidates near each player.
+	// Cost: O(grid_cells_in_PromoteRadius × Players) — far cheaper than O(ActiveEntities).
+
+	TArray<int32> Candidates;
+	Candidates.Reserve(64);
+
+	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+	{
+		APlayerController* PC = It->Get();
+		if (!PC || !PC->GetPawn()) continue;
+
+		const FVector3f PP = FVector3f(PC->GetPawn()->GetActorLocation());
+		Candidates.Reset();
+		SpatialGrid.QueryRadius(PP, PromoteRadius,
+			TArrayView<const FVector3f>(Positions.GetData(), ActiveEntities),
+			Candidates);
+
+		// Closest entities first — inner-ring (MustPromoteRadius) entities sort to top
+		// naturally and consume pool slots before outer-ring ones.
+		Candidates.Sort([&PP, this](int32 A, int32 B)
+		{
+			const FVector3f DA = Positions[A] - PP;
+			const FVector3f DB = Positions[B] - PP;
+			return (DA.X*DA.X + DA.Y*DA.Y) < (DB.X*DB.X + DB.Y*DB.Y);
+		});
+
+		for (const int32 i : Candidates)
+		{
+			if (IndexToActor[i]) continue;   // already promoted
+			if (EchoPool.IsEmpty()) break;    // pool exhausted — no more this frame
+			PromoteEcho(i);                   // stamps PromotionTimes[i] inside PromoteToActive
+		}
+	}
+
+	// ── Demote ───────────────────────────────────────────────────────────────
+	// Scan all slots — inner work only executes for promoted entities (≤ PoolSize).
+	// Effective cost: O(PoolSize × Players).
+
+	for (int32 i = 0; i < ActiveEntities; ++i)
+	{
+		AATR_ActiveEcho* Actor = IndexToActor[i];
+		if (!Actor) continue;
+
+		// Hysteresis: demotion only after MinTimeInTierSeconds has elapsed
+		if ((Now - PromotionTimes[i]) < MinTimeInTierSeconds) continue;
+
+		// StateTree interruptibility guard
+		if (Actor->bBlockDemotion) continue;
+
+		// Demotion requires entity to be beyond DemoteRadius from ALL players
+		bool bAnyClose = false;
+		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+		{
+			APlayerController* PC = It->Get();
+			if (!PC || !PC->GetPawn()) continue;
+			const FVector3f D = Positions[i] - FVector3f(PC->GetPawn()->GetActorLocation());
+			if (D.X * D.X + D.Y * D.Y <= DemRadSq) { bAnyClose = true; break; }
+		}
+		if (bAnyClose) continue;
+
+		DemoteEcho(Actor); // clears PromotionTimes[i] inside DemoteToHorde
+	}
+}
+
+// ─── RunSteeringPass ──────────────────────────────────────────────────────────
+
+void UATR_EchoSubsystem::RunSteeringPass()
+{
+	// Zero all horde velocities — promoted actors own their velocity via CMC.
+	// This ensures entities that leave MustPromoteRadius stop cleanly next frame.
+	for (int32 i = 0; i < ActiveEntities; ++i)
+		if (!IndexToActor[i])
+			Velocities[i] = FVector3f::ZeroVector;
+
+	// Apply steering velocity for unpromoted overflow entities within MustPromoteRadius.
+	TArray<int32> InnerCandidates;
+	InnerCandidates.Reserve(64);
+
+	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+	{
+		APlayerController* PC = It->Get();
+		if (!PC || !PC->GetPawn()) continue;
+
+		const FVector3f PP = FVector3f(PC->GetPawn()->GetActorLocation());
+		InnerCandidates.Reset();
+		SpatialGrid.QueryRadius(PP, MustPromoteRadius,
+			TArrayView<const FVector3f>(Positions.GetData(), ActiveEntities),
+			InnerCandidates);
+
+		for (const int32 i : InnerCandidates)
+		{
+			if (IndexToActor[i]) continue;  // actor owns its movement
+
+			FVector3f Dir = PP - Positions[i];
+			Dir.Z = 0.f;
+			const float DistSq = Dir.X * Dir.X + Dir.Y * Dir.Y;
+			if (DistSq > KINDA_SMALL_NUMBER)
+				Velocities[i] = Dir * FMath::InvSqrt(DistSq) * HordeWalkSpeed;
+		}
+	}
+}
+
+// ─── ForceDestroyEcho ─────────────────────────────────────────────────────────
+
+void UATR_EchoSubsystem::ForceDestroyEcho(int32 SoAIndex)
+{
+	if (SoAIndex < 0 || SoAIndex >= ActiveEntities) return;
+
+	// Demote first if promoted — bypasses bBlockDemotion and hysteresis.
+	if (AATR_ActiveEcho* Actor = IndexToActor[SoAIndex])
+		DemoteEcho(Actor);
+
+	RemoveEcho(SoAIndex);
+}
+
+void UATR_EchoSubsystem::ForceDestroyEcho(AATR_ActiveEcho* Actor)
+{
+	if (!Actor || Actor->SourceIndex == INDEX_NONE) return;
+
+	const int32 Idx = Actor->SourceIndex; // capture before DemoteEcho clears SourceIndex
+	DemoteEcho(Actor);
+	RemoveEcho(Idx);
 }

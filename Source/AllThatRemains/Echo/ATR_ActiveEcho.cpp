@@ -5,6 +5,8 @@
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Perception/AISenseConfig_Sight.h"
 #include "Perception/AISenseConfig_Hearing.h"
+#include "Net/UnrealNetwork.h"
+#include "Components/SkeletalMeshComponent.h"
 
 // ─── Construction ─────────────────────────────────────────────────────────────
 
@@ -62,6 +64,10 @@ void AATR_ActiveEcho::BeginPlay()
 {
 	Super::BeginPlay();
 
+	// Apply mesh offsets from Blueprint class defaults — corrects pivot/facing vs ISM.
+	if (USkeletalMeshComponent* mesh = GetMesh())
+		mesh->SetRelativeLocationAndRotation(MeshLocationOffset, MeshRotationOffset);
+
 	// AI and behavior are authoritative on server only.
 	// Clients drive visuals entirely via CMC replication — no local AI needed.
 	if (!HasAuthority())
@@ -81,6 +87,39 @@ void AATR_ActiveEcho::Tick(float DeltaTime)
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
 
+void AATR_ActiveEcho::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	DOREPLIFETIME(AATR_ActiveEcho, SourceIndex);
+	DOREPLIFETIME(AATR_ActiveEcho, AnimStateCache);
+}
+
+void AATR_ActiveEcho::OnRep_SourceIndex()
+{
+	auto* Sub = GetWorld() ? GetWorld()->GetSubsystem<UATR_EchoSubsystem>() : nullptr;
+	if (!Sub) return;
+
+	// Unregister old slot (covers demotion: SourceIndex flips to INDEX_NONE)
+	if (ClientPrevSourceIndex != INDEX_NONE
+		&& ClientPrevSourceIndex < Sub->ActiveEntities
+		&& Sub->IndexToActor[ClientPrevSourceIndex] == this)
+	{
+		Sub->IndexToActor[ClientPrevSourceIndex] = nullptr;
+	}
+
+	// Register new slot (covers promotion)
+	if (SourceIndex != INDEX_NONE && SourceIndex < Sub->ActiveEntities)
+		Sub->IndexToActor[SourceIndex] = this;
+
+	ClientPrevSourceIndex = SourceIndex;
+}
+
+void AATR_ActiveEcho::OnRep_AnimStateCache()
+{
+	// AnimBP polls AnimStateCache directly each frame — no push needed here.
+	// Override in Blueprint subclass if event-driven anim transitions are required.
+}
+
 void AATR_ActiveEcho::EnterPool()
 {
 	SetActorHiddenInGame(true);
@@ -96,6 +135,7 @@ void AATR_ActiveEcho::EnterPool()
 	if (StateTreeComp) StateTreeComp->StopLogic(TEXT("Pooled"));
 	if (AIPerception)  AIPerception->SetComponentTickEnabled(false);
 
+	bBlockDemotion = false; // safety net — StateTree should clear this in ExitState
 	SourceIndex    = INDEX_NONE;
 	AnimStateCache = 0;
 }

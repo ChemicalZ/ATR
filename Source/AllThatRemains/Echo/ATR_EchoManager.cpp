@@ -102,6 +102,10 @@ void AATR_EchoManager::UpdateISM(UATR_EchoSubsystem* Sub)
 	NearTransforms.Reset(); MidTransforms.Reset(); FarTransforms.Reset();
 	for (int32 i = 0; i < Count; ++i)
 	{
+		// Skip promoted entities — their actor owns rendering for this slot.
+		// IndexToActor is game-thread-only; UpdateISM is game-thread; no race.
+		if (Sub->IndexToActor[i]) continue;
+
 		switch (BucketIds[i])
 		{
 			case 0:  NearTransforms.Add(AllTransforms[i]); break;

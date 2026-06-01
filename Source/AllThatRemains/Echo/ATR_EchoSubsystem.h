@@ -100,6 +100,21 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "Echo|Config")
 	float WorldHalfExtent = 512000.f;
 
+	UPROPERTY(BlueprintReadOnly, Category = "Echo|Config")
+	float MustPromoteRadius = 800.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Echo|Config")
+	float HordeWalkSpeed = 120.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Echo|Config")
+	float PromoteRadius = 2500.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Echo|Config")
+	float DemoteRadius = 4000.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Echo|Config")
+	float MinTimeInTierSeconds = 1.5f;
+
 	// --- SoA (no UPROPERTY — worker-thread written, never GC-traced) ---
 	// Parallel arrays, one entry per live entity [0, ActiveEntities).
 	// Never resized after Initialize(). Capacity = InitializeCount.
@@ -110,12 +125,18 @@ public:
 	TArray<FVector3f> Positions;
 	TArray<uint8>     AnimState;
 	TArray<uint8>     AnimFrame;
+	TArray<float>     PromotionTimes; // GetWorld()->GetTimeSeconds() at promotion; 0 = not promoted
 	int32             ActiveEntities = 0;
 
 	// --- Public API ---
 
 	int32 AddEcho(FVector3f Position);
 	void  RemoveEcho(int32 Index);
+
+	// Immediately demote (if promoted) and remove from SoA. Use when an echo dies.
+	// Bypasses bBlockDemotion and hysteresis — unconditional.
+	void ForceDestroyEcho(int32 SoAIndex);
+	void ForceDestroyEcho(AATR_ActiveEcho* Actor); // convenience overload for promoted echoes
 
 	// Promote SoA entity to a pooled Actor for full simulation.
 	// Caller must pop Actor from EchoPool first.
@@ -140,22 +161,27 @@ public:
 	// on clients (where the Subsystem didn't spawn the Manager itself).
 	void SetManager(AATR_EchoManager* InManager) { Manager = InManager; }
 
-private:
+	// Reverse map: SoA index → promoted Actor. nullptr = in horde.
+	// Raw observer pointers — lifetime guaranteed by EchoPool TObjectPtr.
+	UPROPERTY()
+	TArray<AATR_ActiveEcho*> IndexToActor;
+	
 	void SimTick(float DeltaTime);
 	void RebuildGrid();
 
 	// Grid rebuilt every frame from Positions. Never source of truth.
 	FATR_SpatialGrid SpatialGrid;
 
-	// Reverse map: SoA index → promoted Actor. nullptr = in horde.
-	// Raw observer pointers — lifetime guaranteed by EchoPool TObjectPtr.
-	TArray<AATR_ActiveEcho*> IndexToActor;
+
 
 	UPROPERTY()
 	TObjectPtr<AATR_EchoManager> Manager;
 
 	UPROPERTY()
 	TArray<TObjectPtr<AATR_ActiveEcho>> EchoPool;
+
+	void RunSteeringPass();
+	void RunPromotionPass();
 
 	float TickAccumulator = 0.f;
 	bool  bGridReady      = false;
