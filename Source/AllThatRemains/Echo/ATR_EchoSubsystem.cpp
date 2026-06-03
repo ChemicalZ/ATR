@@ -401,11 +401,64 @@ void UATR_EchoSubsystem::RunPromotionPass()
 			return (DA.X*DA.X + DA.Y*DA.Y) < (DB.X*DB.X + DB.Y*DB.Y);
 		});
 
+		// Sorted farthest-first list of promoted actors — built lazily when pool empties.
+		// Lets us swap farthest actor out so a closer candidate can take its slot.
+		TArray<TPair<float, int32>> FarPromoted;
+		bool  bFarListBuilt = false;
+		int32 FarListIdx    = 0;
+
+		auto BuildFarList = [&]()
+		{
+			if (bFarListBuilt) return;
+			bFarListBuilt = true;
+			for (int32 j = 0; j < ActiveEntities; ++j)
+			{
+				if (!IndexToActor[j]) continue;
+				const FVector3f D = Positions[j] - PP;
+				FarPromoted.Add({ D.X*D.X + D.Y*D.Y, j });
+			}
+			FarPromoted.Sort([](const TPair<float,int32>& A, const TPair<float,int32>& B)
+			{
+				return A.Key > B.Key; // farthest first
+			});
+		};
+
 		for (const int32 i : Candidates)
 		{
-			if (IndexToActor[i]) continue;                             // already promoted
-			if (EchoPool.IsEmpty() || ControllerPool.IsEmpty()) break; // pool exhausted — no more this frame
-			PromoteEcho(i);                                            // stamps PromotionTimes[i] inside PromoteToActive
+			if (IndexToActor[i]) continue; // already promoted
+
+			if (EchoPool.IsEmpty() || ControllerPool.IsEmpty())
+			{
+				// Pool exhausted — try to evict the farthest promoted actor that is
+				// farther from the player than this candidate. Bypasses MinTimeInTierSeconds
+				// so closest echoes are always preferred; bBlockDemotion is still respected.
+				BuildFarList();
+
+				const FVector3f DC       = Positions[i] - PP;
+				const float     CandDSq  = DC.X*DC.X + DC.Y*DC.Y;
+				bool            bSwapped = false;
+
+				while (FarListIdx < FarPromoted.Num())
+				{
+					const float     FarDSq  = FarPromoted[FarListIdx].Key;
+					const int32     FarIdx  = FarPromoted[FarListIdx].Value;
+					++FarListIdx;
+
+					// Farthest promoted is now closer than this candidate — no beneficial swap possible.
+					if (FarDSq <= CandDSq) break;
+
+					AATR_ActiveEcho* FarActor = IndexToActor[FarIdx];
+					if (!FarActor || FarActor->bBlockDemotion) continue; // already gone or locked
+
+					DemoteEcho(FarActor);
+					bSwapped = true;
+					break;
+				}
+
+				if (!bSwapped || EchoPool.IsEmpty() || ControllerPool.IsEmpty()) break;
+			}
+
+			PromoteEcho(i); // stamps PromotionTimes[i] inside PromoteToActive
 		}
 	}
 
