@@ -3,10 +3,11 @@
 #include "ATR_EchoSubsystem.h"
 #include "ATR_EchoManager.h"
 #include "ATR_ActiveEcho.h"
-#include "ATR_EchoAIController.h"
+#include "AI/ATR_EchoAIController.h"
 #include "ATR_EchoSettings.h"
 #include "Engine/World.h"
 #include "Async/ParallelFor.h"
+#include "Logging/StructuredLog.h"
 
 // ─── FATR_SpatialGrid ────────────────────────────────────────────────────────
 
@@ -340,6 +341,7 @@ AATR_ActiveEcho* UATR_EchoSubsystem::PromoteEcho(int32 SoAIndex)
 	PromoteToActive(SoAIndex, Actor);    // wire IndexToActor + SourceIndex
 	Actor->InitFromSoA(this, SoAIndex);  // teleport to SoA position + seed velocity first
 	Controller->Possess(Actor);          // OnPossess → AI wakes at correct world position
+	UE_LOGFMT(LogTemp, Warning, "We spawned that loser and got a controller");
 	return Actor;
 }
 

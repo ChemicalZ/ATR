@@ -106,7 +106,7 @@ void AATR_ActiveEcho::InitFromSoA(const UATR_EchoSubsystem* Sub, int32 Index)
 	if (!ensureAlways(Sub && Index >= 0 && Index < Sub->ActiveEntities)) return;
 
 	// Teleport to SoA position — skip sweep so no stale collision blocks activation
-	SetActorLocation(FVector(Sub->Positions[Index]), false, nullptr, ETeleportType::TeleportPhysics);
+	SetActorLocation(FVector(Sub->Positions[Index]), false, nullptr, ETeleportType::ResetPhysics);
 
 	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
 	{
