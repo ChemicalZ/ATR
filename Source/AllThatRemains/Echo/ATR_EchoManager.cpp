@@ -88,12 +88,15 @@ void AATR_EchoManager::UpdateISM(UATR_EchoSubsystem* Sub)
 	AllTransforms.SetNumUninitialized(Count);
 	BucketIds.SetNumUninitialized(Count);
 
+	const FQuat   ISMRot    = FQuat(ISMMeshRotationOffset);
+	const FVector ISMOffset = ISMMeshLocationOffset;
+
 	// Parallel: build world-space transforms + classify into LOD tiers.
 	// Each lane touches only its own AllTransforms[i] and BucketIds[i] — no contention.
 	ParallelFor(Count, [&](int32 i)
 	{
 		const FVector WP(Sub->Positions[i]);
-		AllTransforms[i] = FTransform(FQuat::Identity, WP, FVector::OneVector);
+		AllTransforms[i] = FTransform(ISMRot, WP + ISMOffset, FVector::OneVector);
 		const float DSq  = FVector::DistSquaredXY(WP, CameraLoc);
 		BucketIds[i]     = (DSq <= NearSq) ? 0 : (DSq <= MidSq) ? 1 : 2;
 	});

@@ -5,6 +5,7 @@
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Net/UnrealNetwork.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Components/CapsuleComponent.h"
 
 // ─── Construction ─────────────────────────────────────────────────────────────
 
@@ -105,8 +106,9 @@ void AATR_ActiveEcho::InitFromSoA(const UATR_EchoSubsystem* Sub, int32 Index)
 {
 	if (!ensureAlways(Sub && Index >= 0 && Index < Sub->ActiveEntities)) return;
 
-	// Teleport to SoA position — skip sweep so no stale collision blocks activation
-	SetActorLocation(FVector(Sub->Positions[Index]), false, nullptr, ETeleportType::ResetPhysics);
+	// SoA stores feet/ground Z; capsule center must be offset up by half-height
+	const float HalfHeight = GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
+	SetActorLocation(FVector(Sub->Positions[Index]) + FVector(0.f, 0.f, HalfHeight), false, nullptr, ETeleportType::ResetPhysics);
 
 	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
 	{
@@ -127,7 +129,9 @@ void AATR_ActiveEcho::WriteBackToSoA(UATR_EchoSubsystem* Sub) const
 {
 	if (!ensureAlways(Sub && SourceIndex >= 0 && SourceIndex < Sub->ActiveEntities)) return;
 
-	Sub->Positions[SourceIndex]  = FVector3f(GetActorLocation());
+	// Write feet Z back so SoA stays ground-relative (matches ISM assumption)
+	const float HalfHeight = GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
+	Sub->Positions[SourceIndex]  = FVector3f(GetActorLocation()) - FVector3f(0.f, 0.f, HalfHeight);
 	Sub->AnimState[SourceIndex]  = AnimStateCache;
 
 	if (const UCharacterMovementComponent* CMC = GetCharacterMovement())

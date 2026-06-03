@@ -76,6 +76,14 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Echo|ISM")
 	TObjectPtr<UInstancedStaticMeshComponent> ISM_Far;
 
+	// Offset applied to every ISM instance — corrects mesh pivot/facing vs. SoA world position.
+	// Set in Blueprint class defaults to match the static mesh's local pivot.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Echo|ISM")
+	FVector ISMMeshLocationOffset = FVector::ZeroVector;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Echo|ISM")
+	FRotator ISMMeshRotationOffset = FRotator::ZeroRotator;
+
 	// Distance thresholds from the local player camera (in Unreal Units).
 	// Edit via Project Settings > AllThatRemains > Echo Horde.
 	UPROPERTY(BlueprintReadOnly, Category = "Echo|ISM")
