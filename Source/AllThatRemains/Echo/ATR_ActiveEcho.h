@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "GenericTeamAgentInterface.h"
 #include "GameFramework/Character.h"
 #include "ATR_ActiveEcho.generated.h"
 
@@ -21,12 +22,15 @@ class UATR_EchoSubsystem;
 // SourceIndex always mirrors the SoA row. INDEX_NONE when pooled.
 // Server owns simulation. Clients drive visuals via CMC replication.
 UCLASS()
-class ALLTHATREMAINS_API AATR_ActiveEcho : public ACharacter
+class ALLTHATREMAINS_API AATR_ActiveEcho : public ACharacter, public IGenericTeamAgentInterface
 {
 	GENERATED_BODY()
 
 public:
 	AATR_ActiveEcho();
+	
+	virtual FGenericTeamId GetGenericTeamId() const override { return FGenericTeamId(TeamNumber); }
+	virtual void SetGenericTeamId(const FGenericTeamId& NewId) override { TeamNumber = NewId.GetId(); }
 
 	// --- State ---
 
@@ -80,6 +84,9 @@ protected:
 
 	UFUNCTION() void OnRep_SourceIndex();
 	UFUNCTION() void OnRep_AnimStateCache();
+	
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Team")
+	uint8 TeamNumber = 2;
 
 public:
 	virtual void Tick(float DeltaTime) override;

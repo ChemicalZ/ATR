@@ -83,7 +83,9 @@ public:
 
 	UPROPERTY(BlueprintReadOnly, Category = "Echo|ISM")
 	float MidDistance = 10000.f;
-
+	
+	UPROPERTY(BlueprintReadOnly, Category = "Echo|ISM")	
+	bool bDebugShowIsm = false;
 	// --- Replication config --------------------------------------------------
 
 	UPROPERTY(BlueprintReadOnly, Category = "Echo|Replication")
@@ -95,6 +97,9 @@ public:
 
 	UPROPERTY(BlueprintReadOnly, Category = "Echo|Replication")
 	float SnapshotZMax = 50000.f;
+	
+
+
 
 private:
 	UFUNCTION(NetMulticast, Unreliable)

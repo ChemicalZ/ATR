@@ -51,6 +51,8 @@ public:
 
 	// ── Pool ──────────────────────────────────────────────────────────────────
 
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Pool")
+	bool bDebugShowIsm = false;
 	// ActiveEcho actors pre-warmed in the pool at BeginPlay (server only).
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Pool", meta=(ClampMin=0))
 	int32 PoolSize = 20;

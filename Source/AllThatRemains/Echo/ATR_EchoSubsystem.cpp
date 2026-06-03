@@ -341,7 +341,6 @@ AATR_ActiveEcho* UATR_EchoSubsystem::PromoteEcho(int32 SoAIndex)
 	PromoteToActive(SoAIndex, Actor);    // wire IndexToActor + SourceIndex
 	Actor->InitFromSoA(this, SoAIndex);  // teleport to SoA position + seed velocity first
 	Controller->Possess(Actor);          // OnPossess → AI wakes at correct world position
-	UE_LOGFMT(LogTemp, Warning, "We spawned that loser and got a controller");
 	return Actor;
 }
 

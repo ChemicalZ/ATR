@@ -28,7 +28,8 @@ class ALLTHATREMAINS_API AATR_EchoAIController : public AAIController
 public:
 	AATR_EchoAIController();
 
-	virtual FGenericTeamId GetGenericTeamId() const override { return FGenericTeamId(1); }
+	virtual FGenericTeamId GetGenericTeamId() const override { return FGenericTeamId(TeamNumber); }
+	virtual void SetGenericTeamId(const FGenericTeamId& NewId) override { TeamNumber = NewId.GetId(); }
 
 	// --- Components ---
 
@@ -57,7 +58,9 @@ public:
 protected:
 	virtual void OnPossess(APawn* InPawn) override;
 	virtual void OnUnPossess() override;
-
+	
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Team")
+	uint8 TeamNumber = 2;
 private:
 	// Batch perception callback — fires once per perception tick after all stimuli are processed.
 	UFUNCTION()

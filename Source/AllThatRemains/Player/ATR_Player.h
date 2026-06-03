@@ -3,18 +3,23 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "GenericTeamAgentInterface.h"
 #include "InputActionValue.h"
 #include "GameFramework/Character.h"
 #include "ATR_Player.generated.h"
 
 UCLASS()
-class ALLTHATREMAINS_API AATR_Player : public ACharacter
+class ALLTHATREMAINS_API AATR_Player : public ACharacter, public IGenericTeamAgentInterface
 {
 	GENERATED_BODY()
 
 public:
 	// Sets default values for this character's properties
 	AATR_Player();
+	
+	virtual FGenericTeamId GetGenericTeamId() const override { return FGenericTeamId(TeamNumber); }
+	virtual void SetGenericTeamId(const FGenericTeamId& NewId) override { TeamNumber = NewId.GetId(); }
+
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
 	TObjectPtr<class USpringArmComponent> SpringArm;
@@ -40,6 +45,9 @@ protected:
 	
 	void Move(const FInputActionValue& Value);
 	void Look(const FInputActionValue& Value);
+	
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Team")
+	uint8 TeamNumber = 1;
 
 public:
 	// Called every frame

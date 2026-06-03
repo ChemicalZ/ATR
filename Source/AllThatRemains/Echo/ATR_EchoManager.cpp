@@ -46,6 +46,7 @@ void AATR_EchoManager::BeginPlay()
 	SnapshotHz   = Settings->SnapshotHz;
 	SnapshotZMin = Settings->SnapshotZMin;
 	SnapshotZMax = Settings->SnapshotZMax;
+	bDebugShowIsm = Settings->bDebugShowIsm;
 
 	// Wire ourselves into the Subsystem on all machines (server sets it via SpawnActor
 	// return value; client sets it here when the replicated actor arrives).
@@ -104,7 +105,11 @@ void AATR_EchoManager::UpdateISM(UATR_EchoSubsystem* Sub)
 	{
 		// Skip promoted entities — their actor owns rendering for this slot.
 		// IndexToActor is game-thread-only; UpdateISM is game-thread; no race.
-		if (Sub->IndexToActor[i]) continue;
+		
+		if (!bDebugShowIsm)
+		{
+			if (Sub->IndexToActor[i]) continue;
+		}
 
 		switch (BucketIds[i])
 		{

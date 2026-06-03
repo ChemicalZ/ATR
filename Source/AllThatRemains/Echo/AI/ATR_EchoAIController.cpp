@@ -45,6 +45,8 @@ void AATR_EchoAIController::OnPossess(APawn* InPawn)
 	}
 
 	if (StateTreeComp) StateTreeComp->StartLogic();
+	UE_LOG(LogTemp, Warning, TEXT("Possessed %s"),
+	*InPawn->GetName());
 }
 
 void AATR_EchoAIController::OnUnPossess()
@@ -91,7 +93,9 @@ AActor* AATR_EchoAIController::SelectBestTarget() const
 	if (!AIPerception) return nullptr;
 
 	APawn* MyPawn = GetPawn();
+	
 	if (!MyPawn) return nullptr;
+
 
 	// Only evaluate sight — hearing is used for alerting, not targeting.
 	TArray<AActor*> KnownActors;
@@ -103,7 +107,9 @@ AActor* AATR_EchoAIController::SelectBestTarget() const
 
 	for (AActor* Actor : KnownActors)
 	{
-		if (!IsValid(Actor)) continue;
+
+		
+		if (!IsValid(Actor) || Actor == MyPawn) continue;
 
 		// Check whether we currently have line of sight or are working from memory.
 		FActorPerceptionBlueprintInfo Info;
