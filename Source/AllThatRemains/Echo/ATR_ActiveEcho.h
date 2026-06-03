@@ -4,18 +4,19 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Character.h"
-#include "Perception/AIPerceptionComponent.h"
-#include "Components/StateTreeComponent.h"
 #include "ATR_ActiveEcho.generated.h"
 
 class UATR_EchoSubsystem;
 
 // Fully-realized Echo actor. Pooled — spawned only near players or for scripted sequences.
+// Owns only movement (CMC) and anim state. All AI lives on AATR_EchoAIController.
 //
 // Lifecycle:
-//   Spawn → EnterPool()          (dormant: hidden, no collision, no tick, no AI)
-//   EnterPool → InitFromSoA()    (active:  position/velocity seeded, AI running, replicated)
-//   InitFromSoA → WriteBackToSoA → EnterPool()   (demoted back to horde)
+//   Spawn → EnterPool()                           (dormant: hidden, no collision, no tick)
+//   PromoteEcho: InitFromSoA()                    (teleport to SoA position, seed velocity)
+//              → Controller->Possess(this)        (OnPossess → AI wakes at correct location)
+//   DemoteEcho: WriteBackToSoA → EnterPool()      (actor returns to pool)
+//             → Controller->UnPossess()           (OnUnPossess → AI stops, controller returns to pool)
 //
 // SourceIndex always mirrors the SoA row. INDEX_NONE when pooled.
 // Server owns simulation. Clients drive visuals via CMC replication.
@@ -26,15 +27,6 @@ class ALLTHATREMAINS_API AATR_ActiveEcho : public ACharacter
 
 public:
 	AATR_ActiveEcho();
-
-	// --- Components ---
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Echo|Components")
-	TObjectPtr<UAIPerceptionComponent> AIPerception;
-
-	// Assign a StateTree asset to this component in your Blueprint subclass.
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Echo|Components")
-	TObjectPtr<UStateTreeComponent> StateTreeComp;
 
 	// --- State ---
 

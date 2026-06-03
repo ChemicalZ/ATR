@@ -8,6 +8,7 @@
 
 class AATR_EchoManager;
 class AATR_ActiveEcho;
+class AATR_EchoAIController;
 
 // Project Settings > AllThatRemains > Echo Horde
 // All Echo system config lives here. C++ reads it once at init; never modify
@@ -85,9 +86,14 @@ public:
 	TSoftClassPtr<AATR_EchoManager> ManagerClass;
 
 	// Blueprint subclass of AATR_ActiveEcho. Leave empty to use the base C++ class.
-	// Assign your BP here so pooled actors carry the correct mesh, AnimBP, and StateTree.
+	// Assign your BP here so pooled actors carry the correct mesh and AnimBP.
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Pool")
 	TSoftClassPtr<AATR_ActiveEcho> ActiveEchoClass;
+
+	// Blueprint subclass of AATR_EchoAIController. Leave empty to use the base C++ class.
+	// Assign your BP here so pooled controllers carry the correct StateTree asset.
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Pool")
+	TSoftClassPtr<AATR_EchoAIController> ControllerClass;
 
 	// ── Rendering ─────────────────────────────────────────────────────────────
 

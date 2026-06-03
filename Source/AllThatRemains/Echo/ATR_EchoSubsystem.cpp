@@ -3,6 +3,7 @@
 #include "ATR_EchoSubsystem.h"
 #include "ATR_EchoManager.h"
 #include "ATR_ActiveEcho.h"
+#include "ATR_EchoAIController.h"
 #include "ATR_EchoSettings.h"
 #include "Engine/World.h"
 #include "Async/ParallelFor.h"
@@ -133,6 +134,7 @@ void UATR_EchoSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	const UATR_EchoSettings* Settings = GetDefault<UATR_EchoSettings>();
 	ManagerClass    = Settings->ManagerClass.LoadSynchronous();
 	ActiveEchoClass = Settings->ActiveEchoClass.LoadSynchronous();
+	ControllerClass = Settings->ControllerClass.LoadSynchronous();
 
 	SpatialGrid.Initialize(
 		FVector2D(-WorldHalfExtent, -WorldHalfExtent),
@@ -162,6 +164,11 @@ void UATR_EchoSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 			ActiveEchoClass ? ActiveEchoClass.Get() : AATR_ActiveEcho::StaticClass();
 
 		EchoPool.Reserve(PoolSize);
+		ControllerPool.Reserve(PoolSize);
+
+		const TSubclassOf<AATR_EchoAIController> AIControllerClass =
+			ControllerClass ? ControllerClass.Get() : AATR_EchoAIController::StaticClass();
+
 		for (int32 i = 0; i < PoolSize; ++i)
 		{
 			FActorSpawnParameters EchoParams;
@@ -170,6 +177,14 @@ void UATR_EchoSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 			{
 				Echo->EnterPool();
 				EchoPool.Add(Echo);
+			}
+
+			FActorSpawnParameters CtrlParams;
+			CtrlParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+			if (AATR_EchoAIController* Ctrl = InWorld.SpawnActor<AATR_EchoAIController>(AIControllerClass, FTransform::Identity, CtrlParams))
+			{
+				Ctrl->EnterPool();
+				ControllerPool.Add(Ctrl);
 			}
 		}
 	}
@@ -313,26 +328,37 @@ void UATR_EchoSubsystem::DemoteToHorde(AATR_ActiveEcho* Actor)
 AATR_ActiveEcho* UATR_EchoSubsystem::PromoteEcho(int32 SoAIndex)
 {
 	if (!ensureAlways(SoAIndex >= 0 && SoAIndex < ActiveEntities)) return nullptr;
-	if (EchoPool.IsEmpty())
+	if (EchoPool.IsEmpty() || ControllerPool.IsEmpty())
 	{
 		UE_LOG(LogTemp, Warning, TEXT("UATR_EchoSubsystem::PromoteEcho — pool exhausted (SoAIndex=%d)"), SoAIndex);
 		return nullptr;
 	}
 
-	// Pop from pool — actor is kept alive by the world's actor list
-	TObjectPtr<AATR_ActiveEcho> PooledRef = EchoPool.Pop();
-	AATR_ActiveEcho* Actor = PooledRef.Get();
+	AATR_ActiveEcho* Actor = EchoPool.Pop().Get();
+	AATR_EchoAIController* Controller = ControllerPool.Pop().Get();
 
 	PromoteToActive(SoAIndex, Actor);    // wire IndexToActor + SourceIndex
-	Actor->InitFromSoA(this, SoAIndex);  // seed position/velocity/anim, activate systems
+	Actor->InitFromSoA(this, SoAIndex);  // teleport to SoA position + seed velocity first
+	Controller->Possess(Actor);          // OnPossess → AI wakes at correct world position
 	return Actor;
 }
 
 void UATR_EchoSubsystem::DemoteEcho(AATR_ActiveEcho* Actor)
 {
 	if (!ensureAlways(Actor)) return;
+
+	// Capture controller before UnPossess clears the pawn reference.
+	AATR_EchoAIController* Controller = Cast<AATR_EchoAIController>(Actor->GetController());
+
 	DemoteToHorde(Actor);  // WriteBackToSoA + clear IndexToActor + SourceIndex = INDEX_NONE
-	Actor->EnterPool();    // hide, disable collision, stop AI and StateTree
+
+	if (Controller)
+	{
+		Controller->UnPossess(); // OnUnPossess → stops StateTree + perception
+		ControllerPool.Add(Controller);
+	}
+
+	Actor->EnterPool(); // hide, disable collision, stop movement
 	EchoPool.Add(Actor);
 }
 
@@ -376,9 +402,9 @@ void UATR_EchoSubsystem::RunPromotionPass()
 
 		for (const int32 i : Candidates)
 		{
-			if (IndexToActor[i]) continue;   // already promoted
-			if (EchoPool.IsEmpty()) break;    // pool exhausted — no more this frame
-			PromoteEcho(i);                   // stamps PromotionTimes[i] inside PromoteToActive
+			if (IndexToActor[i]) continue;                             // already promoted
+			if (EchoPool.IsEmpty() || ControllerPool.IsEmpty()) break; // pool exhausted — no more this frame
+			PromoteEcho(i);                                            // stamps PromotionTimes[i] inside PromoteToActive
 		}
 	}
 

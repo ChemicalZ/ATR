@@ -8,6 +8,7 @@
 
 class AATR_EchoManager;
 class AATR_ActiveEcho;
+class AATR_EchoAIController;
 
 // CSR-style uniform spatial grid. Stores SoA indices — never source of truth.
 // Rebuilt every frame from Positions SoA. Never owns entity data.
@@ -84,6 +85,9 @@ public:
 
 	UPROPERTY(BlueprintReadOnly, Category = "Echo|Config")
 	TSubclassOf<AATR_ActiveEcho> ActiveEchoClass;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Echo|Config")
+	TSubclassOf<AATR_EchoAIController> ControllerClass;
 
 	UPROPERTY(BlueprintReadOnly, Category = "Echo|Config")
 	float SpawnRadius = 5000.f;
@@ -179,6 +183,9 @@ public:
 
 	UPROPERTY()
 	TArray<TObjectPtr<AATR_ActiveEcho>> EchoPool;
+
+	UPROPERTY()
+	TArray<TObjectPtr<AATR_EchoAIController>> ControllerPool;
 
 	void RunSteeringPass();
 	void RunPromotionPass();
