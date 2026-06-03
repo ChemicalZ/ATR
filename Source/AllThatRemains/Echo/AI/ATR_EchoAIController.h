@@ -18,10 +18,8 @@
 //   UnPossess()  → OnUnPossess() (stops movement, unbinds delegate, dormant)
 //   Return to ControllerPool
 //
-// Direct movement (demo):
-//   HandlePerceptionUpdated fires on any perception change, calls SelectBestTarget,
-//   and issues MoveToActor directly — no StateTree required.
-//   When a StateTree is assigned, disable or ignore the direct-move path.
+// Team: Echoes are Team 1. Sight/hearing ignore friendlies, so echoes never perceive
+// each other. Players have no team (NoTeam) and are treated as neutral → detected.
 UCLASS()
 class ALLTHATREMAINS_API AATR_EchoAIController : public AAIController
 {
@@ -29,6 +27,8 @@ class ALLTHATREMAINS_API AATR_EchoAIController : public AAIController
 
 public:
 	AATR_EchoAIController();
+
+	virtual FGenericTeamId GetGenericTeamId() const override { return FGenericTeamId(1); }
 
 	// --- Components ---
 
@@ -41,14 +41,13 @@ public:
 
 	// --- Config ---
 
-	// Acceptance radius passed to MoveToActor in the direct-move path.
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Echo|AI", meta = (ClampMin = 0.f, ForceUnits = "cm"))
-	float MoveAcceptanceRadius = 100.f;
-
 	// Multiplier applied to a target's score when it is already CurrentTarget.
 	// Prevents flickering when two targets score nearly equal.
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Echo|AI", meta = (ClampMin = 1.f))
 	float LoyaltyBonusMultiplier = 1.2f;
+
+	// Returns the current best target selected by perception scoring. Used by StateTree evaluators.
+	AActor* GetCurrentTarget() const { return CurrentTarget.Get(); }
 
 	// --- Pool ---
 

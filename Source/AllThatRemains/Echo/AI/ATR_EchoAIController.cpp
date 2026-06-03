@@ -82,19 +82,8 @@ void AATR_EchoAIController::EnterPool()
 
 void AATR_EchoAIController::HandlePerceptionUpdated(const TArray<AActor*>& UpdatedActors)
 {
-	// Authoritative on server only — clients have no AI.
 	if (!HasAuthority()) return;
-
-	AActor* Best = SelectBestTarget();
-
-	if (Best == CurrentTarget.Get()) return; // no change, avoid redundant move requests
-
-	CurrentTarget = Best;
-
-	if (Best)
-		MoveToActor(Best, MoveAcceptanceRadius);
-	else
-		StopMovement();
+	CurrentTarget = SelectBestTarget();
 }
 
 AActor* AATR_EchoAIController::SelectBestTarget() const

@@ -4,24 +4,45 @@
 #include "AIController.h"
 #include "Navigation/PathFollowingComponent.h"
 #include "StateTreeExecutionContext.h"
+#include "Logging/StructuredLog.h"
 
 EStateTreeRunStatus FATR_EchoMoveToTask::EnterState(FStateTreeExecutionContext& Context, const FStateTreeTransitionResult& Transition) const
 {
 	FInstanceDataType& InstanceData = Context.GetInstanceData(*this);
 	AAIController* AIC = Cast<AAIController>(Context.GetOwner());
-	if (!AIC) return EStateTreeRunStatus::Failed;
+	if (!AIC)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ATR_EchoMoveToTask::EnterState — owner is not AAIController"));
+		return EStateTreeRunStatus::Failed;
+	}
 
 	EPathFollowingRequestResult::Type Result;
 	if (InstanceData.TargetActor)
+	{
+		UE_LOGFMT(LogTemp, Log, "ATR_EchoMoveToTask::EnterState — {Owner} moving to actor {Target}",
+			AIC->GetName(), InstanceData.TargetActor->GetName());
 		Result = AIC->MoveToActor(InstanceData.TargetActor, InstanceData.AcceptanceRadius);
+	}
 	else
+	{
+		UE_LOGFMT(LogTemp, Log, "ATR_EchoMoveToTask::EnterState — {Owner} moving to location {X} {Y} {Z}",
+			AIC->GetName(),
+			InstanceData.TargetLocation.X, InstanceData.TargetLocation.Y, InstanceData.TargetLocation.Z);
 		Result = AIC->MoveToLocation(InstanceData.TargetLocation, InstanceData.AcceptanceRadius);
+	}
 
 	switch (Result)
 	{
-		case EPathFollowingRequestResult::AlreadyAtGoal: return EStateTreeRunStatus::Succeeded;
-		case EPathFollowingRequestResult::Failed:        return EStateTreeRunStatus::Failed;
-		default:                                         return EStateTreeRunStatus::Running;
+		case EPathFollowingRequestResult::AlreadyAtGoal:
+			UE_LOGFMT(LogTemp, Log, "ATR_EchoMoveToTask::EnterState — {Owner} already at goal", AIC->GetName());
+			return EStateTreeRunStatus::Succeeded;
+
+		case EPathFollowingRequestResult::Failed:
+			UE_LOGFMT(LogTemp, Warning, "ATR_EchoMoveToTask::EnterState — {Owner} move request failed (no path?)", AIC->GetName());
+			return EStateTreeRunStatus::Failed;
+
+		default:
+			return EStateTreeRunStatus::Running;
 	}
 }
 
@@ -39,15 +60,16 @@ EStateTreeRunStatus FATR_EchoMoveToTask::Tick(FStateTreeExecutionContext& Contex
 
 		case EPathFollowingStatus::Idle:
 		default:
-			// Idle after a successful EnterState means the move completed (arrived or path ended).
-			// StateTree transitions handle what to do next based on game state.
+			UE_LOGFMT(LogTemp, Log, "ATR_EchoMoveToTask::Tick — {Owner} movement complete (Idle)", AIC->GetName());
 			return EStateTreeRunStatus::Succeeded;
 	}
 }
 
 void FATR_EchoMoveToTask::ExitState(FStateTreeExecutionContext& Context, const FStateTreeTransitionResult& Transition) const
 {
-	// Always abort — covers interruptions. If the move already finished, StopMovement is a no-op.
 	AAIController* AIC = Cast<AAIController>(Context.GetOwner());
-	if (AIC) AIC->StopMovement();
+	if (!AIC) return;
+
+	UE_LOGFMT(LogTemp, Log, "ATR_EchoMoveToTask::ExitState — {Owner} stopping movement", AIC->GetName());
+	AIC->StopMovement();
 }
