@@ -2,6 +2,7 @@
 
 #include "ATR_EchoSubsystem.h"
 #include "ATR_EchoManager.h"
+#include "ATR_EchoReplicationComponent.h"
 #include "ATR_ActiveEcho.h"
 #include "AI/ATR_EchoAIController.h"
 #include "ATR_EchoSettings.h"
@@ -122,7 +123,12 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	AnimState.SetNumZeroed(InitializeCount);
 	AnimFrame.SetNumZeroed(InitializeCount);
 	PromotionTimes.SetNumZeroed(InitializeCount);
+	Yaws.SetNumZeroed(InitializeCount);
+	DirtyStates.SetNumZeroed(InitializeCount);
 	IndexToActor.SetNumZeroed(InitializeCount); // all nullptr
+
+	PositionDirtyThresholdSq = FMath::Square(Settings->PositionDirtyThreshold);
+	YawDirtyThresholdDeg     = Settings->YawDirtyThresholdDegrees;
 
 	bInitialized = true;
 }
@@ -219,13 +225,29 @@ void UATR_EchoSubsystem::Tick(float DeltaTime)
 		RunPromotionPass();
 	}
 
-	if (Manager)
-	{
-		if (NetMode != NM_DedicatedServer)
-			Manager->UpdateISM(this);
+	if (Manager && NetMode != NM_DedicatedServer)
+		Manager->UpdateISM(this);
 
-		if (NetMode != NM_Client)
-			Manager->ServerTick(this, DeltaTime);
+	if (NetMode != NM_Client)
+	{
+		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+		{
+			APlayerController* PC = It->Get();
+			if (!PC) continue;
+
+			UATR_EchoReplicationComponent* Comp =
+				PC->FindComponentByClass<UATR_EchoReplicationComponent>();
+			if (!Comp)
+			{
+				Comp = NewObject<UATR_EchoReplicationComponent>(PC);
+				Comp->RegisterComponent();
+				UE_LOG(LogATR_EchoNet, Log,
+					TEXT("Created EchoReplicationComponent for PlayerController %s"),
+					*GetNameSafe(PC));
+			}
+
+			Comp->ServerTickReplication(this, DeltaTime);
+		}
 	}
 }
 
@@ -235,11 +257,17 @@ void UATR_EchoSubsystem::SimTick(float DeltaTime)
 
 	// Each entity touches only its own SoA slots — no cross-entity writes.
 	// ParallelFor distributes across worker threads via the task graph.
+	// MarkEchoDirty writes only DirtyStates[i] per lane — no data race.
 	ParallelFor(Count, [this, DeltaTime](int32 i)
 	{
+		if (IndexToActor[i]) return; // actor owns its movement; SoA written back on demotion
+		const FVector3f OldPos = Positions[i];
 		Accelerations[i]  = Forces[i]; // mass = 1
 		Velocities[i]    += Accelerations[i] * DeltaTime;
 		Positions[i]     += Velocities[i]    * DeltaTime;
+		const FVector3f Delta = Positions[i] - OldPos;
+		if (Delta.SizeSquared() > PositionDirtyThresholdSq)
+			MarkEchoDirty(i, EEchoDirtyFlags::Transform);
 	});
 }
 
@@ -268,6 +296,8 @@ int32 UATR_EchoSubsystem::AddEcho(FVector3f Position)
 	AnimState[Idx]      = 0;
 	AnimFrame[Idx]      = 0;
 	PromotionTimes[Idx] = 0.f;
+	Yaws[Idx]           = 0.f;
+	DirtyStates[Idx]    = FEchoDirtyState{ EEchoDirtyFlags::Spawn, 1 };
 	IndexToActor[Idx]   = nullptr;
 	return Idx;
 }
@@ -292,6 +322,9 @@ void UATR_EchoSubsystem::RemoveEcho(int32 Index)
 		AnimState[Index]      = AnimState[Last];
 		AnimFrame[Index]      = AnimFrame[Last];
 		PromotionTimes[Index] = PromotionTimes[Last];
+		DirtyStates[Index]    = DirtyStates[Last];
+
+		Yaws[Index] = Yaws[Last];
 
 		// Patch the moved entity's Actor so it knows its new slot
 		if (IndexToActor[Last])
@@ -525,9 +558,60 @@ void UATR_EchoSubsystem::RunSteeringPass()
 			Dir.Z = 0.f;
 			const float DistSq = Dir.X * Dir.X + Dir.Y * Dir.Y;
 			if (DistSq > KINDA_SMALL_NUMBER)
+			{
 				Velocities[i] = Dir * FMath::InvSqrt(DistSq) * HordeWalkSpeed;
+				Yaws[i]       = FMath::RadiansToDegrees(FMath::Atan2(Dir.Y, Dir.X));
+				MarkEchoDirty(i, EEchoDirtyFlags::Transform);
+			}
 		}
 	}
+}
+
+// ─── QueryEchoesByRelevancyBands ──────────────────────────────────────────────
+
+void UATR_EchoSubsystem::QueryEchoesByRelevancyBands(
+	const FVector& Origin,
+	float NearRange, float MidRange, float FarRange,
+	TArray<int32>& OutNear, TArray<int32>& OutMid, TArray<int32>& OutFar) const
+{
+	if (!bGridReady || ActiveEntities == 0) return;
+
+	const FVector3f Origin3f(Origin);
+	const float NearSq = NearRange * NearRange;
+	const float MidSq  = MidRange  * MidRange;
+
+	// Single query at FarRange, then classify each result by XY distance band.
+	TArray<int32> AllInRange;
+	AllInRange.Reserve(64);
+	SpatialGrid.QueryRadius(Origin3f, FarRange,
+		TArrayView<const FVector3f>(Positions.GetData(), ActiveEntities),
+		AllInRange);
+
+	for (int32 Idx : AllInRange)
+	{
+		const FVector3f D   = Positions[Idx] - Origin3f;
+		const float     DSq = D.X * D.X + D.Y * D.Y;
+
+		if      (DSq <= NearSq) OutNear.Add(Idx);
+		else if (DSq <= MidSq)  OutMid.Add(Idx);
+		else                    OutFar.Add(Idx);
+	}
+}
+
+// ─── Dirty State ─────────────────────────────────────────────────────────────
+
+void UATR_EchoSubsystem::MarkEchoDirty(int32 Index, EEchoDirtyFlags Flags)
+{
+	if (!DirtyStates.IsValidIndex(Index)) return;
+	DirtyStates[Index].Flags = DirtyStates[Index].Flags | Flags;
+	++DirtyStates[Index].Version;
+	if (DirtyStates[Index].Version == 0) DirtyStates[Index].Version = 1; // skip 0 — used as "never sent"
+}
+
+bool UATR_EchoSubsystem::IsEchoDirty(int32 Index, EEchoDirtyFlags Flags) const
+{
+	return DirtyStates.IsValidIndex(Index) &&
+	       EnumHasAnyFlags(DirtyStates[Index].Flags, Flags);
 }
 
 // ─── ForceDestroyEcho ─────────────────────────────────────────────────────────

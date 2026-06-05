@@ -4,7 +4,6 @@
 #include "ATR_EchoSubsystem.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Net/UnrealNetwork.h"
-#include "Components/SkeletalMeshComponent.h"
 #include "Components/CapsuleComponent.h"
 
 // ─── Construction ─────────────────────────────────────────────────────────────
@@ -37,12 +36,6 @@ AATR_ActiveEcho::AATR_ActiveEcho()
 void AATR_ActiveEcho::BeginPlay()
 {
 	Super::BeginPlay();
-
-	// Apply mesh offsets from Blueprint class defaults — corrects pivot/facing vs ISM.
-	if (USkeletalMeshComponent* mesh = GetMesh())
-		mesh->SetRelativeLocationAndRotation(MeshLocationOffset, MeshRotationOffset);
-
-	// AI runs on the controller (server-only). Nothing to configure here.
 }
 
 void AATR_ActiveEcho::Tick(float DeltaTime)
@@ -109,6 +102,7 @@ void AATR_ActiveEcho::InitFromSoA(const UATR_EchoSubsystem* Sub, int32 Index)
 	// SoA stores feet/ground Z; capsule center must be offset up by half-height
 	const float HalfHeight = GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
 	SetActorLocation(FVector(Sub->Positions[Index]) + FVector(0.f, 0.f, HalfHeight), false, nullptr, ETeleportType::ResetPhysics);
+	SetActorRotation(FRotator(0.f, Sub->Yaws[Index], 0.f));
 
 	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
 	{
@@ -132,6 +126,7 @@ void AATR_ActiveEcho::WriteBackToSoA(UATR_EchoSubsystem* Sub) const
 	// Write feet Z back so SoA stays ground-relative (matches ISM assumption)
 	const float HalfHeight = GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
 	Sub->Positions[SourceIndex]  = FVector3f(GetActorLocation()) - FVector3f(0.f, 0.f, HalfHeight);
+	Sub->Yaws[SourceIndex]       = GetActorRotation().Yaw;
 	Sub->AnimState[SourceIndex]  = AnimStateCache;
 
 	if (const UCharacterMovementComponent* CMC = GetCharacterMovement())

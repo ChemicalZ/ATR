@@ -51,8 +51,6 @@ public:
 
 	// ── Pool ──────────────────────────────────────────────────────────────────
 
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Pool")
-	bool bDebugShowIsm = false;
 	// ActiveEcho actors pre-warmed in the pool at BeginPlay (server only).
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Pool", meta=(ClampMin=0))
 	int32 PoolSize = 20;
@@ -98,26 +96,45 @@ public:
 	TSoftClassPtr<AATR_EchoAIController> ControllerClass;
 
 	// ── Rendering ─────────────────────────────────────────────────────────────
+	// ISM LOD tier distances are driven by NearRelevancyRange/MidRelevancyRange (Echo|Networking),
+	// keeping network relevancy and render LOD bands consistent.
 
-	// Entities closer than this distance use ISM_Near (highest detail).
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Rendering", meta=(ClampMin=0.f, ForceUnits="cm"))
-	float NearDistance = 3000.f;
+	// Show ISM instance for echoes that are currently promoted to a full actor (debug only).
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Rendering")
+	bool bDebugShowPromotedEchoISM = false;
 
-	// Entities between NearDistance and MidDistance use ISM_Mid.
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Rendering", meta=(ClampMin=0.f, ForceUnits="cm"))
-	float MidDistance = 10000.f;
+	// ── Networking ────────────────────────────────────────────────────────────
 
-	// ── Replication ───────────────────────────────────────────────────────────
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(ClampMin=1.f, ClampMax=60.f))
+	float NearSnapshotHz = 10.f;
 
-	// Snapshot multicast rate. Must match on server and all clients.
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Replication", meta=(ClampMin=1.f, ClampMax=60.f, DisplayName="Snapshot Hz"))
-	float SnapshotHz = 20.f;
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(ClampMin=0.1f, ClampMax=60.f))
+	float MidSnapshotHz = 3.f;
 
-	// Z quantization floor for snapshot encoding (must match server and client).
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Replication", meta=(ForceUnits="cm"))
-	float SnapshotZMin = -10000.f;
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(ClampMin=0.1f, ClampMax=60.f))
+	float FarSnapshotHz = 1.f;
 
-	// Z quantization ceiling for snapshot encoding (must match server and client).
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Replication", meta=(ForceUnits="cm"))
-	float SnapshotZMax = 50000.f;
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(ClampMin=100.f, ForceUnits="cm"))
+	float NearRelevancyRange = 3000.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(ClampMin=100.f, ForceUnits="cm"))
+	float MidRelevancyRange = 10000.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(ClampMin=100.f, ForceUnits="cm"))
+	float FarRelevancyRange = 25000.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(ClampMin=1, ClampMax=512))
+	int32 MaxSnapshotsPerChunk = 256;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(ClampMin=0.f))
+	float FullResyncCooldownSeconds = 2.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(ClampMin=1))
+	int32 MaxMissingSequencesBeforeResync = 3;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(ClampMin=0.f, ForceUnits="cm"))
+	float PositionDirtyThreshold = 5.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(ClampMin=0.f))
+	float YawDirtyThresholdDegrees = 2.f;
 };

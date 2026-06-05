@@ -9,24 +9,28 @@
 
 class UATR_EchoSubsystem;
 
-// Quantized Echo state for net transport — 10 bytes per entity.
-// XY encoded over [-WorldHalfExtent, +WorldHalfExtent].
-// Z encoded over [SnapshotZMin, SnapshotZMax].
+DECLARE_LOG_CATEGORY_EXTERN(LogATR_EchoNet,    Log, All);
+DECLARE_LOG_CATEGORY_EXTERN(LogATR_EchoRender, Log, All);
+
+// Quantized Echo state for net transport — 14 bytes per entity.
+// XY encoded cell-relative: LocalX/Y in [0, CellSize].
+// Z encoded world-relative over [-CellSize, CellSize*3] (no Z cell origin; grid is 2D).
 USTRUCT()
 struct FEchoSnapshot
 {
 	GENERATED_BODY()
 
-	UPROPERTY() uint16 PosX  = 0;
-	UPROPERTY() uint16 PosY  = 0;
-	UPROPERTY() uint16 PosZ  = 0;
-	UPROPERTY() uint16 Index = 0;  // mirrors SoA index on server and client
-	UPROPERTY() uint8  Anim  = 0;
-	UPROPERTY() uint8  Yaw   = 0;  // reserved for Phase 4 (facing direction)
+	UPROPERTY() int32  EchoIndex = INDEX_NONE;  // authoritative SoA index
+	UPROPERTY() int32  CellId    = INDEX_NONE;  // flat 2D spatial grid cell index
+	UPROPERTY() uint16 LocalX    = 0;           // X offset from cell origin, quantized over [0, CellSize]
+	UPROPERTY() uint16 LocalY    = 0;           // Y offset from cell origin, quantized over [0, CellSize]
+	UPROPERTY() uint16 LocalZ    = 0;           // World Z, quantized over [-CellSize, CellSize*3]
+	UPROPERTY() uint8  Anim      = 0;
+	UPROPERTY() uint8  Yaw       = 0;
 
 	bool NetSerialize(FArchive& Ar, UPackageMap* /*Map*/, bool& bOutSuccess)
 	{
-		Ar << PosX << PosY << PosZ << Index << Anim << Yaw;
+		Ar << EchoIndex << CellId << LocalX << LocalY << LocalZ << Anim << Yaw;
 		bOutSuccess = true;
 		return true;
 	}
@@ -38,14 +42,85 @@ struct TStructOpsTypeTraits<FEchoSnapshot> : public TStructOpsTypeTraitsBase2<FE
 	enum { WithNetSerializer = true };
 };
 
-// Network surface and ISM renderer for the Echo horde.
-//
-// Responsibilities:
-//   Server/listen-server — packs FEchoSnapshot arrays and multicasts at SnapshotHz.
-//   Client/listen-server — updates three LOD-tier ISMComponents from live or decoded SoA data.
-//
-// Owns no simulation data. Queries UATR_EchoSubsystem for positions each frame.
-// Driven by UATR_EchoSubsystem::Tick — its own tick is disabled.
+UENUM()
+enum class EEchoSnapshotKind : uint8
+{
+	Delta,
+	Full,
+	Correction,
+	Despawn,
+	CellEnter,
+	CellExit
+};
+
+UENUM()
+enum class EEchoRelevancyBand : uint8
+{
+	Near,
+	Mid,
+	Far
+};
+
+// Chunked wrapper for FEchoSnapshot arrays.
+// Keeps each RPC within bunch-size limits. Sequence + ChunkIndex + ChunkCount allow
+// the client to reassemble a multi-chunk send and detect missing chunks.
+USTRUCT()
+struct FEchoSnapshotChunk
+{
+	GENERATED_BODY()
+
+	UPROPERTY() uint16 Sequence    = 0;
+	UPROPERTY() uint8  ChunkIndex  = 0;
+	UPROPERTY() uint8  ChunkCount  = 0;
+	UPROPERTY() int32  TotalEchoes = 0;  // authoritative active count, sync'd to Sub->ActiveEntities
+
+	UPROPERTY() EEchoSnapshotKind  SnapshotKind  = EEchoSnapshotKind::Full;
+	UPROPERTY() EEchoRelevancyBand RelevancyBand = EEchoRelevancyBand::Near;
+	UPROPERTY() int32              ViewId        = 0;
+
+	UPROPERTY() TArray<FEchoSnapshot> Snapshots;
+
+	bool NetSerialize(FArchive& Ar, UPackageMap* Map, bool& bOutSuccess)
+	{
+		Ar << Sequence << ChunkIndex << ChunkCount << TotalEchoes;
+
+		uint8 Kind = static_cast<uint8>(SnapshotKind);
+		uint8 Band = static_cast<uint8>(RelevancyBand);
+		Ar << Kind << Band;
+		if (Ar.IsLoading())
+		{
+			SnapshotKind  = static_cast<EEchoSnapshotKind>(Kind);
+			RelevancyBand = static_cast<EEchoRelevancyBand>(Band);
+		}
+		Ar << ViewId;
+
+		int32 Count = Snapshots.Num();
+		Ar << Count;
+		if (Ar.IsLoading())
+			Snapshots.SetNum(Count);
+
+		for (FEchoSnapshot& S : Snapshots)
+		{
+			bool bOk = true;
+			S.NetSerialize(Ar, Map, bOk);
+			if (!bOk) { bOutSuccess = false; return false; }
+		}
+
+		bOutSuccess = true;
+		return true;
+	}
+};
+
+template<>
+struct TStructOpsTypeTraits<FEchoSnapshotChunk> : public TStructOpsTypeTraitsBase2<FEchoSnapshotChunk>
+{
+	enum { WithNetSerializer = true };
+};
+
+// ISM renderer for the Echo horde.
+// Updates three LOD-tier ISMComponents from local SoA data each frame.
+// Owns no simulation data. Driven by UATR_EchoSubsystem::Tick — own tick disabled.
+// Snapshot encoding/delivery is handled by UATR_EchoReplicationComponent (per-player).
 UCLASS()
 class ALLTHATREMAINS_API AATR_EchoManager : public AActor
 {
@@ -60,9 +135,7 @@ public:
 	// Skipped on NM_DedicatedServer (no GPU).
 	void UpdateISM(UATR_EchoSubsystem* Sub);
 
-	// Called by UATR_EchoSubsystem::Tick — packs snapshots and multicasts.
-	// NM_DedicatedServer and NM_ListenServer only.
-	void ServerTick(UATR_EchoSubsystem* Sub, float DeltaTime);
+	static constexpr int32 MaxEchoSnapshotsPerChunk = 256;
 
 	// --- ISM LOD tiers -------------------------------------------------------
 	// Assign static meshes per-tier in a Blueprint subclass or the CDO.
@@ -84,49 +157,31 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Echo|ISM")
 	FRotator ISMMeshRotationOffset = FRotator::ZeroRotator;
 
-	// Distance thresholds from the local player camera (in Unreal Units).
-	// Edit via Project Settings > AllThatRemains > Echo Horde.
 	UPROPERTY(BlueprintReadOnly, Category = "Echo|ISM")
-	float NearDistance = 3000.f;
-
-	UPROPERTY(BlueprintReadOnly, Category = "Echo|ISM")
-	float MidDistance = 10000.f;
-	
-	UPROPERTY(BlueprintReadOnly, Category = "Echo|ISM")	
-	bool bDebugShowIsm = false;
-	// --- Replication config --------------------------------------------------
-
-	UPROPERTY(BlueprintReadOnly, Category = "Echo|Replication")
-	float SnapshotHz = 20.f;
-
-	// Z quantization range — must match on server and client.
-	UPROPERTY(BlueprintReadOnly, Category = "Echo|Replication")
-	float SnapshotZMin = -10000.f;
-
-	UPROPERTY(BlueprintReadOnly, Category = "Echo|Replication")
-	float SnapshotZMax = 50000.f;
-	
-
-
+	bool bDebugShowPromotedEchoISM = false;
 
 private:
-	UFUNCTION(NetMulticast, Unreliable)
-	void Multicast_EchoSnapshot(const TArray<FEchoSnapshot>& Snapshots, int32 TotalActiveCount);
+	// Per-tier stable ISM slot state.
+	struct FEchoISMTier
+	{
+		TMap<int32, int32>  EchoToInstance;  // SoA index → ISM instance slot
+		TArray<int32>       InstanceToEcho;  // ISM instance slot → SoA index
+		TMap<int32, uint32> EchoISMVersion;  // SoA index → DirtyState.Version at last update
+		TArray<int32>       DirtyInstances;  // pending update indices (parallel with DirtyTransforms)
+		TArray<FTransform>  DirtyTransforms;
+	};
 
-	void ApplySnapshotsToSubsystem(const TArray<FEchoSnapshot>& Snapshots, int32 TotalActiveCount);
+	FEchoISMTier                    Tiers[3];      // indexed by EEchoRelevancyBand (Near=0,Mid=1,Far=2)
+	TMap<int32, EEchoRelevancyBand> EchoToBand;    // current tier for each echo in the ISM
 
-	static FEchoSnapshot EncodeEcho(FVector3f Pos, uint8 AnimState, uint16 Index,
-	                                 float HalfExtent, float ZMin, float ZMax);
-	static FVector3f     DecodeEcho(const FEchoSnapshot& S,
-	                                 float HalfExtent, float ZMin, float ZMax);
+	float NearBandDistance = 3000.f;   // read from NearRelevancyRange in BeginPlay
+	float MidBandDistance  = 10000.f;  // read from MidRelevancyRange in BeginPlay
 
-	// Pre-allocated scratch — zero heap allocations per frame on the hot path.
-	TArray<FTransform>    AllTransforms;    // parallel transform build
-	TArray<uint8>         BucketIds;        // parallel LOD classification
-	TArray<FTransform>    NearTransforms;
-	TArray<FTransform>    MidTransforms;
-	TArray<FTransform>    FarTransforms;
-	TArray<FEchoSnapshot> SnapshotScratch;
-
-	float SnapshotAccumulator = 0.f;
+	UInstancedStaticMeshComponent* ISMForBand       (EEchoRelevancyBand Band) const;
+	void                           AddEchoToISM     (int32 EchoIndex, EEchoRelevancyBand Band,
+	                                                  const FTransform& T, uint32 Version);
+	void                           RemoveEchoFromISM(int32 EchoIndex);
+	void                           QueueTransformUpdate(int32 EchoIndex, EEchoRelevancyBand Band,
+	                                                     const FTransform& T, uint32 Version);
+	void                           FlushTierUpdates ();
 };

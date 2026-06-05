@@ -50,16 +50,6 @@ public:
 	UPROPERTY(BlueprintReadWrite, Category = "Echo")
 	bool bBlockDemotion = false;
 
-	// --- Mesh Transform Offsets ---
-	// Set in Blueprint class defaults to correct pivot and facing mismatches between
-	// the ISM representation and the skeletal mesh. Applied once in BeginPlay.
-
-	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Echo|Mesh")
-	FVector MeshLocationOffset = FVector::ZeroVector;
-
-	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Echo|Mesh")
-	FRotator MeshRotationOffset = FRotator::ZeroRotator;
-
 	// --- Lifecycle ---
 
 	// Put actor in dormant pool state: hidden, collision off, AI off, CMC stopped.

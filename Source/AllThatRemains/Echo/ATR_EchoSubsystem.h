@@ -10,6 +10,23 @@ class AATR_EchoManager;
 class AATR_ActiveEcho;
 class AATR_EchoAIController;
 
+UENUM()
+enum class EEchoDirtyFlags : uint8
+{
+	None      = 0,
+	Transform = 1 << 0,
+	Anim      = 1 << 1,
+	Spawn     = 1 << 3,
+	Despawn   = 1 << 4,
+};
+ENUM_CLASS_FLAGS(EEchoDirtyFlags)
+
+struct FEchoDirtyState
+{
+	EEchoDirtyFlags Flags   = EEchoDirtyFlags::None;
+	uint32          Version = 0; // increments each dirty marking; never wraps to 0
+};
+
 // CSR-style uniform spatial grid. Stores SoA indices — never source of truth.
 // Rebuilt every frame from Positions SoA. Never owns entity data.
 struct FATR_SpatialGrid
@@ -37,6 +54,30 @@ public:
 
 	int32 GetNumCells()    const { return NumCellsX * NumCellsY; }
 	bool  IsInitialized()  const { return NumCellsX > 0; }
+
+	FORCEINLINE float GetCellSize() const { return CellSize; }
+
+	FORCEINLINE bool IsValidCellId(int32 InCellId) const
+	{
+		return InCellId >= 0 && InCellId < NumCellsX * NumCellsY;
+	}
+
+	// Returns the flat cell index for a 2D world position.
+	FORCEINLINE int32 GetCellId(FVector2f Pos2D) const
+	{
+		return CellIndex(CellX(Pos2D.X), CellY(Pos2D.Y));
+	}
+
+	// Returns the world-space XY origin (bottom-left corner) of the given cell.
+	FORCEINLINE FVector2f GetCellOrigin2D(int32 InCellId) const
+	{
+		const int32 Cx = InCellId % FMath::Max(1, NumCellsX);
+		const int32 Cy = InCellId / FMath::Max(1, NumCellsX);
+		return FVector2f(
+			static_cast<float>(WorldMin.X) + Cx * CellSize,
+			static_cast<float>(WorldMin.Y) + Cy * CellSize
+		);
+	}
 
 private:
 	FORCEINLINE int32 CellX(float X) const
@@ -123,13 +164,15 @@ public:
 	// Parallel arrays, one entry per live entity [0, ActiveEntities).
 	// Never resized after Initialize(). Capacity = InitializeCount.
 
-	TArray<FVector3f> Forces;
-	TArray<FVector3f> Accelerations;
-	TArray<FVector3f> Velocities;
-	TArray<FVector3f> Positions;
-	TArray<uint8>     AnimState;
-	TArray<uint8>     AnimFrame;
-	TArray<float>     PromotionTimes; // GetWorld()->GetTimeSeconds() at promotion; 0 = not promoted
+	TArray<FVector3f>     Forces;
+	TArray<FVector3f>     Accelerations;
+	TArray<FVector3f>     Velocities;
+	TArray<FVector3f>     Positions;
+	TArray<uint8>         AnimState;
+	TArray<uint8>         AnimFrame;
+	TArray<float>         PromotionTimes; // GetWorld()->GetTimeSeconds() at promotion; 0 = not promoted
+	TArray<float>         Yaws;           // degrees [0, 360) — facing direction per entity
+	TArray<FEchoDirtyState> DirtyStates;
 	int32             ActiveEntities = 0;
 
 	// --- Public API ---
@@ -160,6 +203,37 @@ public:
 
 	const FATR_SpatialGrid& GetSpatialGrid() const { return SpatialGrid; }
 	bool                    IsGridReady()    const { return bGridReady; }
+
+	void MarkEchoDirty(int32 Index, EEchoDirtyFlags Flags);
+	bool IsEchoDirty  (int32 Index, EEchoDirtyFlags Flags) const;
+
+	float PositionDirtyThresholdSq = 25.f;  // set from settings in Initialize()
+	float YawDirtyThresholdDeg     = 2.f;
+
+	// Single FarRange grid query, results classified into three XY-distance bands.
+	// OutNear/Mid/Far are non-overlapping. Appends to caller's arrays (caller owns Reset).
+	void QueryEchoesByRelevancyBands(
+		const FVector& Origin,
+		float NearRange, float MidRange, float FarRange,
+		TArray<int32>& OutNear, TArray<int32>& OutMid, TArray<int32>& OutFar) const;
+
+	bool IsInitialized() const
+	{
+		return bInitialized                       &&
+		       Positions.Num()  >= InitializeCount &&
+		       Yaws.Num()       >= InitializeCount &&
+		       AnimState.Num()  >= InitializeCount;
+	}
+
+	bool ValidateActiveArrays() const
+	{
+		return ActiveEntities >= 0                  &&
+		       ActiveEntities <= InitializeCount    &&
+		       Positions.Num()   >= ActiveEntities  &&
+		       Yaws.Num()        >= ActiveEntities  &&
+		       AnimState.Num()   >= ActiveEntities  &&
+		       IndexToActor.Num() >= ActiveEntities;
+	}
 
 	// Called by AATR_EchoManager::BeginPlay on all machines — wires the Manager pointer
 	// on clients (where the Subsystem didn't spawn the Manager itself).
