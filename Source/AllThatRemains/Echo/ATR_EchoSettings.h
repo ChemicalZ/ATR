@@ -194,7 +194,7 @@ public:
 	float VisualFarDistance = 20000.f;
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Rendering", meta=(
-		ToolTip="Debug only. If true, promoted Actor echoes may also be shown as ISM instances. Keep false during normal gameplay to avoid duplicate visuals and extra rendering cost."
+		ToolTip="Reserved for future debug visualization. Promoted Actor echoes are currently excluded from horde ISM to prevent duplicate visuals and stale transform rendering. Use Actor debug drawing for promoted echo debugging."
 	))
 	bool bDebugShowPromotedEchoISM = false;
 

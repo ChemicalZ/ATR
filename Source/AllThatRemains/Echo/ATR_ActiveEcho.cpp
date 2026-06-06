@@ -57,17 +57,34 @@ void AATR_ActiveEcho::OnRep_SourceIndex()
 	auto* Sub = GetWorld() ? GetWorld()->GetSubsystem<UATR_EchoSubsystem>() : nullptr;
 	if (!Sub) return;
 
-	// Unregister old slot (covers demotion: SourceIndex flips to INDEX_NONE)
+	// Unregister old slot (covers demotion: SourceIndex flips to INDEX_NONE).
+	// Use InitializeCount/IsValidIndex rather than ActiveEntities because clients
+	// receive partial horde snapshots and may see a promoted actor before the
+	// matching SoA index has been replicated as horde data.
 	if (ClientPrevSourceIndex != INDEX_NONE
-		&& ClientPrevSourceIndex < Sub->ActiveEntities
+		&& ClientPrevSourceIndex >= 0
+		&& ClientPrevSourceIndex < Sub->InitializeCount
+		&& Sub->IndexToActor.IsValidIndex(ClientPrevSourceIndex)
 		&& Sub->IndexToActor[ClientPrevSourceIndex] == this)
 	{
 		Sub->IndexToActor[ClientPrevSourceIndex] = nullptr;
 	}
 
-	// Register new slot (covers promotion)
-	if (SourceIndex != INDEX_NONE && SourceIndex < Sub->ActiveEntities)
+	// Register new slot (covers promotion). ActiveEntities is expanded only far
+	// enough for legacy index bounds checks; promoted actors are still excluded
+	// from client horde grids/ISM unless horde snapshots mark them relevant.
+	if (SourceIndex != INDEX_NONE
+		&& SourceIndex >= 0
+		&& SourceIndex < Sub->InitializeCount
+		&& Sub->IndexToActor.IsValidIndex(SourceIndex))
+	{
+		if (Sub->ActiveEntities <= SourceIndex)
+		{
+			Sub->ActiveEntities = SourceIndex + 1;
+		}
+
 		Sub->IndexToActor[SourceIndex] = this;
+	}
 
 	ClientPrevSourceIndex = SourceIndex;
 }
@@ -116,7 +133,7 @@ void AATR_ActiveEcho::InitFromSoA(const UATR_EchoSubsystem* Sub, int32 Index)
 	SetActorHiddenInGame(false);
 	SetActorEnableCollision(true);
 	SetActorTickEnabled(true);
-	// AI starts via controller OnPossess — subsystem calls Possess() before InitFromSoA().
+	// AI starts via controller OnPossess — subsystem calls Possess() after InitFromSoA().
 }
 
 void AATR_ActiveEcho::WriteBackToSoA(UATR_EchoSubsystem* Sub) const

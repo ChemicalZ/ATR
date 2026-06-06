@@ -37,6 +37,7 @@ private:
 	                      const TArray<int32>& EchoIndices);
 	void SendDespawnChunk(const TArray<int32>& EchoIndices);
 	void ApplyChunkToSubsystem(const TArray<FEchoSnapshot>& Snapshots, int32 TotalEchoes);
+	void ApplyDespawnToSubsystem(const TArray<FEchoSnapshot>& Snapshots);
 
 	// Cell-relative quantization helpers.
 	static uint16        QuantizeToUInt16 (float Value, float MinValue, float MaxValue);
@@ -70,8 +71,12 @@ private:
 
 	float FullResyncCooldownSeconds       = 2.f;
 	int32 MaxMissingSequencesBeforeResync = 3;
+	int32 MaxSnapshotsPerChunk            = 256;
 
 	TArray<FEchoSnapshot> SnapshotScratch;
+	TSet<int32> CurrentRelevantScratch;
+	TArray<int32> RemovedScratch;
+	TArray<int32> DespawnIndexScratch;
 	TArray<int32> NearEchoes;
 	TArray<int32> MidEchoes;
 	TArray<int32> FarEchoes;

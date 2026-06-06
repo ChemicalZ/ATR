@@ -20,13 +20,19 @@ UATR_EchoReplicationComponent::UATR_EchoReplicationComponent()
 void UATR_EchoReplicationComponent::BeginPlay()
 {
 	Super::BeginPlay();
-	const UATR_EchoSettings* Settings = GetDefault<UATR_EchoSettings>();
+
+	UATR_EchoSettings* Settings = GetMutableDefault<UATR_EchoSettings>();
+	if (!Settings) return;
+
+	Settings->ValidateAndClamp();
+
 	NearSnapshotHz = Settings->NearSnapshotHz;
 	MidSnapshotHz  = Settings->MidSnapshotHz;
 	FarSnapshotHz  = Settings->FarSnapshotHz;
 	NearRelevancyRange = Settings->NearRelevancyRange;
 	MidRelevancyRange  = Settings->MidRelevancyRange;
 	FarRelevancyRange  = Settings->FarRelevancyRange;
+	MaxSnapshotsPerChunk            = Settings->MaxSnapshotsPerChunk;
 	FullResyncCooldownSeconds       = Settings->FullResyncCooldownSeconds;
 	MaxMissingSequencesBeforeResync = Settings->MaxMissingSequencesBeforeResync;
 }
@@ -64,27 +70,27 @@ void UATR_EchoReplicationComponent::ServerTickReplication(UATR_EchoSubsystem* Su
 		NearEchoes, MidEchoes, FarEchoes
 	);
 
-	// Removal sweep: echoes that fell out of all relevancy bands get a Despawn chunk.
-	TSet<int32> CurrentRelevant;
-	CurrentRelevant.Reserve(NearEchoes.Num() + MidEchoes.Num() + FarEchoes.Num());
-	for (int32 i : NearEchoes) CurrentRelevant.Add(i);
-	for (int32 i : MidEchoes)  CurrentRelevant.Add(i);
-	for (int32 i : FarEchoes)  CurrentRelevant.Add(i);
+	// Removal sweep: echoes that fell out of all relevancy bands get Despawn chunks.
+	CurrentRelevantScratch.Reset();
+	CurrentRelevantScratch.Reserve(NearEchoes.Num() + MidEchoes.Num() + FarEchoes.Num());
+	for (int32 i : NearEchoes) CurrentRelevantScratch.Add(i);
+	for (int32 i : MidEchoes)  CurrentRelevantScratch.Add(i);
+	for (int32 i : FarEchoes)  CurrentRelevantScratch.Add(i);
 
+	RemovedScratch.Reset();
+	for (int32 Known : KnownEchoes)
 	{
-		TArray<int32> Removed;
-		for (int32 Known : KnownEchoes)
-			if (!CurrentRelevant.Contains(Known))
-				Removed.Add(Known);
+		if (!CurrentRelevantScratch.Contains(Known))
+			RemovedScratch.Add(Known);
+	}
 
-		if (Removed.Num() > 0)
-			SendDespawnChunk(Removed);
+	if (RemovedScratch.Num() > 0)
+		SendDespawnChunk(RemovedScratch);
 
-		for (int32 Idx : Removed)
-		{
-			KnownEchoes.Remove(Idx);
-			EchoLastHandledVersion.Remove(Idx);
-		}
+	for (int32 Idx : RemovedScratch)
+	{
+		KnownEchoes.Remove(Idx);
+		EchoLastHandledVersion.Remove(Idx);
 	}
 
 	if (bSendNear) { BuildAndSendBand(Sub, EEchoRelevancyBand::Near, NearEchoes); NearAccumulator = 0.f; }
@@ -99,6 +105,8 @@ void UATR_EchoReplicationComponent::BuildAndSendBand(UATR_EchoSubsystem* Sub,
 	if (EchoIndices.IsEmpty()) return;
 
 	const float CellSz = Sub->SpatialGrid.GetCellSize();
+	const int32 SafeMaxSnapshotsPerChunk = FMath::Clamp(MaxSnapshotsPerChunk, 1, 512);
+	const int32 MaxSnapshotsThisSequence = SafeMaxSnapshotsPerChunk * 255;
 
 	// Phase 1 (game thread): dirty check, TSet/TMap bookkeeping, promoted actor reads (CMC).
 	// These cannot be parallelized — TSet/TMap are not thread-safe, CMC requires game thread.
@@ -117,6 +125,18 @@ void UATR_EchoReplicationComponent::BuildAndSendBand(UATR_EchoSubsystem* Sub,
 		{
 			const uint32 LastVersion = EchoLastHandledVersion.FindRef(i);
 			if (CurrentVersion == LastVersion) continue; // clean — skip
+		}
+
+		if (ToEncode.Num() >= MaxSnapshotsThisSequence)
+		{
+			UE_LOG(LogATR_EchoNet, Warning,
+				TEXT("Echo snapshot send cap reached for band %d. Remaining dirty/new echoes will be retried next send."),
+				static_cast<int32>(Band));
+			break;
+		}
+
+		if (bKnown)
+		{
 			EchoLastHandledVersion[i] = CurrentVersion;
 		}
 		else
@@ -159,22 +179,14 @@ void UATR_EchoReplicationComponent::BuildAndSendBand(UATR_EchoSubsystem* Sub,
 	const EEchoSnapshotKind Kind = bAnyNew ? EEchoSnapshotKind::Full : EEchoSnapshotKind::Delta;
 
 	const int32 Total     = SnapshotScratch.Num();
-	const int32 NumChunks = FMath::DivideAndRoundUp(Total, AATR_EchoManager::MaxEchoSnapshotsPerChunk);
-
-	if (NumChunks > 255)
-	{
-		UE_LOG(LogATR_EchoNet, Warning,
-			TEXT("Echo snapshot chunk count exceeds 255 for band %d (Count=%d). Clamping."),
-			static_cast<int32>(Band), Total);
-	}
-
+	const int32 NumChunks = FMath::DivideAndRoundUp(Total, SafeMaxSnapshotsPerChunk);
 	const uint8 ChunkCount = static_cast<uint8>(FMath::Clamp(NumChunks, 1, 255));
 	++SnapshotSequence;
 
 	for (int32 ChunkIdx = 0; ChunkIdx < ChunkCount; ++ChunkIdx)
 	{
-		const int32 StartIdx = ChunkIdx * AATR_EchoManager::MaxEchoSnapshotsPerChunk;
-		const int32 EndIdx   = FMath::Min(StartIdx + AATR_EchoManager::MaxEchoSnapshotsPerChunk, Total);
+		const int32 StartIdx = ChunkIdx * SafeMaxSnapshotsPerChunk;
+		const int32 EndIdx   = FMath::Min(StartIdx + SafeMaxSnapshotsPerChunk, Total);
 
 		FEchoSnapshotChunk Chunk;
 		Chunk.Sequence      = SnapshotSequence;
@@ -199,24 +211,44 @@ void UATR_EchoReplicationComponent::SendDespawnChunk(const TArray<int32>& EchoIn
 {
 	if (EchoIndices.IsEmpty()) return;
 
-	FEchoSnapshotChunk Chunk;
-	Chunk.Sequence      = ++SnapshotSequence;
-	Chunk.ChunkIndex    = 0;
-	Chunk.ChunkCount    = 1;
-	Chunk.TotalEchoes   = 0;
-	Chunk.SnapshotKind  = EEchoSnapshotKind::Despawn;
-	Chunk.RelevancyBand = EEchoRelevancyBand::Near; // unused for Despawn
-	Chunk.ViewId        = 0;
-	Chunk.Snapshots.Reserve(EchoIndices.Num());
+	const int32 SafeMaxSnapshotsPerChunk = FMath::Clamp(MaxSnapshotsPerChunk, 1, 512);
+	const int32 MaxSnapshotsPerSequence = SafeMaxSnapshotsPerChunk * 255;
+	const int32 Total = EchoIndices.Num();
 
-	for (int32 Idx : EchoIndices)
+	for (int32 SequenceStart = 0; SequenceStart < Total; SequenceStart += MaxSnapshotsPerSequence)
 	{
-		FEchoSnapshot S;
-		S.EchoIndex = Idx;
-		Chunk.Snapshots.Add(S);
-	}
+		const int32 SequenceEnd = FMath::Min(SequenceStart + MaxSnapshotsPerSequence, Total);
+		const int32 SequenceTotal = SequenceEnd - SequenceStart;
+		const int32 NumChunks = FMath::DivideAndRoundUp(SequenceTotal, SafeMaxSnapshotsPerChunk);
+		const uint8 ChunkCount = static_cast<uint8>(FMath::Clamp(NumChunks, 1, 255));
+		const uint16 Sequence = ++SnapshotSequence;
 
-	Client_EchoSnapshotChunk(Chunk);
+		for (int32 ChunkIdx = 0; ChunkIdx < ChunkCount; ++ChunkIdx)
+		{
+			const int32 StartIdx = SequenceStart + ChunkIdx * SafeMaxSnapshotsPerChunk;
+			const int32 EndIdx = FMath::Min(StartIdx + SafeMaxSnapshotsPerChunk, SequenceEnd);
+			if (StartIdx >= EndIdx) break;
+
+			FEchoSnapshotChunk Chunk;
+			Chunk.Sequence      = Sequence;
+			Chunk.ChunkIndex    = static_cast<uint8>(ChunkIdx);
+			Chunk.ChunkCount    = ChunkCount;
+			Chunk.TotalEchoes   = 0;
+			Chunk.SnapshotKind  = EEchoSnapshotKind::Despawn;
+			Chunk.RelevancyBand = EEchoRelevancyBand::Near; // unused for Despawn
+			Chunk.ViewId        = 0;
+			Chunk.Snapshots.Reserve(EndIdx - StartIdx);
+
+			for (int32 j = StartIdx; j < EndIdx; ++j)
+			{
+				FEchoSnapshot S;
+				S.EchoIndex = EchoIndices[j];
+				Chunk.Snapshots.Add(S);
+			}
+
+			Client_EchoSnapshotChunk(Chunk);
+		}
+	}
 }
 
 // ─── Client RPC ───────────────────────────────────────────────────────────────
@@ -252,6 +284,14 @@ void UATR_EchoReplicationComponent::Client_EchoSnapshotChunk_Implementation(cons
 			UE_LOG(LogATR_EchoNet, Log,
 				TEXT("Requesting full echo resync. MissingCount=%d LastSeq=%d"),
 				MissingChunkCount, static_cast<int32>(LastReceivedSequence));
+
+			if (UWorld* World = GetWorld())
+			{
+				if (UATR_EchoSubsystem* Sub = World->GetSubsystem<UATR_EchoSubsystem>())
+					Sub->ClearClientEchoRelevancy();
+			}
+			PendingChunks.Empty();
+
 			Server_RequestFullResync(0, LastReceivedSequence);
 			LastResyncRequestTime = Now;
 			MissingChunkCount     = 0;
@@ -280,10 +320,7 @@ void UATR_EchoReplicationComponent::Client_EchoSnapshotChunk_Implementation(cons
 
 		if (Assembly.SnapshotKind == EEchoSnapshotKind::Despawn)
 		{
-			// Removal acknowledged — client stops rendering these echoes (Phase 8 ISM will act on this).
-			UE_LOG(LogATR_EchoNet, Verbose,
-				TEXT("Client despawn: %d echoes removed from local relevancy set."),
-				Assembly.Snapshots.Num());
+			ApplyDespawnToSubsystem(Assembly.Snapshots);
 		}
 		else
 		{
@@ -325,8 +362,10 @@ void UATR_EchoReplicationComponent::ApplyChunkToSubsystem(const TArray<FEchoSnap
 		return;
 	}
 
-	if (TotalEchoes > 0)
-		Sub->ActiveEntities = FMath::Clamp(TotalEchoes, 0, Sub->InitializeCount);
+	// TotalEchoes is server metadata only. This client receives a partial
+	// relevancy stream, so do not expand ActiveEntities to the server total.
+	// Each received EchoIndex is marked client-relevant individually below.
+	(void)TotalEchoes;
 
 	const float CellSz = Sub->SpatialGrid.GetCellSize();
 
@@ -334,7 +373,7 @@ void UATR_EchoReplicationComponent::ApplyChunkToSubsystem(const TArray<FEchoSnap
 	{
 		const int32 EchoIndex = S.EchoIndex;
 
-		if (EchoIndex < 0 || EchoIndex >= Sub->ActiveEntities)
+		if (EchoIndex < 0 || EchoIndex >= Sub->InitializeCount)
 			continue;
 
 		if (!Sub->Positions.IsValidIndex(EchoIndex) ||
@@ -363,9 +402,37 @@ void UATR_EchoReplicationComponent::ApplyChunkToSubsystem(const TArray<FEchoSnap
 		Sub->Positions[EchoIndex] = DecodeEchoCell(S, CellOrigin, CellSz);
 		Sub->Yaws[EchoIndex]      = (S.Yaw / 255.f) * 360.f;
 		Sub->AnimState[EchoIndex] = S.Anim;
+		Sub->MarkEchoClientRelevant(EchoIndex);
 		// Bump the dirty version so the client's ISM QueueTransformUpdate detects the change.
 		Sub->MarkEchoDirty(EchoIndex, EEchoDirtyFlags::Transform);
 	}
+}
+
+
+void UATR_EchoReplicationComponent::ApplyDespawnToSubsystem(const TArray<FEchoSnapshot>& Snapshots)
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	UATR_EchoSubsystem* Sub = World->GetSubsystem<UATR_EchoSubsystem>();
+	if (!Sub) return;
+
+	DespawnIndexScratch.Reset();
+	DespawnIndexScratch.Reserve(Snapshots.Num());
+
+	for (const FEchoSnapshot& S : Snapshots)
+	{
+		if (S.EchoIndex < 0 || S.EchoIndex >= Sub->InitializeCount)
+			continue;
+
+		DespawnIndexScratch.Add(S.EchoIndex);
+	}
+
+	Sub->MarkEchoesClientIrrelevant(DespawnIndexScratch);
+
+	UE_LOG(LogATR_EchoNet, Verbose,
+		TEXT("Client despawn: %d echoes removed from local relevancy set."),
+		DespawnIndexScratch.Num());
 }
 
 // ─── Quantization + Codec ─────────────────────────────────────────────────────

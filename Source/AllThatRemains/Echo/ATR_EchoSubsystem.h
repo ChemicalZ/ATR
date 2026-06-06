@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/BitArray.h"
 #include "Subsystems/WorldSubsystem.h"
 #include "ATR_EchoSubsystem.generated.h"
 
@@ -311,6 +312,15 @@ public:
 
 	bool ValidateEchoSpatialState() const;
 
+	// Client-side partial replication support. On clients, only snapshot-received
+	// echo indices are relevant/valid for local coarse/fine grid and ISM queries.
+	// Server/standalone treat every index in [0, ActiveEntities) as relevant.
+	bool IsEchoClientRelevant(int32 Index) const;
+	void MarkEchoClientRelevant(int32 Index);
+	void MarkEchoClientIrrelevant(int32 Index);
+	void MarkEchoesClientIrrelevant(const TArray<int32>& Indices);
+	void ClearClientEchoRelevancy();
+
 	// Called by AATR_EchoManager::BeginPlay on all machines — wires the Manager pointer
 	// on clients (where the Subsystem didn't spawn the Manager itself).
 	void SetManager(AATR_EchoManager* InManager) { Manager = InManager; }
@@ -323,6 +333,18 @@ public:
 	// Compact list of SoA indices currently promoted to an Actor.
 	// Maintained by PromoteEcho/DemoteEcho/RemoveEcho. Never has nullptr entries.
 	TArray<int32> PromotedIndices;
+
+	// Client-only validity mask for partial echo replication. On clients, indices
+	// with false bits must not be registered into spatial grids or rendered by ISM.
+	// On server/standalone this mask is ignored.
+	TBitArray<> ClientRelevantEchoMask;
+
+	// Compact client-only list of snapshot-relevant horde echo indices. This keeps
+	// client coarse-grid updates proportional to relevant echoes instead of the
+	// highest replicated SoA index. ClientRelevantEchoSlots maps SoA index -> slot
+	// in ClientRelevantEchoIndices for O(1) removal by swap.
+	TArray<int32> ClientRelevantEchoIndices;
+	TArray<int32> ClientRelevantEchoSlots;
 
 	// SoA parallel arrays for coarse grid registration (parallel to Positions).
 	// CoarseCellIds: current coarse cell per entity (INDEX_NONE = not registered).
@@ -376,4 +398,5 @@ private:
 	void RegisterEntityToCoarseGrid(int32 EntityIndex);
 	void UnregisterEntityFromCoarseGrid(int32 EntityIndex);
 	void MoveEntityCoarseCell(int32 EntityIndex, int32 NewCellId);
+	bool ShouldProcessEchoForLocalHorde(int32 Index) const;
 };

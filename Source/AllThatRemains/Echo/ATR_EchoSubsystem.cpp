@@ -179,6 +179,9 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	IndexToActor.SetNumZeroed(InitializeCount); // all nullptr
 	CoarseCellIds.Init(INDEX_NONE, InitializeCount);
 	CoarseSlotInCell.Init(INDEX_NONE, InitializeCount);
+	ClientRelevantEchoMask.Init(false, InitializeCount);
+	ClientRelevantEchoIndices.Reserve(256);
+	ClientRelevantEchoSlots.Init(INDEX_NONE, InitializeCount);
 	LocalVisitStamp.Init(0, InitializeCount);
 	LocalVisitEpoch = 1;
 
@@ -373,6 +376,7 @@ void UATR_EchoSubsystem::RebuildFineGrid()
 
 			CoarseGrid.ForEachEntityInRadius(XY, LocalZoneRadius, PosView, [this](int32 Ei)
 			{
+				if (!ShouldProcessEchoForLocalHorde(Ei)) return;
 				if (IndexToActor[Ei]) return; // promoted — owned by actor, not horde grid
 				if (LocalVisitStamp[Ei] == LocalVisitEpoch) return;
 				LocalVisitStamp[Ei] = LocalVisitEpoch;
@@ -390,6 +394,7 @@ void UATR_EchoSubsystem::RebuildFineGrid()
 		for (int32 Ei : LastLocalEntityScratch)
 		{
 			if (Ei < 0 || Ei >= ActiveEntities) continue;
+			if (!ShouldProcessEchoForLocalHorde(Ei)) continue;
 			if (LocalVisitStamp[Ei] != LocalVisitEpoch && !IndexToActor[Ei])
 				Velocities[Ei] = FVector3f::ZeroVector;
 		}
@@ -409,11 +414,30 @@ void UATR_EchoSubsystem::RebuildFineGrid()
 void UATR_EchoSubsystem::UpdateCoarseGrid()
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_UpdateCoarseGrid);
-	for (int32 i = 0; i < ActiveEntities; ++i)
+
+	const UWorld* World = GetWorld();
+	const bool bClientPartialReplication = World && World->GetNetMode() == NM_Client;
+
+	auto UpdateOne = [this](int32 i)
 	{
-		if (IndexToActor[i]) continue; // promoted entity SoA position is stale until demotion
+		if (!ShouldProcessEchoForLocalHorde(i)) return;
+		if (IndexToActor[i]) return; // promoted entity SoA position is stale until demotion
 		const int32 NewCell = CoarseGrid.GetCellId(FVector2f(Positions[i].X, Positions[i].Y));
 		if (NewCell != CoarseCellIds[i]) MoveEntityCoarseCell(i, NewCell);
+	};
+
+	if (bClientPartialReplication)
+	{
+		for (int32 i : ClientRelevantEchoIndices)
+		{
+			UpdateOne(i);
+		}
+		return;
+	}
+
+	for (int32 i = 0; i < ActiveEntities; ++i)
+	{
+		UpdateOne(i);
 	}
 }
 
@@ -878,6 +902,7 @@ void UATR_EchoSubsystem::QueryEchoesByRelevancyBands(
 
 	for (int32 Idx : AllInRange)
 	{
+		if (!ShouldProcessEchoForLocalHorde(Idx)) continue;
 		if (IndexToActor[Idx]) continue; // promoted this frame — handled as real actor, not horde/ISM
 
 		const FVector3f D   = Positions[Idx] - Origin3f;
@@ -914,6 +939,8 @@ bool UATR_EchoSubsystem::ValidateEchoSpatialState() const
 
 	for (int32 i = 0; i < ActiveEntities; ++i)
 	{
+		if (!ShouldProcessEchoForLocalHorde(i)) continue;
+
 		if (CoarseCellIds[i] == INDEX_NONE)
 		{
 			UE_LOG(LogTemp, Error, TEXT("Echo %d has invalid CoarseCellId"), i);
@@ -957,6 +984,197 @@ bool UATR_EchoSubsystem::ValidateEchoSpatialState() const
 #else
 	return true;
 #endif
+}
+
+
+// ─── Client Relevancy State ───────────────────────────────────────────────────
+
+bool UATR_EchoSubsystem::IsEchoClientRelevant(int32 Index) const
+{
+	if (Index < 0 || Index >= InitializeCount)
+		return false;
+
+	const UWorld* World = GetWorld();
+	if (!World || World->GetNetMode() != NM_Client)
+		return Index < ActiveEntities;
+
+	return ClientRelevantEchoMask.IsValidIndex(Index) && ClientRelevantEchoMask[Index];
+}
+
+bool UATR_EchoSubsystem::ShouldProcessEchoForLocalHorde(int32 Index) const
+{
+	if (Index < 0 || Index >= ActiveEntities)
+		return false;
+
+	const UWorld* World = GetWorld();
+	if (!World || World->GetNetMode() != NM_Client)
+		return true;
+
+	return ClientRelevantEchoMask.IsValidIndex(Index) && ClientRelevantEchoMask[Index];
+}
+
+void UATR_EchoSubsystem::MarkEchoClientRelevant(int32 Index)
+{
+	if (Index < 0 || Index >= InitializeCount)
+		return;
+
+	if (ClientRelevantEchoMask.Num() < InitializeCount)
+		ClientRelevantEchoMask.Init(false, InitializeCount);
+
+	if (ClientRelevantEchoSlots.Num() < InitializeCount)
+		ClientRelevantEchoSlots.Init(INDEX_NONE, InitializeCount);
+
+	if (ActiveEntities <= Index)
+		ActiveEntities = Index + 1;
+
+	const bool bWasRelevant = ClientRelevantEchoMask[Index];
+	ClientRelevantEchoMask[Index] = true;
+
+	if (!bWasRelevant)
+	{
+		ClientRelevantEchoSlots[Index] = ClientRelevantEchoIndices.Num();
+		ClientRelevantEchoIndices.Add(Index);
+	}
+	else if (!ClientRelevantEchoIndices.IsValidIndex(ClientRelevantEchoSlots[Index]) ||
+		ClientRelevantEchoIndices[ClientRelevantEchoSlots[Index]] != Index)
+	{
+		const int32 ExistingSlot = ClientRelevantEchoIndices.IndexOfByKey(Index);
+		if (ExistingSlot != INDEX_NONE)
+		{
+			ClientRelevantEchoSlots[Index] = ExistingSlot;
+		}
+		else
+		{
+			ClientRelevantEchoSlots[Index] = ClientRelevantEchoIndices.Num();
+			ClientRelevantEchoIndices.Add(Index);
+		}
+	}
+
+	if (CoarseGrid.IsInitialized())
+	{
+		const int32 NewCell = CoarseGrid.GetCellId(FVector2f(Positions[Index].X, Positions[Index].Y));
+		if (CoarseCellIds[Index] == INDEX_NONE)
+		{
+			RegisterEntityToCoarseGrid(Index);
+		}
+		else if (NewCell != CoarseCellIds[Index])
+		{
+			MoveEntityCoarseCell(Index, NewCell);
+		}
+	}
+}
+
+void UATR_EchoSubsystem::MarkEchoClientIrrelevant(int32 Index)
+{
+	TArray<int32> SingleIndex;
+	SingleIndex.Reserve(1);
+	SingleIndex.Add(Index);
+	MarkEchoesClientIrrelevant(SingleIndex);
+}
+
+void UATR_EchoSubsystem::MarkEchoesClientIrrelevant(const TArray<int32>& Indices)
+{
+	if (Indices.IsEmpty())
+		return;
+
+	const UWorld* World = GetWorld();
+	const bool bClientWorld = World && World->GetNetMode() == NM_Client;
+	bool bRemovedAnyRelevantEcho = false;
+
+	for (int32 Index : Indices)
+	{
+		if (Index < 0 || Index >= InitializeCount)
+			continue;
+
+		const bool bWasRelevant =
+			ClientRelevantEchoMask.IsValidIndex(Index) && ClientRelevantEchoMask[Index];
+
+		if (ClientRelevantEchoMask.IsValidIndex(Index))
+			ClientRelevantEchoMask[Index] = false;
+
+		if (ClientRelevantEchoSlots.IsValidIndex(Index))
+		{
+			const int32 Slot = ClientRelevantEchoSlots[Index];
+			if (ClientRelevantEchoIndices.IsValidIndex(Slot) && ClientRelevantEchoIndices[Slot] == Index)
+			{
+				const int32 LastSlot = ClientRelevantEchoIndices.Num() - 1;
+				const int32 MovedIndex = ClientRelevantEchoIndices[LastSlot];
+				ClientRelevantEchoIndices.RemoveAtSwap(Slot, 1, EAllowShrinking::No);
+
+				if (Slot != LastSlot && ClientRelevantEchoSlots.IsValidIndex(MovedIndex))
+				{
+					ClientRelevantEchoSlots[MovedIndex] = Slot;
+				}
+			}
+			else if (bWasRelevant)
+			{
+				const int32 FoundSlot = ClientRelevantEchoIndices.IndexOfByKey(Index);
+				if (FoundSlot != INDEX_NONE)
+				{
+					const int32 LastSlot = ClientRelevantEchoIndices.Num() - 1;
+					const int32 MovedIndex = ClientRelevantEchoIndices[LastSlot];
+					ClientRelevantEchoIndices.RemoveAtSwap(FoundSlot, 1, EAllowShrinking::No);
+
+					if (FoundSlot != LastSlot && ClientRelevantEchoSlots.IsValidIndex(MovedIndex))
+					{
+						ClientRelevantEchoSlots[MovedIndex] = FoundSlot;
+					}
+				}
+			}
+
+			ClientRelevantEchoSlots[Index] = INDEX_NONE;
+		}
+
+		if (Index < ActiveEntities && CoarseCellIds.IsValidIndex(Index) && CoarseCellIds[Index] != INDEX_NONE)
+			UnregisterEntityFromCoarseGrid(Index);
+
+		if (Velocities.IsValidIndex(Index))     Velocities[Index]     = FVector3f::ZeroVector;
+		if (Accelerations.IsValidIndex(Index)) Accelerations[Index] = FVector3f::ZeroVector;
+		if (Forces.IsValidIndex(Index))        Forces[Index]        = FVector3f::ZeroVector;
+		if (LocalVisitStamp.IsValidIndex(Index)) LocalVisitStamp[Index] = 0;
+
+		LocalEntityScratch.RemoveAllSwap([Index](int32 Ei) { return Ei == Index; }, EAllowShrinking::No);
+		LastLocalEntityScratch.RemoveAllSwap([Index](int32 Ei) { return Ei == Index; }, EAllowShrinking::No);
+
+		bRemovedAnyRelevantEcho |= bWasRelevant;
+	}
+
+	// Keep ActiveEntities as the highest currently relevant client index + 1 so legacy
+	// array range checks remain valid without forcing client scans over stale sparse rows.
+	if (bClientWorld && bRemovedAnyRelevantEcho)
+	{
+		int32 HighestRelevant = INDEX_NONE;
+		for (int32 RelevantIndex : ClientRelevantEchoIndices)
+		{
+			HighestRelevant = FMath::Max(HighestRelevant, RelevantIndex);
+		}
+		ActiveEntities = HighestRelevant + 1;
+	}
+}
+
+void UATR_EchoSubsystem::ClearClientEchoRelevancy()
+{
+	const UWorld* World = GetWorld();
+	if (World && World->GetNetMode() != NM_Client)
+		return;
+
+	for (int32 Index : ClientRelevantEchoIndices)
+	{
+		if (Index >= 0 && Index < ActiveEntities &&
+			CoarseCellIds.IsValidIndex(Index) && CoarseCellIds[Index] != INDEX_NONE)
+		{
+			UnregisterEntityFromCoarseGrid(Index);
+		}
+	}
+
+	ClientRelevantEchoMask.Init(false, InitializeCount);
+	ClientRelevantEchoSlots.Init(INDEX_NONE, InitializeCount);
+	ClientRelevantEchoIndices.Reset();
+	LocalEntityScratch.Reset();
+	LastLocalEntityScratch.Reset();
+	SpatialGrid.Reset();
+	bGridReady = false;
+	ActiveEntities = 0;
 }
 
 // ─── ForceDestroyEcho ─────────────────────────────────────────────────────────

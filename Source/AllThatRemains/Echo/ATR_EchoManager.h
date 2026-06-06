@@ -157,9 +157,6 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Echo|ISM")
 	FRotator ISMMeshRotationOffset = FRotator::ZeroRotator;
 
-	UPROPERTY(BlueprintReadOnly, Category = "Echo|ISM")
-	bool bDebugShowPromotedEchoISM = false;
-
 	// --- Visual band distances (cached from UATR_EchoSettings in BeginPlay) ---
 	// These come from the Echo|Rendering settings (VisualNearDistance, etc.) and
 	// are deliberately NOT the Echo|Networking relevancy ranges. They drive what
@@ -221,6 +218,11 @@ private:
 	// Grow EchoVisualStamp to at least RequiredCapacity. Never shrinks during play.
 	void EnsureVisualStampCapacity(int32 RequiredCapacity);
 
-	// Apply performance-oriented defaults (collision/shadow/decal/distance-field) from settings.
+	// Apply hard performance-safe defaults that do not depend on project settings.
+	// Called from the constructor so CDO/component defaults are safe even before settings are read.
+	void ApplyISMSafeDefaults(UInstancedStaticMeshComponent* ISM);
+
+	// Apply designer-configurable rendering flags from validated UATR_EchoSettings.
+	// Called from BeginPlay after ValidateAndClamp().
 	void ConfigureISMComponent(UInstancedStaticMeshComponent* ISM);
 };

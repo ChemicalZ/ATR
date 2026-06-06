@@ -32,11 +32,11 @@ AATR_EchoManager::AATR_EchoManager()
 	ISM_Mid->SetupAttachment(Root);
 	ISM_Far->SetupAttachment(Root);
 
-	// ISM components never tick themselves and use performance-oriented render
-	// defaults (no collision/shadows/decals/distance-field unless a designer opts in).
-	ConfigureISMComponent(ISM_Near);
-	ConfigureISMComponent(ISM_Mid);
-	ConfigureISMComponent(ISM_Far);
+	// Constructor-time defaults must not depend on developer settings.
+	// Settings are validated and applied in BeginPlay.
+	ApplyISMSafeDefaults(ISM_Near);
+	ApplyISMSafeDefaults(ISM_Mid);
+	ApplyISMSafeDefaults(ISM_Far);
 }
 
 void AATR_EchoManager::BeginPlay()
@@ -45,12 +45,21 @@ void AATR_EchoManager::BeginPlay()
 
 	// Visual band distances come from Echo|Rendering — NOT the network relevancy
 	// ranges. Rendering and networking solve different problems (RenderThread cost
-	// vs bandwidth) and must be tuned independently.
-	const UATR_EchoSettings* Settings = GetDefault<UATR_EchoSettings>();
-	NearBandDistance          = Settings->VisualNearDistance;
-	MidBandDistance           = Settings->VisualMidDistance;
-	FarBandDistance           = Settings->VisualFarDistance;
-	bDebugShowPromotedEchoISM = Settings->bDebugShowPromotedEchoISM;
+	// vs bandwidth) and must be tuned independently. Validate first so hand-edited
+	// config cannot violate distance ordering or LocalZoneRadius invariants.
+	if (UATR_EchoSettings* Settings = GetMutableDefault<UATR_EchoSettings>())
+	{
+		Settings->ValidateAndClamp();
+
+		NearBandDistance = Settings->VisualNearDistance;
+		MidBandDistance  = Settings->VisualMidDistance;
+		FarBandDistance  = Settings->VisualFarDistance;
+	}
+
+	// Settings-driven render flags are applied after validation.
+	ConfigureISMComponent(ISM_Near);
+	ConfigureISMComponent(ISM_Mid);
+	ConfigureISMComponent(ISM_Far);
 
 	// Wire ourselves into the Subsystem on all machines (server sets it via SpawnActor
 	// return value; client sets it here when the replicated actor arrives).
@@ -221,16 +230,29 @@ void AATR_EchoManager::RemoveUnstampedEchoes(UATR_EchoSubsystem* Sub)
 
 // ─── ISM Helpers ──────────────────────────────────────────────────────────────
 
+void AATR_EchoManager::ApplyISMSafeDefaults(UInstancedStaticMeshComponent* ISM)
+{
+	if (!ISM) return;
+
+	ISM->SetComponentTickEnabled(false);
+	ISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	ISM->SetGenerateOverlapEvents(false);
+
+	ISM->SetCastShadow(false);
+	ISM->bCastDynamicShadow = false;
+	ISM->bCastStaticShadow = false;
+	ISM->bReceivesDecals = false;
+	ISM->bAffectDistanceFieldLighting = false;
+}
+
 void AATR_EchoManager::ConfigureISMComponent(UInstancedStaticMeshComponent* ISM)
 {
 	if (!ISM) return;
 
 	const UATR_EchoSettings* Settings = GetDefault<UATR_EchoSettings>();
 
-	// ISM components never tick themselves — updated via UpdateISM().
-	ISM->SetComponentTickEnabled(false);
-	ISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	ISM->SetGenerateOverlapEvents(false);
+	// Preserve hard safety defaults even if a setting read fails.
+	ApplyISMSafeDefaults(ISM);
 
 	const bool bCastShadows               = Settings ? Settings->bHordeISMCastShadows : false;
 	const bool bReceivesDecals            = Settings ? Settings->bHordeISMReceivesDecals : false;
