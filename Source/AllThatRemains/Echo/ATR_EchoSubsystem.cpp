@@ -9,6 +9,7 @@
 #include "Engine/World.h"
 #include "Async/ParallelFor.h"
 #include "Logging/StructuredLog.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 
 // ─── FATR_SparseGrid ─────────────────────────────────────────────────────────
 
@@ -29,8 +30,11 @@ void FATR_SparseGrid::Initialize(FVector2D InWorldMin, FVector2D InWorldMax, flo
 void FATR_SparseGrid::Reset()
 {
 	for (int32 Key : PopulatedCells)
-		Cells[Key].Reset();
+		if (TArray<int32>* Bucket = Cells.Find(Key)) Bucket->Reset();
 	PopulatedCells.Reset();
+
+	constexpr int32 MaxRetainedSparseCells = 4096;
+	if (Cells.Num() > MaxRetainedSparseCells) Cells.Reset();
 }
 
 void FATR_SparseGrid::Build(TArrayView<const FVector3f> Positions, const TArray<int32>& LocalIndices)
@@ -87,7 +91,45 @@ void FATR_CoarseGrid::Initialize(FVector2D InWorldMin, FVector2D InWorldMax, flo
 	NumCellsX = FMath::Max(1, FMath::CeilToInt(Extent.X * InvCellSize));
 	NumCellsY = FMath::Max(1, FMath::CeilToInt(Extent.Y * InvCellSize));
 
-	CellCounts.Reset();
+	CellEntities.Reset();
+}
+
+void FATR_CoarseGrid::AddEntity(int32 EntityIndex, int32 CellId, int32& OutSlotInCell)
+{
+	TArray<int32>& Bucket = CellEntities.FindOrAdd(CellId);
+	OutSlotInCell = Bucket.Num();
+	Bucket.Add(EntityIndex);
+}
+
+int32 FATR_CoarseGrid::RemoveEntityAndReturnMoved(int32 EntityIndex, int32 CellId, int32 SlotInCell)
+{
+	TArray<int32>* Bucket = CellEntities.Find(CellId);
+	if (!ensureAlways(Bucket)) return INDEX_NONE;
+	if (!ensureAlways(Bucket->IsValidIndex(SlotInCell))) return INDEX_NONE;
+	if (!ensureAlways((*Bucket)[SlotInCell] == EntityIndex)) return INDEX_NONE;
+
+	const int32 LastSlot    = Bucket->Num() - 1;
+	const int32 MovedEntity = (*Bucket)[LastSlot];
+	Bucket->RemoveAtSwap(SlotInCell, 1, EAllowShrinking::No);
+	if (Bucket->IsEmpty()) { CellEntities.Remove(CellId); return INDEX_NONE; }
+	return (SlotInCell != LastSlot) ? MovedEntity : INDEX_NONE;
+}
+
+void FATR_CoarseGrid::ReplaceEntityAtSlot(int32 CellId, int32 SlotInCell, int32 ExpectedOld, int32 NewEntity)
+{
+	TArray<int32>* Bucket = CellEntities.Find(CellId);
+	if (!ensureAlways(Bucket)) return;
+	if (!ensureAlways(Bucket->IsValidIndex(SlotInCell))) return;
+	if (!ensureAlways((*Bucket)[SlotInCell] == ExpectedOld)) return;
+	(*Bucket)[SlotInCell] = NewEntity;
+}
+
+bool FATR_CoarseGrid::ValidateEntitySlot(int32 EntityIndex, int32 CellId, int32 SlotInCell) const
+{
+	const TArray<int32>* Bucket = CellEntities.Find(CellId);
+	if (!Bucket) return false;
+	if (!Bucket->IsValidIndex(SlotInCell)) return false;
+	return (*Bucket)[SlotInCell] == EntityIndex;
 }
 
 // ─── UATR_EchoSubsystem ──────────────────────────────────────────────────────
@@ -132,13 +174,16 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	DirtyStates.SetNumZeroed(InitializeCount);
 	IndexToActor.SetNumZeroed(InitializeCount); // all nullptr
 	CoarseCellIds.Init(INDEX_NONE, InitializeCount);
+	CoarseSlotInCell.Init(INDEX_NONE, InitializeCount);
+	LocalVisitStamp.Init(0, InitializeCount);
+	LocalVisitEpoch = 1;
 
 	PositionDirtyThresholdSq = FMath::Square(Settings->PositionDirtyThreshold);
 	YawDirtyThresholdDeg     = Settings->YawDirtyThresholdDegrees;
 
 	PromotedIndices.Reserve(PoolSize);
 	LocalEntityScratch.Reserve(256);
-	WasLocalLastFrame.Init(false, InitializeCount);
+	LastLocalEntityScratch.Reserve(512);
 
 	bInitialized = true;
 }
@@ -215,40 +260,49 @@ void UATR_EchoSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 void UATR_EchoSubsystem::Tick(float DeltaTime)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoSubsystem_Tick);
 	Super::Tick(DeltaTime);
 
 	const ENetMode NetMode = GetWorld()->GetNetMode();
 
-	// Fine grid first — steering pass, promotion pass, and ISM all need it.
-	// Clients rebuild from received snapshot positions; server from authoritative SoA.
-	if (ActiveEntities > 0)
-	{
-		RebuildFineGrid();
-		UpdateCoarseGrid();
-	}
-
+	// ── Server / Standalone ───────────────────────────────────────────────────
+	// Sim runs at SimHz — coarse grid updated inside the fixed step loop so it
+	// stays current after integration. Fine grid rebuilt once per render tick.
 	if (NetMode != NM_Client && ActiveEntities > 0)
 	{
-		// Steering writes horde velocities before SimTick integrates them.
-		RunSteeringPass();
-
 		TickAccumulator += DeltaTime;
 		const float SimInterval = 1.f / static_cast<float>(FMath::Max(1, SimHz));
 		while (TickAccumulator >= SimInterval)
 		{
 			SimTick(SimInterval);
+			UpdateCoarseGrid();
 			TickAccumulator -= SimInterval;
 		}
 
-		// Promotion pass after integration — IndexToActor is stable for UpdateISM.
+		RebuildFineGrid();
+		RunSteeringPass();
 		RunPromotionPass();
 	}
 
+	// ── Client ────────────────────────────────────────────────────────────────
+	// Clients receive positions via replication. They must update their coarse
+	// grid before rebuilding the fine grid — otherwise ForEachEntityInRadius
+	// queries an empty CellEntities map.
+	if (NetMode == NM_Client && ActiveEntities > 0)
+	{
+		UpdateCoarseGrid();
+		RebuildFineGrid();
+	}
+
 	if (Manager && NetMode != NM_DedicatedServer)
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(Echo_UpdateISM);
 		Manager->UpdateISM(this);
+	}
 
 	if (NetMode != NM_Client)
 	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(Echo_ServerReplication);
 		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
 		{
 			APlayerController* PC = It->Get();
@@ -272,6 +326,7 @@ void UATR_EchoSubsystem::Tick(float DeltaTime)
 
 void UATR_EchoSubsystem::SimTick(float DeltaTime)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_SimTick);
 	const int32 Count = ActiveEntities;
 
 	// Each entity touches only its own SoA slots — no cross-entity writes.
@@ -292,70 +347,119 @@ void UATR_EchoSubsystem::SimTick(float DeltaTime)
 
 void UATR_EchoSubsystem::RebuildFineGrid()
 {
-	// Build local entity set — entities within LocalZoneRadius of any player.
-	// Use TSet for O(1) dedup in multi-player scenarios.
-	TSet<int32> LocalSet;
-	LocalEntityScratch.Reset();
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_RebuildFineGrid);
 
-	const float ZoneSq = LocalZoneRadius * LocalZoneRadius;
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+	if (++LocalVisitEpoch == 0)
 	{
-		APlayerController* PC = It->Get();
-		if (!PC || !PC->GetPawn()) continue;
-		const FVector3f PP = FVector3f(PC->GetPawn()->GetActorLocation());
+		LocalVisitStamp.Init(0, InitializeCount);
+		LocalVisitEpoch = 1;
+	}
 
-		for (int32 i = 0; i < ActiveEntities; ++i)
+	LocalEntityScratch.Reset();
+	const TArrayView<const FVector3f> PosView(Positions.GetData(), ActiveEntities);
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(Echo_RebuildFineGrid_GatherLocal);
+		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
 		{
-			const FVector3f D = Positions[i] - PP;
-			if (D.X * D.X + D.Y * D.Y <= ZoneSq)
+			APlayerController* PC = It->Get();
+			if (!PC || !PC->GetPawn()) continue;
+			const FVector Loc = PC->GetPawn()->GetActorLocation();
+			const FVector2f XY(static_cast<float>(Loc.X), static_cast<float>(Loc.Y));
+
+			CoarseGrid.ForEachEntityInRadius(XY, LocalZoneRadius, PosView, [this](int32 Ei)
 			{
-				bool bAlreadyIn = false;
-				LocalSet.Add(i, &bAlreadyIn);
-				if (!bAlreadyIn)
-					LocalEntityScratch.Add(i);
-			}
+				if (IndexToActor[Ei]) return; // promoted — owned by actor, not horde grid
+				if (LocalVisitStamp[Ei] == LocalVisitEpoch) return;
+				LocalVisitStamp[Ei] = LocalVisitEpoch;
+				LocalEntityScratch.Add(Ei);
+			});
 		}
 	}
 
-	// Zero velocities for entities that left the local zone since last frame.
-	// Without this, an entity that was steered and then exited the zone would
-	// continue integrating a stale velocity indefinitely.
-	for (int32 i = 0; i < ActiveEntities; ++i)
 	{
-		if (WasLocalLastFrame[i] && !IndexToActor[i] && !LocalSet.Contains(i))
-			Velocities[i] = FVector3f::ZeroVector;
+		TRACE_CPUPROFILER_EVENT_SCOPE(Echo_RebuildFineGrid_ZeroExited);
+		// Zero velocities for unpromoted entities that left the local zone since last frame.
+		// Without this, an entity that was steered and then exited the zone would
+		// continue integrating a stale velocity indefinitely.
+		// Bounds check guards against indices invalidated by swap-remove in RemoveEcho.
+		for (int32 Ei : LastLocalEntityScratch)
+		{
+			if (Ei < 0 || Ei >= ActiveEntities) continue;
+			if (LocalVisitStamp[Ei] != LocalVisitEpoch && !IndexToActor[Ei])
+				Velocities[Ei] = FVector3f::ZeroVector;
+		}
 	}
 
-	// Update zone membership for next frame
-	WasLocalLastFrame.Init(false, InitializeCount);
-	for (int32 i : LocalEntityScratch)
-		WasLocalLastFrame[i] = true;
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(Echo_RebuildFineGrid_BuildSparseGrid);
+		SpatialGrid.Reset();
+		SpatialGrid.Build(PosView, LocalEntityScratch);
+		bGridReady = true;
+	}
 
-	SpatialGrid.Reset();
-	SpatialGrid.Build(
-		TArrayView<const FVector3f>(Positions.GetData(), ActiveEntities),
-		LocalEntityScratch
-	);
-	bGridReady = true;
+	LastLocalEntityScratch.Reset();
+	LastLocalEntityScratch.Append(LocalEntityScratch);
 }
 
 void UATR_EchoSubsystem::UpdateCoarseGrid()
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_UpdateCoarseGrid);
 	for (int32 i = 0; i < ActiveEntities; ++i)
 	{
+		if (IndexToActor[i]) continue; // promoted entity SoA position is stale until demotion
 		const int32 NewCell = CoarseGrid.GetCellId(FVector2f(Positions[i].X, Positions[i].Y));
-		if (CoarseCellIds[i] == INDEX_NONE)
-		{
-			CoarseGrid.OnEntityAdded(NewCell);
-			CoarseCellIds[i] = NewCell;
-		}
-		else if (NewCell != CoarseCellIds[i])
-		{
-			CoarseGrid.OnEntityRemoved(CoarseCellIds[i]);
-			CoarseGrid.OnEntityAdded(NewCell);
-			CoarseCellIds[i] = NewCell;
-		}
+		if (NewCell != CoarseCellIds[i]) MoveEntityCoarseCell(i, NewCell);
 	}
+}
+
+// ─── Coarse Registration Helpers ─────────────────────────────────────────────
+
+void UATR_EchoSubsystem::RegisterEntityToCoarseGrid(int32 EntityIndex)
+{
+	if (!ensureAlways(EntityIndex >= 0 && EntityIndex < ActiveEntities)) return;
+	if (!ensureAlways(CoarseGrid.IsInitialized())) return;
+	if (CoarseCellIds[EntityIndex] != INDEX_NONE) return;
+
+	const FVector3f& P  = Positions[EntityIndex];
+	const int32 CellId  = CoarseGrid.GetCellId(FVector2f(P.X, P.Y));
+	int32 SlotInCell    = INDEX_NONE;
+	CoarseGrid.AddEntity(EntityIndex, CellId, SlotInCell);
+	CoarseCellIds[EntityIndex]    = CellId;
+	CoarseSlotInCell[EntityIndex] = SlotInCell;
+}
+
+void UATR_EchoSubsystem::UnregisterEntityFromCoarseGrid(int32 EntityIndex)
+{
+	if (!ensureAlways(EntityIndex >= 0 && EntityIndex < ActiveEntities)) return;
+	const int32 CellId    = CoarseCellIds[EntityIndex];
+	const int32 SlotInCell = CoarseSlotInCell[EntityIndex];
+	if (CellId == INDEX_NONE) { CoarseSlotInCell[EntityIndex] = INDEX_NONE; return; }
+
+	const int32 MovedEntity = CoarseGrid.RemoveEntityAndReturnMoved(EntityIndex, CellId, SlotInCell);
+	if (MovedEntity != INDEX_NONE) CoarseSlotInCell[MovedEntity] = SlotInCell;
+
+	CoarseCellIds[EntityIndex]    = INDEX_NONE;
+	CoarseSlotInCell[EntityIndex] = INDEX_NONE;
+}
+
+void UATR_EchoSubsystem::MoveEntityCoarseCell(int32 EntityIndex, int32 NewCellId)
+{
+	if (!ensureAlways(EntityIndex >= 0 && EntityIndex < ActiveEntities)) return;
+	const int32 OldCellId = CoarseCellIds[EntityIndex];
+	if (OldCellId == NewCellId) return;
+
+	if (OldCellId != INDEX_NONE)
+	{
+		const int32 OldSlot   = CoarseSlotInCell[EntityIndex];
+		const int32 MovedEnt  = CoarseGrid.RemoveEntityAndReturnMoved(EntityIndex, OldCellId, OldSlot);
+		if (MovedEnt != INDEX_NONE) CoarseSlotInCell[MovedEnt] = OldSlot;
+	}
+
+	int32 NewSlot = INDEX_NONE;
+	CoarseGrid.AddEntity(EntityIndex, NewCellId, NewSlot);
+	CoarseCellIds[EntityIndex]    = NewCellId;
+	CoarseSlotInCell[EntityIndex] = NewSlot;
 }
 
 int32 UATR_EchoSubsystem::AddEcho(FVector3f Position)
@@ -377,7 +481,13 @@ int32 UATR_EchoSubsystem::AddEcho(FVector3f Position)
 	Yaws[Idx]           = 0.f;
 	DirtyStates[Idx]    = FEchoDirtyState{ EEchoDirtyFlags::Spawn, 1 };
 	IndexToActor[Idx]   = nullptr;
-	CoarseCellIds[Idx]  = INDEX_NONE; // registered by UpdateCoarseGrid() on first tick
+	CoarseCellIds[Idx]    = INDEX_NONE;
+	CoarseSlotInCell[Idx] = INDEX_NONE;
+	LocalVisitStamp[Idx]  = 0;
+
+	if (CoarseGrid.IsInitialized())
+		RegisterEntityToCoarseGrid(Idx);
+
 	return Idx;
 }
 
@@ -386,21 +496,33 @@ void UATR_EchoSubsystem::RemoveEcho(int32 Index)
 	if (Index < 0 || Index >= ActiveEntities)
 		return;
 
-	// Caller must demote before removing — promoted actors track their SoA slot.
-	ensureAlways(!IndexToActor[Index]);
-
-	// Remove entity from coarse grid before slot is vacated
-	if (CoarseCellIds[Index] != INDEX_NONE)
+	if (IndexToActor[Index])
 	{
-		CoarseGrid.OnEntityRemoved(CoarseCellIds[Index]);
-		CoarseCellIds[Index] = INDEX_NONE;
+		DemoteEcho(IndexToActor[Index]);
+		if (!ensureAlways(IndexToActor[Index] == nullptr))
+			return;
 	}
 
-	const int32 Last = --ActiveEntities;
+	// Remove entity from coarse grid before its slot is reused.
+	UnregisterEntityFromCoarseGrid(Index);
+
+	const int32 Last = ActiveEntities - 1; // capture before decrement
+
+	// Patch LastLocalEntityScratch to mirror the swap-remove.
+	// Index is deleted; Last moves into Index. If Last was tracked as local, re-add it as Index.
+	{
+		const bool bMovedLastWasLocal = Index != Last && LastLocalEntityScratch.Contains(Last);
+		LastLocalEntityScratch.RemoveAllSwap(
+			[Index, Last](int32 Ei) { return Ei == Index || Ei == Last; },
+			EAllowShrinking::No
+		);
+		if (bMovedLastWasLocal)
+			LastLocalEntityScratch.Add(Index);
+	}
 
 	if (Index != Last)
 	{
-		// Swap-remove: copy Last into gap
+		// Swap-remove: copy Last into the gap.
 		Positions[Index]     = Positions[Last];
 		Velocities[Index]    = Velocities[Last];
 		Accelerations[Index] = Accelerations[Last];
@@ -410,32 +532,52 @@ void UATR_EchoSubsystem::RemoveEcho(int32 Index)
 		PromotionTimes[Index] = PromotionTimes[Last];
 		DirtyStates[Index]    = DirtyStates[Last];
 		Yaws[Index]           = Yaws[Last];
-		CoarseCellIds[Index]  = CoarseCellIds[Last];
-		CoarseCellIds[Last]   = INDEX_NONE;
 
-		// Patch the moved entity's Actor so it knows its new slot
+		// Capture before overwrite — needed for ReplaceEntityAtSlot and for the
+		// same-cell case where UnregisterEntityFromCoarseGrid may have updated
+		// CoarseSlotInCell[Last] already.
+		const int32 OldLastCoarseCell = CoarseCellIds[Last];
+		const int32 OldLastCoarseSlot = CoarseSlotInCell[Last];
+
+		CoarseCellIds[Index]    = OldLastCoarseCell;
+		CoarseSlotInCell[Index] = OldLastCoarseSlot;
+		LocalVisitStamp[Index]  = LocalVisitStamp[Last];
+
+		// Patch the coarse bucket: the slot still holds Last; relabel it to Index.
+		if (OldLastCoarseCell != INDEX_NONE)
+			CoarseGrid.ReplaceEntityAtSlot(OldLastCoarseCell, OldLastCoarseSlot, Last, Index);
+
+		// Clear the vacated Last slot.
+		CoarseCellIds[Last]    = INDEX_NONE;
+		CoarseSlotInCell[Last] = INDEX_NONE;
+		LocalVisitStamp[Last]  = 0;
+
+		// Patch the moved entity's Actor so it knows its new slot.
 		if (IndexToActor[Last])
 		{
 			IndexToActor[Index]              = IndexToActor[Last];
 			IndexToActor[Index]->SourceIndex = Index;
 			IndexToActor[Last]               = nullptr;
 
-			// Patch PromotedIndices: Last moved to Index
+			// Patch PromotedIndices: Last moved to Index.
 			const int32 PIIdx = PromotedIndices.IndexOfByKey(Last);
 			if (ensureAlways(PIIdx != INDEX_NONE))
 				PromotedIndices[PIIdx] = Index;
 		}
 	}
+
+	--ActiveEntities; // decrement last — helpers above need the valid range
 }
 
-void UATR_EchoSubsystem::PromoteToActive(int32 SoAIndex, AATR_ActiveEcho* Actor)
+bool UATR_EchoSubsystem::PromoteToActive(int32 SoAIndex, AATR_ActiveEcho* Actor)
 {
-	if (!ensureAlways(Actor && SoAIndex >= 0 && SoAIndex < ActiveEntities)) return;
-	if (!ensureAlways(!IndexToActor[SoAIndex])) return; // double-promote guard
+	if (!ensureAlways(Actor && SoAIndex >= 0 && SoAIndex < ActiveEntities)) return false;
+	if (!ensureAlways(!IndexToActor[SoAIndex])) return false; // double-promote guard
 
-	IndexToActor[SoAIndex]    = Actor;
-	Actor->SourceIndex         = SoAIndex;
-	PromotionTimes[SoAIndex]  = GetWorld()->GetTimeSeconds();
+	IndexToActor[SoAIndex]   = Actor;
+	Actor->SourceIndex        = SoAIndex;
+	PromotionTimes[SoAIndex] = GetWorld()->GetTimeSeconds();
+	return true;
 }
 
 void UATR_EchoSubsystem::DemoteToHorde(AATR_ActiveEcho* Actor)
@@ -446,6 +588,10 @@ void UATR_EchoSubsystem::DemoteToHorde(AATR_ActiveEcho* Actor)
 	if (!ensureAlways(Idx >= 0 && Idx < ActiveEntities)) return;
 
 	Actor->WriteBackToSoA(this);  // flush Actor state → SoA before severing link
+
+	const int32 NewCell = CoarseGrid.GetCellId(FVector2f(Positions[Idx].X, Positions[Idx].Y));
+	MoveEntityCoarseCell(Idx, NewCell);
+
 	IndexToActor[Idx]   = nullptr;
 	PromotionTimes[Idx] = 0.f;
 	Actor->SourceIndex  = INDEX_NONE;
@@ -463,7 +609,13 @@ AATR_ActiveEcho* UATR_EchoSubsystem::PromoteEcho(int32 SoAIndex)
 	AATR_ActiveEcho* Actor = EchoPool.Pop().Get();
 	AATR_EchoAIController* Controller = ControllerPool.Pop().Get();
 
-	PromoteToActive(SoAIndex, Actor);    // wire IndexToActor + SourceIndex
+	if (!PromoteToActive(SoAIndex, Actor))
+	{
+		EchoPool.Add(Actor);
+		ControllerPool.Add(Controller);
+		return nullptr;
+	}
+
 	PromotedIndices.Add(SoAIndex);
 	Actor->InitFromSoA(this, SoAIndex);  // teleport to SoA position + seed velocity first
 	Controller->Possess(Actor);          // OnPossess → AI wakes at correct world position
@@ -474,15 +626,14 @@ void UATR_EchoSubsystem::DemoteEcho(AATR_ActiveEcho* Actor)
 {
 	if (!ensureAlways(Actor)) return;
 
-	// Capture SoAIndex before DemoteToHorde clears Actor->SourceIndex
 	const int32 SoAIndex = Actor->SourceIndex;
+	if (!ensureAlways(SoAIndex >= 0 && SoAIndex < ActiveEntities)) return;
+	if (!ensureAlways(IndexToActor[SoAIndex] == Actor)) return;
 
-	// Capture controller before UnPossess clears the pawn reference.
 	AATR_EchoAIController* Controller = Cast<AATR_EchoAIController>(Actor->GetController());
 
-	DemoteToHorde(Actor);  // WriteBackToSoA + clear IndexToActor + SourceIndex = INDEX_NONE
+	DemoteToHorde(Actor);  // WriteBackToSoA + coarse grid update + clear IndexToActor + SourceIndex
 
-	// Maintain compact promoted list
 	const int32 PIIdx = PromotedIndices.IndexOfByKey(SoAIndex);
 	if (ensureAlways(PIIdx != INDEX_NONE))
 		PromotedIndices.RemoveAtSwap(PIIdx, 1, EAllowShrinking::No);
@@ -501,6 +652,8 @@ void UATR_EchoSubsystem::DemoteEcho(AATR_ActiveEcho* Actor)
 
 void UATR_EchoSubsystem::RunPromotionPass()
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_RunPromotionPass);
+
 	// Server-authoritative — clients never promote/demote locally.
 	if (GetWorld()->GetNetMode() == NM_Client) return;
 	if (ActiveEntities == 0) return;
@@ -530,8 +683,8 @@ void UATR_EchoSubsystem::RunPromotionPass()
 		// naturally and consume pool slots before outer-ring ones.
 		Candidates.Sort([&PP, this](int32 A, int32 B)
 		{
-			const FVector3f DA = Positions[A] - PP;
-			const FVector3f DB = Positions[B] - PP;
+			const FVector3f DA = GetEchoQueryPosition(A) - PP;
+			const FVector3f DB = GetEchoQueryPosition(B) - PP;
 			return (DA.X*DA.X + DA.Y*DA.Y) < (DB.X*DB.X + DB.Y*DB.Y);
 		});
 
@@ -548,7 +701,7 @@ void UATR_EchoSubsystem::RunPromotionPass()
 			for (const int32 j : PromotedIndices)
 			{
 				if (!IndexToActor[j]) continue; // paranoia guard
-				const FVector3f D = Positions[j] - PP;
+				const FVector3f D = GetEchoQueryPosition(j) - PP;
 				FarPromoted.Add({ D.X*D.X + D.Y*D.Y, j });
 			}
 			FarPromoted.Sort([](const TPair<float,int32>& A, const TPair<float,int32>& B)
@@ -618,7 +771,7 @@ void UATR_EchoSubsystem::RunPromotionPass()
 		{
 			APlayerController* PC = It->Get();
 			if (!PC || !PC->GetPawn()) continue;
-			const FVector3f D = Positions[i] - FVector3f(PC->GetPawn()->GetActorLocation());
+			const FVector3f D = GetEchoQueryPosition(i) - FVector3f(PC->GetPawn()->GetActorLocation());
 			if (D.X * D.X + D.Y * D.Y <= DemRadSq) { bAnyClose = true; break; }
 		}
 		if (bAnyClose) continue;
@@ -631,51 +784,82 @@ void UATR_EchoSubsystem::RunPromotionPass()
 
 void UATR_EchoSubsystem::RunSteeringPass()
 {
-	// Horde velocities for zone-exiters are zeroed inside RebuildFineGrid().
-	// Entities entering the local zone start at zero (AddEcho initializes to zero).
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_RunSteeringPass);
 
-	// Apply steering velocity for unpromoted overflow entities within MustPromoteRadius.
-	TArray<int32> InnerCandidates;
-	InnerCandidates.Reserve(64);
+	TArray<FVector3f> PlayerPositions;
+	PlayerPositions.Reserve(8);
 
 	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
 	{
 		APlayerController* PC = It->Get();
 		if (!PC || !PC->GetPawn()) continue;
-
-		const FVector3f PP = FVector3f(PC->GetPawn()->GetActorLocation());
-		InnerCandidates.Reset();
-		SpatialGrid.QueryRadius(PP, MustPromoteRadius,
-			TArrayView<const FVector3f>(Positions.GetData(), ActiveEntities),
-			InnerCandidates);
-
-		// QueryRadius returns each entity at most once — unique SoA index per lane, no cross-lane writes.
-		ParallelFor(InnerCandidates.Num(), [this, &InnerCandidates, PP](int32 CandIdx)
-		{
-			const int32 i = InnerCandidates[CandIdx];
-			if (IndexToActor[i]) return;
-
-			FVector3f Dir = PP - Positions[i];
-			Dir.Z = 0.f;
-			const float DistSq = Dir.X * Dir.X + Dir.Y * Dir.Y;
-			if (DistSq > KINDA_SMALL_NUMBER)
-			{
-				Velocities[i] = Dir * FMath::InvSqrt(DistSq) * HordeWalkSpeed;
-				Yaws[i]       = FMath::RadiansToDegrees(FMath::Atan2(Dir.Y, Dir.X));
-				MarkEchoDirty(i, EEchoDirtyFlags::Transform);
-			}
-		});
+		PlayerPositions.Add(FVector3f(PC->GetPawn()->GetActorLocation()));
 	}
+
+	if (PlayerPositions.IsEmpty()) return;
+
+	const float MustPromoteSq = MustPromoteRadius * MustPromoteRadius;
+
+	// Single pass over all local entities — each entity steers toward its nearest player within
+	// MustPromoteRadius. Avoids last-player-wins when multiple players' zones overlap.
+	ParallelFor(LocalEntityScratch.Num(), [this, &PlayerPositions, MustPromoteSq](int32 LocalIdx)
+	{
+		const int32 EntityIndex = LocalEntityScratch[LocalIdx];
+		if (IndexToActor[EntityIndex]) return;
+
+		float BestSq          = MustPromoteSq;
+		int32 BestPlayerIndex = INDEX_NONE;
+
+		for (int32 PlayerIndex = 0; PlayerIndex < PlayerPositions.Num(); ++PlayerIndex)
+		{
+			const FVector3f Delta  = PlayerPositions[PlayerIndex] - Positions[EntityIndex];
+			const float     DistSq = Delta.X * Delta.X + Delta.Y * Delta.Y;
+			if (DistSq <= BestSq) { BestSq = DistSq; BestPlayerIndex = PlayerIndex; }
+		}
+
+		if (BestPlayerIndex == INDEX_NONE) return;
+
+		FVector3f Dir = PlayerPositions[BestPlayerIndex] - Positions[EntityIndex];
+		Dir.Z = 0.f;
+
+		if (BestSq > KINDA_SMALL_NUMBER)
+		{
+			Velocities[EntityIndex] = Dir * FMath::InvSqrt(BestSq) * HordeWalkSpeed;
+			Yaws[EntityIndex]       = FMath::RadiansToDegrees(FMath::Atan2(Dir.Y, Dir.X));
+			MarkEchoDirty(EntityIndex, EEchoDirtyFlags::Transform);
+		}
+	});
+}
+
+// ─── GetEchoQueryPosition ─────────────────────────────────────────────────────
+
+FVector3f UATR_EchoSubsystem::GetEchoQueryPosition(int32 Index) const
+{
+	if (!ensureAlways(Index >= 0 && Index < ActiveEntities))
+		return FVector3f::ZeroVector;
+
+	if (AATR_ActiveEcho* Actor = IndexToActor[Index])
+		return FVector3f(Actor->GetActorLocation());
+
+	return Positions[Index];
 }
 
 // ─── QueryEchoesByRelevancyBands ──────────────────────────────────────────────
 
+// Queries the local fine grid only.
+// Correct only when FarRange <= LocalZoneRadius.
+// OutNear/Mid/Far are non-overlapping.
+// Appends to caller arrays.
 void UATR_EchoSubsystem::QueryEchoesByRelevancyBands(
 	const FVector& Origin,
 	float NearRange, float MidRange, float FarRange,
 	TArray<int32>& OutNear, TArray<int32>& OutMid, TArray<int32>& OutFar) const
 {
 	if (!bGridReady || ActiveEntities == 0) return;
+
+	ensureMsgf(FarRange <= LocalZoneRadius,
+		TEXT("QueryEchoesByRelevancyBands: FarRange %.1f > LocalZoneRadius %.1f — results incomplete."),
+		FarRange, LocalZoneRadius);
 
 	const FVector3f Origin3f(Origin);
 	const float NearSq = NearRange * NearRange;
@@ -690,6 +874,8 @@ void UATR_EchoSubsystem::QueryEchoesByRelevancyBands(
 
 	for (int32 Idx : AllInRange)
 	{
+		if (IndexToActor[Idx]) continue; // promoted this frame — handled as real actor, not horde/ISM
+
 		const FVector3f D   = Positions[Idx] - Origin3f;
 		const float     DSq = D.X * D.X + D.Y * D.Y;
 
@@ -715,15 +901,71 @@ bool UATR_EchoSubsystem::IsEchoDirty(int32 Index, EEchoDirtyFlags Flags) const
 	       EnumHasAnyFlags(DirtyStates[Index].Flags, Flags);
 }
 
+// ─── ValidateEchoSpatialState ─────────────────────────────────────────────────
+
+bool UATR_EchoSubsystem::ValidateEchoSpatialState() const
+{
+#if DO_CHECK
+	bool bValid = true;
+
+	for (int32 i = 0; i < ActiveEntities; ++i)
+	{
+		if (CoarseCellIds[i] == INDEX_NONE)
+		{
+			UE_LOG(LogTemp, Error, TEXT("Echo %d has invalid CoarseCellId"), i);
+			bValid = false;
+		}
+		if (CoarseSlotInCell[i] == INDEX_NONE)
+		{
+			UE_LOG(LogTemp, Error, TEXT("Echo %d has invalid CoarseSlotInCell"), i);
+			bValid = false;
+		}
+		if (CoarseCellIds[i] != INDEX_NONE && CoarseSlotInCell[i] != INDEX_NONE &&
+		    !CoarseGrid.ValidateEntitySlot(i, CoarseCellIds[i], CoarseSlotInCell[i]))
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("Echo %d coarse-grid bucket mismatch. Cell=%d Slot=%d"),
+				i, CoarseCellIds[i], CoarseSlotInCell[i]);
+			bValid = false;
+		}
+		if (AATR_ActiveEcho* Actor = IndexToActor[i])
+		{
+			if (Actor->SourceIndex != i)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("Echo %d actor SourceIndex mismatch: %d"), i, Actor->SourceIndex);
+				bValid = false;
+			}
+		}
+	}
+
+	for (int32 PromotedIndex : PromotedIndices)
+	{
+		if (!IndexToActor.IsValidIndex(PromotedIndex) || !IndexToActor[PromotedIndex])
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("PromotedIndices contains invalid or unpromoted index: %d"), PromotedIndex);
+			bValid = false;
+		}
+	}
+
+	return bValid;
+#else
+	return true;
+#endif
+}
+
 // ─── ForceDestroyEcho ─────────────────────────────────────────────────────────
 
 void UATR_EchoSubsystem::ForceDestroyEcho(int32 SoAIndex)
 {
 	if (SoAIndex < 0 || SoAIndex >= ActiveEntities) return;
 
-	// Demote first if promoted — bypasses bBlockDemotion and hysteresis.
 	if (AATR_ActiveEcho* Actor = IndexToActor[SoAIndex])
+	{
 		DemoteEcho(Actor);
+		if (!ensureAlways(IndexToActor[SoAIndex] == nullptr)) return;
+	}
 
 	RemoveEcho(SoAIndex);
 }
@@ -732,7 +974,11 @@ void UATR_EchoSubsystem::ForceDestroyEcho(AATR_ActiveEcho* Actor)
 {
 	if (!Actor || Actor->SourceIndex == INDEX_NONE) return;
 
-	const int32 Idx = Actor->SourceIndex; // capture before DemoteEcho clears SourceIndex
+	const int32 Idx = Actor->SourceIndex;
 	DemoteEcho(Actor);
+
+	if (!ensureAlways(Idx >= 0 && Idx < ActiveEntities)) return;
+	if (!ensureAlways(IndexToActor[Idx] == nullptr)) return;
+
 	RemoveEcho(Idx);
 }

@@ -3,7 +3,6 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Containers/BitArray.h"
 #include "Subsystems/WorldSubsystem.h"
 #include "ATR_EchoSubsystem.generated.h"
 
@@ -103,32 +102,55 @@ private:
 	TArray<int32>              PopulatedCells;
 };
 
-// Global coarse grid tracking entity counts per large cell.
+// Global coarse grid storing entity indices per large cell.
 // Updated incrementally — only when an entity crosses a coarse cell boundary.
+// Enables O(nearby cells) queries instead of O(ActiveEntities) scans.
 struct FATR_CoarseGrid
 {
 public:
 	void Initialize(FVector2D InWorldMin, FVector2D InWorldMax, float InCellSize);
+
+	FORCEINLINE bool IsInitialized() const { return NumCellsX > 0 && NumCellsY > 0; }
 
 	FORCEINLINE int32 GetCellId(FVector2f Pos2D) const
 	{
 		return CellIndex(CellX(Pos2D.X), CellY(Pos2D.Y));
 	}
 
-	void OnEntityAdded(int32 CellId)
+	void  AddEntity(int32 EntityIndex, int32 CellId, int32& OutSlotInCell);
+	int32 RemoveEntityAndReturnMoved(int32 EntityIndex, int32 CellId, int32 SlotInCell);
+	void  ReplaceEntityAtSlot(int32 CellId, int32 SlotInCell, int32 ExpectedOld, int32 NewEntity);
+
+	bool ValidateEntitySlot(int32 EntityIndex, int32 CellId, int32 SlotInCell) const;
+
+	template<typename FuncType>
+	void ForEachEntityInRadius(FVector2f Origin, float Radius,
+		TArrayView<const FVector3f> Positions, FuncType&& Func) const
 	{
-		CellCounts.FindOrAdd(CellId)++;
+		const float RadiusSq = Radius * Radius;
+		const int32 MinCX = CellX(Origin.X - Radius), MaxCX = CellX(Origin.X + Radius);
+		const int32 MinCY = CellY(Origin.Y - Radius), MaxCY = CellY(Origin.Y + Radius);
+		for (int32 CY = MinCY; CY <= MaxCY; ++CY)
+			for (int32 CX = MinCX; CX <= MaxCX; ++CX)
+			{
+				const int32 CellId = CellIndex(CX, CY);
+				const TArray<int32>* Bucket = CellEntities.Find(CellId);
+				if (!Bucket) continue;
+				for (int32 Ei : *Bucket)
+				{
+					const FVector3f& P = Positions[Ei];
+					const float DX = P.X - Origin.X, DY = P.Y - Origin.Y;
+					if (DX*DX + DY*DY <= RadiusSq) Func(Ei);
+				}
+			}
 	}
 
-	void OnEntityRemoved(int32 CellId)
+	int32 GetOccupiedCellCount()       const { return CellEntities.Num(); }
+	int32 GetEntityCountInCell(int32 CellId) const
 	{
-		int32* Count = CellCounts.Find(CellId);
-		if (!ensureAlways(Count)) return;
-		if (--(*Count) == 0)
-			CellCounts.Remove(CellId);
+		const TArray<int32>* B = CellEntities.Find(CellId);
+		return B ? B->Num() : 0;
 	}
-
-	const TMap<int32, int32>& GetCellCounts() const { return CellCounts; }
 
 private:
 	FORCEINLINE int32 CellX(float X) const
@@ -147,7 +169,7 @@ private:
 	int32     NumCellsX   = 0;
 	int32     NumCellsY   = 0;
 
-	TMap<int32, int32> CellCounts;
+	TMap<int32, TArray<int32>> CellEntities;
 };
 
 UCLASS()
@@ -236,7 +258,7 @@ public:
 
 	// Promote SoA entity to a pooled Actor for full simulation.
 	// Caller must pop Actor from EchoPool first.
-	void PromoteToActive(int32 SoAIndex, AATR_ActiveEcho* Actor);
+	bool PromoteToActive(int32 SoAIndex, AATR_ActiveEcho* Actor);
 
 	// Write Actor state back to SoA and return Actor to pool.
 	void DemoteToHorde(AATR_ActiveEcho* Actor);
@@ -258,6 +280,9 @@ public:
 
 	float PositionDirtyThresholdSq = 25.f;  // set from settings in Initialize()
 	float YawDirtyThresholdDeg     = 2.f;
+
+	// Returns actor world location for promoted entities, SoA position otherwise.
+	FVector3f GetEchoQueryPosition(int32 Index) const;
 
 	// Single FarRange grid query, results classified into three XY-distance bands.
 	// OutNear/Mid/Far are non-overlapping. Appends to caller's arrays (caller owns Reset).
@@ -284,6 +309,8 @@ public:
 		       IndexToActor.Num() >= ActiveEntities;
 	}
 
+	bool ValidateEchoSpatialState() const;
+
 	// Called by AATR_EchoManager::BeginPlay on all machines — wires the Manager pointer
 	// on clients (where the Subsystem didn't spawn the Manager itself).
 	void SetManager(AATR_EchoManager* InManager) { Manager = InManager; }
@@ -297,9 +324,18 @@ public:
 	// Maintained by PromoteEcho/DemoteEcho/RemoveEcho. Never has nullptr entries.
 	TArray<int32> PromotedIndices;
 
-	// SoA parallel array: current coarse cell per entity (INDEX_NONE = not yet registered).
-	// Updated incrementally in UpdateCoarseGrid() on cell boundary crossings.
+	// SoA parallel arrays for coarse grid registration (parallel to Positions).
+	// CoarseCellIds: current coarse cell per entity (INDEX_NONE = not registered).
+	// CoarseSlotInCell: slot within that cell's bucket.
 	TArray<int32> CoarseCellIds;
+	TArray<int32> CoarseSlotInCell;
+
+	// Epoch-stamp per entity for O(1) dedup in RebuildFineGrid.
+	TArray<uint32> LocalVisitStamp;
+	uint32         LocalVisitEpoch = 1;
+
+	// Local-entity indices from the previous frame; used to zero exited velocities.
+	TArray<int32> LastLocalEntityScratch;
 
 	void SimTick(float DeltaTime);
 	void RebuildFineGrid();
@@ -309,7 +345,7 @@ public:
 	// Member name SpatialGrid preserved for ATR_EchoReplicationComponent direct access.
 	FATR_SparseGrid SpatialGrid;
 
-	// Global coarse grid — incremental count-only, updated on cell boundary crossings.
+	// Global coarse grid — entity-bucket spatial index, updated on cell boundary crossings.
 	FATR_CoarseGrid CoarseGrid;
 
 	UPROPERTY()
@@ -327,10 +363,6 @@ public:
 	// Frame-scope scratch for local entity indices; allocation persists across ticks.
 	TArray<int32> LocalEntityScratch;
 
-	// Bit per SoA slot: was this entity in the local zone last frame?
-	// Used to zero stale steering velocities when an entity exits the zone.
-	TBitArray<> WasLocalLastFrame;
-
 	UPROPERTY(BlueprintReadOnly, Category = "Echo|Config")
 	float LocalZoneRadius = 27500.f;  // must be >= FarRelevancyRange for replication queries
 
@@ -339,4 +371,9 @@ public:
 	float TickAccumulator = 0.f;
 	bool  bGridReady      = false;
 	bool  bInitialized    = false;
+
+private:
+	void RegisterEntityToCoarseGrid(int32 EntityIndex);
+	void UnregisterEntityFromCoarseGrid(int32 EntityIndex);
+	void MoveEntityCoarseCell(int32 EntityIndex, int32 NewCellId);
 };
