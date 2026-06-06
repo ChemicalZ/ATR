@@ -160,6 +160,20 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "Echo|ISM")
 	bool bDebugShowPromotedEchoISM = false;
 
+	// --- Visual band distances (cached from UATR_EchoSettings in BeginPlay) ---
+	// These come from the Echo|Rendering settings (VisualNearDistance, etc.) and
+	// are deliberately NOT the Echo|Networking relevancy ranges. They drive what
+	// the local client renders as horde ISM.
+
+	UPROPERTY(BlueprintReadOnly, Category = "Echo|Rendering")
+	float NearBandDistance = 3000.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Echo|Rendering")
+	float MidBandDistance = 10000.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Echo|Rendering")
+	float FarBandDistance = 20000.f;
+
 private:
 	// Per-tier stable ISM slot state.
 	struct FEchoISMTier
@@ -174,8 +188,19 @@ private:
 	FEchoISMTier                    Tiers[3];      // indexed by EEchoRelevancyBand (Near=0,Mid=1,Far=2)
 	TMap<int32, EEchoRelevancyBand> EchoToBand;    // current tier for each echo in the ISM
 
-	float NearBandDistance = 3000.f;   // read from NearRelevancyRange in BeginPlay
-	float MidBandDistance  = 10000.f;  // read from MidRelevancyRange in BeginPlay
+	// Per-echo "seen this frame" stamp. EchoVisualStamp[i] == VisualFrameEpoch means
+	// echo i was returned by the relevancy query this frame and should remain in the ISM.
+	// Any echo in EchoToBand whose stamp is stale is removed (left the visual cutoff).
+	// Sized to Sub->InitializeCount; grown only, never shrunk during play.
+	TArray<uint32> EchoVisualStamp;
+	uint32         VisualFrameEpoch = 1;
+
+	// Frame-scope scratch for the relevancy query results and the removal pass.
+	// Allocation persists across frames (Reset, not Empty) to avoid per-frame churn.
+	TArray<int32> NearScratch;
+	TArray<int32> MidScratch;
+	TArray<int32> FarScratch;
+	TArray<int32> RemoveScratch;
 
 	UInstancedStaticMeshComponent* ISMForBand       (EEchoRelevancyBand Band) const;
 	void                           AddEchoToISM     (int32 EchoIndex, EEchoRelevancyBand Band,
@@ -184,4 +209,18 @@ private:
 	void                           QueueTransformUpdate(int32 EchoIndex, EEchoRelevancyBand Band,
 	                                                     const FTransform& T, uint32 Version);
 	void                           FlushTierUpdates ();
+
+	// Process a single relevancy band: stamp each returned echo, then add / band-swap /
+	// queue-update its ISM instance. Skips promoted and invalid indices.
+	void ProcessBand(UATR_EchoSubsystem* Sub, const TArray<int32>& Echoes,
+	                 EEchoRelevancyBand DesiredBand);
+
+	// Remove every ISM echo not stamped this frame (left the cutoff, invalid, or promoted).
+	void RemoveUnstampedEchoes(UATR_EchoSubsystem* Sub);
+
+	// Grow EchoVisualStamp to at least RequiredCapacity. Never shrinks during play.
+	void EnsureVisualStampCapacity(int32 RequiredCapacity);
+
+	// Apply performance-oriented defaults (collision/shadow/decal/distance-field) from settings.
+	void ConfigureISMComponent(UInstancedStaticMeshComponent* ISM);
 };

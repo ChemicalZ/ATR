@@ -143,6 +143,10 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
 
+	// Defensive runtime clamp — editor PostEditChangeProperty handles in-editor edits,
+	// but config files can be hand-edited, so re-validate invariants before reading.
+	GetMutableDefault<UATR_EchoSettings>()->ValidateAndClamp();
+
 	const UATR_EchoSettings* Settings = GetDefault<UATR_EchoSettings>();
 	InitializeCount = Settings->InitializeCount;
 	SpawnCount      = Settings->SpawnCount;

@@ -5,6 +5,7 @@
 #include "ATR_EchoSettings.h"
 #include "GameFramework/PlayerController.h"
 #include "Engine/World.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 
 DEFINE_LOG_CATEGORY(LogATR_EchoNet);
 DEFINE_LOG_CATEGORY(LogATR_EchoRender);
@@ -31,19 +32,24 @@ AATR_EchoManager::AATR_EchoManager()
 	ISM_Mid->SetupAttachment(Root);
 	ISM_Far->SetupAttachment(Root);
 
-	// ISM components never tick themselves — updated via UpdateISM()
-	ISM_Near->SetComponentTickEnabled(false);
-	ISM_Mid->SetComponentTickEnabled(false);
-	ISM_Far->SetComponentTickEnabled(false);
+	// ISM components never tick themselves and use performance-oriented render
+	// defaults (no collision/shadows/decals/distance-field unless a designer opts in).
+	ConfigureISMComponent(ISM_Near);
+	ConfigureISMComponent(ISM_Mid);
+	ConfigureISMComponent(ISM_Far);
 }
 
 void AATR_EchoManager::BeginPlay()
 {
 	Super::BeginPlay();
 
+	// Visual band distances come from Echo|Rendering — NOT the network relevancy
+	// ranges. Rendering and networking solve different problems (RenderThread cost
+	// vs bandwidth) and must be tuned independently.
 	const UATR_EchoSettings* Settings = GetDefault<UATR_EchoSettings>();
-	NearBandDistance          = Settings->NearRelevancyRange;
-	MidBandDistance           = Settings->MidRelevancyRange;
+	NearBandDistance          = Settings->VisualNearDistance;
+	MidBandDistance           = Settings->VisualMidDistance;
+	FarBandDistance           = Settings->VisualFarDistance;
 	bDebugShowPromotedEchoISM = Settings->bDebugShowPromotedEchoISM;
 
 	// Wire ourselves into the Subsystem on all machines (server sets it via SpawnActor
@@ -54,74 +60,188 @@ void AATR_EchoManager::BeginPlay()
 
 // ─── ISM Update ───────────────────────────────────────────────────────────────
 
+// Visualizes only the locally relevant horde echoes returned by the subsystem's
+// spatial relevancy query — never scans the full ActiveEntities array. Echoes
+// beyond FarBandDistance (the visual cutoff) get no ISM instance, and any echo
+// that was visualized last frame but is not relevant this frame is removed.
 void AATR_EchoManager::UpdateISM(UATR_EchoSubsystem* Sub)
 {
-	if (!Sub || !ISM_Near || !ISM_Mid || !ISM_Far) return;
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoISM_UpdateISM);
+
+	if (!Sub) return;
+	if (!ISM_Near || !ISM_Mid || !ISM_Far) return;
+
+	EnsureVisualStampCapacity(Sub->InitializeCount);
+
+	// New frame epoch. On wrap (epoch hits 0) the stale-detection comparison
+	// breaks, so reset all stamps and restart at 1.
+	if (++VisualFrameEpoch == 0)
+	{
+		EchoVisualStamp.Init(0, Sub->InitializeCount);
+		VisualFrameEpoch = 1;
+	}
+
+	FVector ViewLocation = FVector::ZeroVector;
+	if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr)
+	{
+		FRotator ViewRotation;
+		PC->GetPlayerViewPoint(ViewLocation, ViewRotation);
+	}
+	else
+	{
+		ViewLocation = GetActorLocation();
+	}
+
+	NearScratch.Reset();
+	MidScratch.Reset();
+	FarScratch.Reset();
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(EchoISM_QueryRelevancy);
+		Sub->QueryEchoesByRelevancyBands(
+			ViewLocation,
+			NearBandDistance,
+			MidBandDistance,
+			FarBandDistance,
+			NearScratch,
+			MidScratch,
+			FarScratch);
+	}
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(EchoISM_ProcessBands);
+		ProcessBand(Sub, NearScratch, EEchoRelevancyBand::Near);
+		ProcessBand(Sub, MidScratch,  EEchoRelevancyBand::Mid);
+		ProcessBand(Sub, FarScratch,  EEchoRelevancyBand::Far);
+	}
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(EchoISM_RemoveUnstamped);
+		RemoveUnstampedEchoes(Sub);
+	}
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(EchoISM_FlushUpdates);
+		FlushTierUpdates();
+	}
+}
+
+// ─── Visual band processing ───────────────────────────────────────────────────
+
+void AATR_EchoManager::EnsureVisualStampCapacity(int32 RequiredCapacity)
+{
+	// Grow only — never shrink during play (indices stay stable for the epoch test).
+	if (EchoVisualStamp.Num() < RequiredCapacity)
+	{
+		EchoVisualStamp.SetNumZeroed(RequiredCapacity);
+	}
+}
+
+void AATR_EchoManager::ProcessBand(UATR_EchoSubsystem* Sub, const TArray<int32>& Echoes,
+                                   EEchoRelevancyBand DesiredBand)
+{
+	if (!Sub) return;
 
 	const FQuat   ISMCorrection = FQuat(ISMMeshRotationOffset);
 	const FVector ISMOffset     = ISMMeshLocationOffset;
 
-	FVector CameraLoc = FVector::ZeroVector;
-	if (APlayerController* PC = GetWorld()->GetFirstPlayerController())
+	for (int32 EchoIndex : Echoes)
 	{
-		FVector Loc; FRotator Rot;
-		PC->GetPlayerViewPoint(Loc, Rot);
-		CameraLoc = Loc;
-	}
+		if (EchoIndex < 0 || EchoIndex >= Sub->ActiveEntities) continue;
+		if (!Sub->Positions.IsValidIndex(EchoIndex))           continue;
 
-	const float NearSq = NearBandDistance * NearBandDistance;
-	const float MidSq  = MidBandDistance  * MidBandDistance;
+		// Promoted echoes are full Actors — never drawn as horde ISM.
+		if (Sub->IndexToActor.IsValidIndex(EchoIndex) && Sub->IndexToActor[EchoIndex]) continue;
 
-	// Remove instances whose SoA slots were reclaimed by swap-remove.
-	{
-		TArray<int32> Stale;
-		for (const auto& Pair : EchoToBand)
-			if (Pair.Key >= Sub->ActiveEntities)
-				Stale.Add(Pair.Key);
-		for (int32 Idx : Stale)
-			RemoveEchoFromISM(Idx);
-	}
+		if (!EchoVisualStamp.IsValidIndex(EchoIndex)) continue;
 
-	for (int32 i = 0; i < Sub->ActiveEntities; ++i)
-	{
-		const bool bPromoted = (Sub->IndexToActor[i] != nullptr);
-		if (bPromoted && !bDebugShowPromotedEchoISM)
+		// Mark seen this frame so RemoveUnstampedEchoes keeps this instance.
+		EchoVisualStamp[EchoIndex] = VisualFrameEpoch;
+
+		const FVector WorldPosition(Sub->Positions[EchoIndex]);
+		const float   Yaw = Sub->Yaws.IsValidIndex(EchoIndex) ? Sub->Yaws[EchoIndex] : 0.f;
+		const FQuat   EntityYaw(FRotator(0.f, Yaw, 0.f));
+		const FTransform Transform(EntityYaw * ISMCorrection, WorldPosition + ISMOffset, FVector::OneVector);
+
+		const uint32 Version = Sub->DirtyStates.IsValidIndex(EchoIndex)
+			? Sub->DirtyStates[EchoIndex].Version : 0;
+
+		const EEchoRelevancyBand* ExistingBand = EchoToBand.Find(EchoIndex);
+		if (!ExistingBand)
 		{
-			if (EchoToBand.Contains(i)) RemoveEchoFromISM(i);
-			continue;
+			AddEchoToISM(EchoIndex, DesiredBand, Transform, Version);
 		}
-
-		const FVector WP(Sub->Positions[i]);
-		const FQuat   EntityYaw(FRotator(0.f, Sub->Yaws[i], 0.f));
-		const FTransform T(EntityYaw * ISMCorrection, WP + ISMOffset, FVector::OneVector);
-
-		const float DSq = FVector::DistSquaredXY(WP, CameraLoc);
-		const EEchoRelevancyBand DesiredBand =
-			(DSq <= NearSq) ? EEchoRelevancyBand::Near :
-			(DSq <= MidSq)  ? EEchoRelevancyBand::Mid  : EEchoRelevancyBand::Far;
-
-		const uint32 Version = Sub->DirtyStates.IsValidIndex(i) ? Sub->DirtyStates[i].Version : 0;
-
-		const EEchoRelevancyBand* CurrentBand = EchoToBand.Find(i);
-		if (!CurrentBand)
+		else if (*ExistingBand != DesiredBand)
 		{
-			AddEchoToISM(i, DesiredBand, T, Version);
-		}
-		else if (*CurrentBand != DesiredBand)
-		{
-			RemoveEchoFromISM(i);
-			AddEchoToISM(i, DesiredBand, T, Version);
+			RemoveEchoFromISM(EchoIndex);
+			AddEchoToISM(EchoIndex, DesiredBand, Transform, Version);
 		}
 		else
 		{
-			QueueTransformUpdate(i, DesiredBand, T, Version);
+			QueueTransformUpdate(EchoIndex, DesiredBand, Transform, Version);
+		}
+	}
+}
+
+void AATR_EchoManager::RemoveUnstampedEchoes(UATR_EchoSubsystem* Sub)
+{
+	// Collect first, then remove — never mutate EchoToBand while iterating it.
+	RemoveScratch.Reset();
+
+	for (const TPair<int32, EEchoRelevancyBand>& Pair : EchoToBand)
+	{
+		const int32 EchoIndex = Pair.Key;
+
+		const bool bInvalidIndex =
+			EchoIndex < 0 ||
+			!Sub ||
+			EchoIndex >= Sub->ActiveEntities ||
+			!EchoVisualStamp.IsValidIndex(EchoIndex);
+
+		const bool bNotSeenThisFrame =
+			!bInvalidIndex &&
+			EchoVisualStamp[EchoIndex] != VisualFrameEpoch;
+
+		const bool bPromoted =
+			!bInvalidIndex &&
+			Sub->IndexToActor.IsValidIndex(EchoIndex) &&
+			Sub->IndexToActor[EchoIndex] != nullptr;
+
+		if (bInvalidIndex || bNotSeenThisFrame || bPromoted)
+		{
+			RemoveScratch.Add(EchoIndex);
 		}
 	}
 
-	FlushTierUpdates();
+	for (int32 EchoIndex : RemoveScratch)
+	{
+		RemoveEchoFromISM(EchoIndex);
+	}
 }
 
 // ─── ISM Helpers ──────────────────────────────────────────────────────────────
+
+void AATR_EchoManager::ConfigureISMComponent(UInstancedStaticMeshComponent* ISM)
+{
+	if (!ISM) return;
+
+	const UATR_EchoSettings* Settings = GetDefault<UATR_EchoSettings>();
+
+	// ISM components never tick themselves — updated via UpdateISM().
+	ISM->SetComponentTickEnabled(false);
+	ISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	ISM->SetGenerateOverlapEvents(false);
+
+	const bool bCastShadows               = Settings ? Settings->bHordeISMCastShadows : false;
+	const bool bReceivesDecals            = Settings ? Settings->bHordeISMReceivesDecals : false;
+	const bool bAffectDistanceFieldLighting = Settings ? Settings->bHordeISMAffectDistanceFieldLighting : false;
+
+	ISM->SetCastShadow(bCastShadows);
+	ISM->bCastDynamicShadow            = bCastShadows;
+	ISM->bCastStaticShadow             = bCastShadows;
+	ISM->bReceivesDecals               = bReceivesDecals;
+	ISM->bAffectDistanceFieldLighting  = bAffectDistanceFieldLighting;
+}
 
 UInstancedStaticMeshComponent* AATR_EchoManager::ISMForBand(EEchoRelevancyBand Band) const
 {
