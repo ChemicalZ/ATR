@@ -282,6 +282,49 @@ public:
 	))
 	int32 MaxMissingSequencesBeforeResync = 3;
 
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(
+		ClampMin="0.1",
+		ClampMax="10.0",
+		ForceUnits="ms",
+		ToolTip="Maximum CPU time the Echo replication scheduler should spend per server frame. Lower values reduce frame spikes but increase replication latency. Higher values reduce latency but can create server hitches with many clients."
+	))
+	float ServerReplicationBudgetMs = 1.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(
+		ClampMin="1",
+		ClampMax="64",
+		ToolTip="Maximum number of client replication jobs processed per server frame. A job is one client and one band. Higher values reduce replication latency but increase per-frame server cost."
+	))
+	int32 MaxReplicationJobsPerFrame = 8;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(
+		ClampMin="1",
+		ClampMax="2048",
+		ToolTip="Maximum snapshots a single client may receive from Echo replication in one server frame across all bands. Higher values improve catch-up speed but increase bandwidth and CPU spikes."
+	))
+	int32 MaxSnapshotsPerClientPerFrame = 256;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(
+		ClampMin="1",
+		ClampMax="64",
+		ToolTip="Maximum Near-band replication jobs processed per frame. Near updates are highest priority because they affect close horde motion and client accuracy."
+	))
+	int32 MaxNearReplicationJobsPerFrame = 8;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(
+		ClampMin="0",
+		ClampMax="64",
+		ToolTip="Maximum Mid-band replication jobs processed per frame. Mid updates may be deferred before Near updates when the replication budget is tight."
+	))
+	int32 MaxMidReplicationJobsPerFrame = 4;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Networking", meta=(
+		ClampMin="0",
+		ClampMax="64",
+		ToolTip="Maximum Far-band replication jobs processed per frame. Far updates are lowest priority and should be aggressively staggered to prevent server frame spikes."
+	))
+	int32 MaxFarReplicationJobsPerFrame = 2;
+
 	// ── Echo|Dirty State ───────────────────────────────────────────────────────
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Dirty State", meta=(

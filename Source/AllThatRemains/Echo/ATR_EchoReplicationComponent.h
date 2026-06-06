@@ -24,7 +24,16 @@ public:
 	virtual void BeginPlay() override;
 
 	// Called server-side by UATR_EchoSubsystem::Tick for each active PlayerController.
+	// Kept as legacy compatibility wrapper — subsystem scheduler calls ServerReplicateBandBudgeted directly.
 	void ServerTickReplication(UATR_EchoSubsystem* Sub, float DeltaTime);
+
+	// Scheduler API — called by UATR_EchoSubsystem::TickReplicationScheduler.
+	bool  IsBandDue(EEchoRelevancyBand Band, double NowSeconds) const;
+	void  ResetFrameReplicationBudget();
+	int32 GetRemainingSnapshotBudget() const;
+	int32 ServerReplicateBandBudgeted(UATR_EchoSubsystem* Sub, EEchoRelevancyBand Band,
+	                                   const FVector& ViewOrigin, double NowSeconds,
+	                                   int32 MaxSnapshotsForThisJob);
 
 	UFUNCTION(Client, Unreliable)
 	void Client_EchoSnapshotChunk(const FEchoSnapshotChunk& Chunk);
@@ -33,9 +42,10 @@ public:
 	void Server_RequestFullResync(int32 ViewId, uint16 LastSeq);
 
 private:
-	void BuildAndSendBand(UATR_EchoSubsystem* Sub, EEchoRelevancyBand Band,
-	                      const TArray<int32>& EchoIndices);
+	int32 BuildAndSendBand(UATR_EchoSubsystem* Sub, EEchoRelevancyBand Band,
+	                       const TArray<int32>& EchoIndices, int32 MaxSnapshotsToSend);
 	void SendDespawnChunk(const TArray<int32>& EchoIndices);
+	void MarkBandProcessed(EEchoRelevancyBand Band, double NowSeconds);
 	void ApplyChunkToSubsystem(const TArray<FEchoSnapshot>& Snapshots, int32 TotalEchoes);
 	void ApplyDespawnToSubsystem(const TArray<FEchoSnapshot>& Snapshots);
 
@@ -55,11 +65,24 @@ private:
 		TArray<FEchoSnapshot> Snapshots;
 	};
 
-	// Server-side state — per-band accumulators drive independent send rates.
-	float  NearAccumulator = 0.f;
-	float  MidAccumulator  = 0.f;
-	float  FarAccumulator  = 0.f;
+	// Server-side state — per-band next-due timestamps drive independent send rates.
 	uint16 SnapshotSequence = 0;
+
+	// Scheduler config (read from settings at BeginPlay)
+	float  ServerReplicationBudgetMs      = 1.5f;
+	int32  MaxReplicationJobsPerFrame     = 8;
+	int32  MaxSnapshotsPerClientPerFrame  = 256;
+	int32  MaxNearReplicationJobsPerFrame = 8;
+	int32  MaxMidReplicationJobsPerFrame  = 4;
+	int32  MaxFarReplicationJobsPerFrame  = 2;
+
+	// Per-frame snapshot accounting. Reset by scheduler before servicing this client.
+	int32  SnapshotsSentThisFrame = 0;
+
+	// Next-due timestamps (wall-clock seconds) per band.
+	double NextNearReplicationTime = 0.0;
+	double NextMidReplicationTime  = 0.0;
+	double NextFarReplicationTime  = 0.0;
 
 	float NearSnapshotHz = 10.f;
 	float MidSnapshotHz  = 3.f;
@@ -74,12 +97,12 @@ private:
 	int32 MaxSnapshotsPerChunk            = 256;
 
 	TArray<FEchoSnapshot> SnapshotScratch;
-	TSet<int32> CurrentRelevantScratch;
+	TSet<int32>   CurrentRelevantScratch;
 	TArray<int32> RemovedScratch;
 	TArray<int32> DespawnIndexScratch;
-	TArray<int32> NearEchoes;
-	TArray<int32> MidEchoes;
-	TArray<int32> FarEchoes;
+	TArray<int32> NearScratch;
+	TArray<int32> MidScratch;
+	TArray<int32> FarScratch;
 
 	// Server-side per-client known echo set
 	TSet<int32>         KnownEchoes;

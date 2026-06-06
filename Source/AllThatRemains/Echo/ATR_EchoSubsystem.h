@@ -7,6 +7,7 @@
 #include "Subsystems/WorldSubsystem.h"
 #include "ATR_EchoSubsystem.generated.h"
 
+class UATR_EchoReplicationComponent;
 class AATR_EchoManager;
 class AATR_ActiveEcho;
 class AATR_EchoAIController;
@@ -393,6 +394,23 @@ public:
 	float TickAccumulator = 0.f;
 	bool  bGridReady      = false;
 	bool  bInitialized    = false;
+
+	// Replication scheduler config (read from settings at Initialize — never per-tick)
+	float  ServerReplicationBudgetMs      = 1.5f;
+	int32  MaxReplicationJobsPerFrame     = 8;
+	int32  MaxSnapshotsPerClientPerFrame  = 256;
+	int32  MaxNearReplicationJobsPerFrame = 8;
+	int32  MaxMidReplicationJobsPerFrame  = 4;
+	int32  MaxFarReplicationJobsPerFrame  = 2;
+
+	// Round-robin cursor: advances by 1 each scheduler pass so clients are served fairly.
+	int32 ReplicationClientCursor = 0;
+
+	// Transient per-frame scratch — raw observer pointers, no ownership.
+	TArray<UATR_EchoReplicationComponent*> ReplicationClientsScratch;
+
+	void GatherReplicationClients();
+	void TickReplicationScheduler(float DeltaTime);
 
 private:
 	void RegisterEntityToCoarseGrid(int32 EntityIndex);

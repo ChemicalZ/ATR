@@ -8,6 +8,7 @@
 #include "GameFramework/PlayerController.h"
 #include "Engine/World.h"
 #include "Async/ParallelFor.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 
 // ─── Construction ─────────────────────────────────────────────────────────────
 
@@ -35,12 +36,28 @@ void UATR_EchoReplicationComponent::BeginPlay()
 	MaxSnapshotsPerChunk            = Settings->MaxSnapshotsPerChunk;
 	FullResyncCooldownSeconds       = Settings->FullResyncCooldownSeconds;
 	MaxMissingSequencesBeforeResync = Settings->MaxMissingSequencesBeforeResync;
+
+	ServerReplicationBudgetMs      = Settings->ServerReplicationBudgetMs;
+	MaxReplicationJobsPerFrame     = Settings->MaxReplicationJobsPerFrame;
+	MaxSnapshotsPerClientPerFrame  = Settings->MaxSnapshotsPerClientPerFrame;
+	MaxNearReplicationJobsPerFrame = Settings->MaxNearReplicationJobsPerFrame;
+	MaxMidReplicationJobsPerFrame  = Settings->MaxMidReplicationJobsPerFrame;
+	MaxFarReplicationJobsPerFrame  = Settings->MaxFarReplicationJobsPerFrame;
+
+	// Force all bands due immediately so a newly connected client receives Near/Mid/Far
+	// within the first scheduler pass instead of waiting for the first interval to elapse.
+	const double NowSeconds = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+	NextNearReplicationTime = NowSeconds;
+	NextMidReplicationTime  = NowSeconds;
+	NextFarReplicationTime  = NowSeconds;
 }
 
 // ─── Server Tick ──────────────────────────────────────────────────────────────
 
 void UATR_EchoReplicationComponent::ServerTickReplication(UATR_EchoSubsystem* Sub, float DeltaTime)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_ServerTickReplication_LegacyWrapper);
+
 	if (!Sub || Sub->ActiveEntities == 0) return;
 
 	APlayerController* PC = Cast<APlayerController>(GetOwner());
@@ -50,165 +67,155 @@ void UATR_EchoReplicationComponent::ServerTickReplication(UATR_EchoSubsystem* Su
 	FRotator ViewRotation;
 	PC->GetPlayerViewPoint(ViewOrigin, ViewRotation);
 
-	NearAccumulator += DeltaTime;
-	MidAccumulator  += DeltaTime;
-	FarAccumulator  += DeltaTime;
+	const double Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
 
-	const bool bSendNear = (NearAccumulator >= 1.f / FMath::Max(1.f, NearSnapshotHz));
-	const bool bSendMid  = (MidAccumulator  >= 1.f / FMath::Max(1.f, MidSnapshotHz));
-	const bool bSendFar  = (FarAccumulator  >= 1.f / FMath::Max(1.f, FarSnapshotHz));
+	ResetFrameReplicationBudget();
 
-	if (!bSendNear && !bSendMid && !bSendFar) return;
-
-	NearEchoes.Reset();
-	MidEchoes.Reset();
-	FarEchoes.Reset();
-
-	Sub->QueryEchoesByRelevancyBands(
-		ViewOrigin,
-		NearRelevancyRange, MidRelevancyRange, FarRelevancyRange,
-		NearEchoes, MidEchoes, FarEchoes
-	);
-
-	// Removal sweep: echoes that fell out of all relevancy bands get Despawn chunks.
-	CurrentRelevantScratch.Reset();
-	CurrentRelevantScratch.Reserve(NearEchoes.Num() + MidEchoes.Num() + FarEchoes.Num());
-	for (int32 i : NearEchoes) CurrentRelevantScratch.Add(i);
-	for (int32 i : MidEchoes)  CurrentRelevantScratch.Add(i);
-	for (int32 i : FarEchoes)  CurrentRelevantScratch.Add(i);
-
-	RemovedScratch.Reset();
-	for (int32 Known : KnownEchoes)
+	if (IsBandDue(EEchoRelevancyBand::Near, Now))
 	{
-		if (!CurrentRelevantScratch.Contains(Known))
-			RemovedScratch.Add(Known);
+		ServerReplicateBandBudgeted(Sub, EEchoRelevancyBand::Near, ViewOrigin, Now,
+		                            GetRemainingSnapshotBudget());
 	}
 
-	if (RemovedScratch.Num() > 0)
-		SendDespawnChunk(RemovedScratch);
-
-	for (int32 Idx : RemovedScratch)
+	if (IsBandDue(EEchoRelevancyBand::Mid, Now) && GetRemainingSnapshotBudget() > 0)
 	{
-		KnownEchoes.Remove(Idx);
-		EchoLastHandledVersion.Remove(Idx);
+		ServerReplicateBandBudgeted(Sub, EEchoRelevancyBand::Mid, ViewOrigin, Now,
+		                            GetRemainingSnapshotBudget());
 	}
 
-	if (bSendNear) { BuildAndSendBand(Sub, EEchoRelevancyBand::Near, NearEchoes); NearAccumulator = 0.f; }
-	if (bSendMid)  { BuildAndSendBand(Sub, EEchoRelevancyBand::Mid,  MidEchoes);  MidAccumulator  = 0.f; }
-	if (bSendFar)  { BuildAndSendBand(Sub, EEchoRelevancyBand::Far,  FarEchoes);  FarAccumulator  = 0.f; }
+	if (IsBandDue(EEchoRelevancyBand::Far, Now) && GetRemainingSnapshotBudget() > 0)
+	{
+		ServerReplicateBandBudgeted(Sub, EEchoRelevancyBand::Far, ViewOrigin, Now,
+		                            GetRemainingSnapshotBudget());
+	}
 }
 
-void UATR_EchoReplicationComponent::BuildAndSendBand(UATR_EchoSubsystem* Sub,
-                                                      EEchoRelevancyBand Band,
-                                                      const TArray<int32>& EchoIndices)
+int32 UATR_EchoReplicationComponent::BuildAndSendBand(UATR_EchoSubsystem* Sub,
+                                                       EEchoRelevancyBand Band,
+                                                       const TArray<int32>& EchoIndices,
+                                                       int32 MaxSnapshotsToSend)
 {
-	if (EchoIndices.IsEmpty()) return;
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_BuildAndSendBand);
+
+	if (EchoIndices.IsEmpty() || MaxSnapshotsToSend <= 0) return 0;
 
 	const float CellSz = Sub->SpatialGrid.GetCellSize();
 	const int32 SafeMaxSnapshotsPerChunk = FMath::Clamp(MaxSnapshotsPerChunk, 1, 512);
 	const int32 MaxSnapshotsThisSequence = SafeMaxSnapshotsPerChunk * 255;
+	const int32 EffectiveMax = FMath::Min(MaxSnapshotsThisSequence, MaxSnapshotsToSend);
 
 	// Phase 1 (game thread): dirty check, TSet/TMap bookkeeping, promoted actor reads (CMC).
 	// These cannot be parallelized — TSet/TMap are not thread-safe, CMC requires game thread.
 	struct FEncodeInput { FVector3f Pos; float Yaw; uint8 Anim; int32 Index; };
 	TArray<FEncodeInput> ToEncode;
-	ToEncode.Reserve(EchoIndices.Num());
 	bool bAnyNew = false;
 
-	for (int32 i : EchoIndices)
 	{
-		const uint32 CurrentVersion = Sub->DirtyStates.IsValidIndex(i)
-		                            ? Sub->DirtyStates[i].Version : 0;
-		const bool bKnown = KnownEchoes.Contains(i);
+		TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_BuildEncodeInputs);
+		ToEncode.Reserve(FMath::Min(EchoIndices.Num(), EffectiveMax));
 
-		if (bKnown)
+		for (int32 i : EchoIndices)
 		{
-			const uint32 LastVersion = EchoLastHandledVersion.FindRef(i);
-			if (CurrentVersion == LastVersion) continue; // clean — skip
-		}
+			const uint32 CurrentVersion = Sub->DirtyStates.IsValidIndex(i)
+			                            ? Sub->DirtyStates[i].Version : 0;
+			const bool bKnown = KnownEchoes.Contains(i);
 
-		if (ToEncode.Num() >= MaxSnapshotsThisSequence)
-		{
-			UE_LOG(LogATR_EchoNet, Warning,
-				TEXT("Echo snapshot send cap reached for band %d. Remaining dirty/new echoes will be retried next send."),
-				static_cast<int32>(Band));
-			break;
-		}
-
-		if (bKnown)
-		{
-			EchoLastHandledVersion[i] = CurrentVersion;
-		}
-		else
-		{
-			KnownEchoes.Add(i);
-			EchoLastHandledVersion.Add(i, CurrentVersion);
-			bAnyNew = true;
-		}
-
-		FVector3f EncodePos = Sub->Positions[i];
-		float     EncodeYaw = Sub->Yaws[i];
-		if (AATR_ActiveEcho* Actor = Sub->IndexToActor[i])
-		{
-			UCapsuleComponent* Capsule = Actor->GetCapsuleComponent();
-			if (Capsule)
+			if (bKnown)
 			{
-				const float HH = Capsule->GetScaledCapsuleHalfHeight();
-				EncodePos = FVector3f(Actor->GetActorLocation()) - FVector3f(0.f, 0.f, HH);
-				EncodeYaw = Actor->GetActorRotation().Yaw;
+				const uint32 LastVersion = EchoLastHandledVersion.FindRef(i);
+				if (CurrentVersion == LastVersion) continue; // clean — skip
 			}
-		}
 
-		ToEncode.Add({ EncodePos, EncodeYaw, Sub->AnimState[i], i });
+			if (ToEncode.Num() >= EffectiveMax)
+			{
+				break; // scheduler budget reached — defer to next frame
+			}
+
+			if (bKnown)
+			{
+				EchoLastHandledVersion[i] = CurrentVersion;
+			}
+			else
+			{
+				KnownEchoes.Add(i);
+				EchoLastHandledVersion.Add(i, CurrentVersion);
+				bAnyNew = true;
+			}
+
+			FVector3f EncodePos = Sub->Positions[i];
+			float     EncodeYaw = Sub->Yaws[i];
+			if (AATR_ActiveEcho* Actor = Sub->IndexToActor[i])
+			{
+				UCapsuleComponent* Capsule = Actor->GetCapsuleComponent();
+				if (Capsule)
+				{
+					const float HH = Capsule->GetScaledCapsuleHalfHeight();
+					EncodePos = FVector3f(Actor->GetActorLocation()) - FVector3f(0.f, 0.f, HH);
+					EncodeYaw = Actor->GetActorRotation().Yaw;
+				}
+			}
+
+			ToEncode.Add({ EncodePos, EncodeYaw, Sub->AnimState[i], i });
+		}
 	}
 
-	if (ToEncode.IsEmpty()) return; // all echoes clean this band
+	if (ToEncode.IsEmpty()) return 0; // all echoes clean this band
 
 	// Phase 2 (parallel): encode inputs into snapshots — pure math, no UObject access.
 	// Pre-sized array; each lane writes only its unique slot — no data races.
-	SnapshotScratch.SetNumUninitialized(ToEncode.Num());
-	ParallelFor(ToEncode.Num(), [this, &ToEncode, Sub, CellSz](int32 j)
 	{
-		const FEncodeInput& In = ToEncode[j];
-		const int32     CellId     = Sub->SpatialGrid.GetCellId(FVector2f(In.Pos.X, In.Pos.Y));
-		const FVector2f CellOrigin = Sub->SpatialGrid.GetCellOrigin2D(CellId);
-		SnapshotScratch[j] = EncodeEchoCell(In.Pos, In.Yaw, In.Anim, In.Index,
-		                                    CellId, CellOrigin, CellSz);
-	});
+		TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_EncodeSnapshots);
+		SnapshotScratch.SetNumUninitialized(ToEncode.Num());
+		ParallelFor(ToEncode.Num(), [this, &ToEncode, Sub, CellSz](int32 j)
+		{
+			const FEncodeInput& In = ToEncode[j];
+			const int32     CellId     = Sub->SpatialGrid.GetCellId(FVector2f(In.Pos.X, In.Pos.Y));
+			const FVector2f CellOrigin = Sub->SpatialGrid.GetCellOrigin2D(CellId);
+			SnapshotScratch[j] = EncodeEchoCell(In.Pos, In.Yaw, In.Anim, In.Index,
+			                                    CellId, CellOrigin, CellSz);
+		});
+	}
 
 	const EEchoSnapshotKind Kind = bAnyNew ? EEchoSnapshotKind::Full : EEchoSnapshotKind::Delta;
 
-	const int32 Total     = SnapshotScratch.Num();
-	const int32 NumChunks = FMath::DivideAndRoundUp(Total, SafeMaxSnapshotsPerChunk);
+	const int32 Total      = SnapshotScratch.Num();
+	const int32 NumChunks  = FMath::DivideAndRoundUp(Total, SafeMaxSnapshotsPerChunk);
 	const uint8 ChunkCount = static_cast<uint8>(FMath::Clamp(NumChunks, 1, 255));
 	++SnapshotSequence;
 
-	for (int32 ChunkIdx = 0; ChunkIdx < ChunkCount; ++ChunkIdx)
 	{
-		const int32 StartIdx = ChunkIdx * SafeMaxSnapshotsPerChunk;
-		const int32 EndIdx   = FMath::Min(StartIdx + SafeMaxSnapshotsPerChunk, Total);
+		TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_SendSnapshotChunks);
+		for (int32 ChunkIdx = 0; ChunkIdx < ChunkCount; ++ChunkIdx)
+		{
+			const int32 StartIdx = ChunkIdx * SafeMaxSnapshotsPerChunk;
+			const int32 EndIdx   = FMath::Min(StartIdx + SafeMaxSnapshotsPerChunk, Total);
 
-		FEchoSnapshotChunk Chunk;
-		Chunk.Sequence      = SnapshotSequence;
-		Chunk.ChunkIndex    = static_cast<uint8>(ChunkIdx);
-		Chunk.ChunkCount    = ChunkCount;
-		Chunk.TotalEchoes   = Sub->ActiveEntities;
-		Chunk.SnapshotKind  = Kind;
-		Chunk.RelevancyBand = Band;
-		Chunk.ViewId        = 0;
-		Chunk.Snapshots.Reserve(EndIdx - StartIdx);
+			FEchoSnapshotChunk Chunk;
+			Chunk.Sequence      = SnapshotSequence;
+			Chunk.ChunkIndex    = static_cast<uint8>(ChunkIdx);
+			Chunk.ChunkCount    = ChunkCount;
+			Chunk.TotalEchoes   = Sub->ActiveEntities;
+			Chunk.SnapshotKind  = Kind;
+			Chunk.RelevancyBand = Band;
+			Chunk.ViewId        = 0;
+			Chunk.Snapshots.Reserve(EndIdx - StartIdx);
 
-		for (int32 j = StartIdx; j < EndIdx; ++j)
-			Chunk.Snapshots.Add(SnapshotScratch[j]);
+			for (int32 j = StartIdx; j < EndIdx; ++j)
+				Chunk.Snapshots.Add(SnapshotScratch[j]);
 
-		Client_EchoSnapshotChunk(Chunk);
+			Client_EchoSnapshotChunk(Chunk);
+		}
 	}
+
+	return Total;
 }
 
 // ─── Despawn ──────────────────────────────────────────────────────────────────
 
 void UATR_EchoReplicationComponent::SendDespawnChunk(const TArray<int32>& EchoIndices)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_SendDespawnChunks);
+
 	if (EchoIndices.IsEmpty()) return;
 
 	const int32 SafeMaxSnapshotsPerChunk = FMath::Clamp(MaxSnapshotsPerChunk, 1, 512);
@@ -255,6 +262,8 @@ void UATR_EchoReplicationComponent::SendDespawnChunk(const TArray<int32>& EchoIn
 
 void UATR_EchoReplicationComponent::Client_EchoSnapshotChunk_Implementation(const FEchoSnapshotChunk& Chunk)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_ClientReceiveChunk);
+
 	// Prune stale assemblies — sequences more than 4 behind are considered lost.
 	// Incomplete assemblies at prune time represent dropped chunk(s); count them for resync.
 	{
@@ -316,6 +325,7 @@ void UATR_EchoReplicationComponent::Client_EchoSnapshotChunk_Implementation(cons
 
 	if (Assembly.ReceivedChunkIndices.Num() == Assembly.ExpectedChunkCount)
 	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_ClientAssembly);
 		LastReceivedSequence = Chunk.Sequence;
 
 		if (Assembly.SnapshotKind == EEchoSnapshotKind::Despawn)
@@ -338,10 +348,18 @@ void UATR_EchoReplicationComponent::Server_RequestFullResync_Implementation(int3
 		TEXT("Client requested full resync. ViewId=%d LastSeq=%d — clearing known echo set (%d echoes)."),
 		ViewId, static_cast<int32>(LastSeq), KnownEchoes.Num());
 
-	// Drop all per-client tracking. On the next ServerTickReplication every echo in
+	// Drop all per-client tracking. On the next scheduler pass every echo in
 	// relevancy range will be treated as new and receive a Full snapshot.
 	KnownEchoes.Empty();
 	EchoLastHandledVersion.Empty();
+
+	// Reset band due times so all three bands fire on the next scheduler pass.
+	// Without this, a resync during a low-Hz Far interval could leave the client
+	// waiting up to 10s (at FarSnapshotHz=0.1) before receiving far echo indices.
+	const double NowSeconds = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+	NextNearReplicationTime = NowSeconds;
+	NextMidReplicationTime  = NowSeconds;
+	NextFarReplicationTime  = NowSeconds;
 }
 
 // ─── Apply ────────────────────────────────────────────────────────────────────
@@ -349,6 +367,8 @@ void UATR_EchoReplicationComponent::Server_RequestFullResync_Implementation(int3
 void UATR_EchoReplicationComponent::ApplyChunkToSubsystem(const TArray<FEchoSnapshot>& Snapshots,
                                                             int32 TotalEchoes)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_ClientApplySnapshots);
+
 	UWorld* World = GetWorld();
 	if (!World) return;
 
@@ -411,6 +431,8 @@ void UATR_EchoReplicationComponent::ApplyChunkToSubsystem(const TArray<FEchoSnap
 
 void UATR_EchoReplicationComponent::ApplyDespawnToSubsystem(const TArray<FEchoSnapshot>& Snapshots)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_ClientApplyDespawns);
+
 	UWorld* World = GetWorld();
 	if (!World) return;
 
@@ -433,6 +455,124 @@ void UATR_EchoReplicationComponent::ApplyDespawnToSubsystem(const TArray<FEchoSn
 	UE_LOG(LogATR_EchoNet, Verbose,
 		TEXT("Client despawn: %d echoes removed from local relevancy set."),
 		DespawnIndexScratch.Num());
+}
+
+// ─── Scheduler API ───────────────────────────────────────────────────────────
+
+bool UATR_EchoReplicationComponent::IsBandDue(EEchoRelevancyBand Band, double NowSeconds) const
+{
+	switch (Band)
+	{
+	case EEchoRelevancyBand::Near: return NowSeconds >= NextNearReplicationTime;
+	case EEchoRelevancyBand::Mid:  return NowSeconds >= NextMidReplicationTime;
+	case EEchoRelevancyBand::Far:  return NowSeconds >= NextFarReplicationTime;
+	default:                       return false;
+	}
+}
+
+void UATR_EchoReplicationComponent::ResetFrameReplicationBudget()
+{
+	SnapshotsSentThisFrame = 0;
+}
+
+int32 UATR_EchoReplicationComponent::GetRemainingSnapshotBudget() const
+{
+	return FMath::Max(0, MaxSnapshotsPerClientPerFrame - SnapshotsSentThisFrame);
+}
+
+void UATR_EchoReplicationComponent::MarkBandProcessed(EEchoRelevancyBand Band, double NowSeconds)
+{
+	switch (Band)
+	{
+	case EEchoRelevancyBand::Near:
+		NextNearReplicationTime = NowSeconds + (1.0 / FMath::Max(0.1f, NearSnapshotHz));
+		break;
+	case EEchoRelevancyBand::Mid:
+		NextMidReplicationTime  = NowSeconds + (1.0 / FMath::Max(0.1f, MidSnapshotHz));
+		break;
+	case EEchoRelevancyBand::Far:
+		NextFarReplicationTime  = NowSeconds + (1.0 / FMath::Max(0.1f, FarSnapshotHz));
+		break;
+	}
+}
+
+int32 UATR_EchoReplicationComponent::ServerReplicateBandBudgeted(
+	UATR_EchoSubsystem* Sub,
+	EEchoRelevancyBand  Band,
+	const FVector&      ViewOrigin,
+	double              NowSeconds,
+	int32               MaxSnapshotsForThisJob)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_ServerReplicateBandBudgeted);
+
+	if (!Sub || MaxSnapshotsForThisJob <= 0) return 0;
+
+	NearScratch.Reset();
+	MidScratch.Reset();
+	FarScratch.Reset();
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_QueryRelevancy);
+		Sub->QueryEchoesByRelevancyBands(
+			ViewOrigin,
+			NearRelevancyRange, MidRelevancyRange, FarRelevancyRange,
+			NearScratch, MidScratch, FarScratch);
+	}
+
+	// Removal sweep — only during Near band job to avoid redundant scans per client.
+	if (Band == EEchoRelevancyBand::Near)
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_NearRemovalMaintenance);
+
+		CurrentRelevantScratch.Reset();
+		CurrentRelevantScratch.Reserve(NearScratch.Num() + MidScratch.Num() + FarScratch.Num());
+		for (int32 i : NearScratch) CurrentRelevantScratch.Add(i);
+		for (int32 i : MidScratch)  CurrentRelevantScratch.Add(i);
+		for (int32 i : FarScratch)  CurrentRelevantScratch.Add(i);
+
+		RemovedScratch.Reset();
+		for (int32 Known : KnownEchoes)
+		{
+			if (!CurrentRelevantScratch.Contains(Known))
+				RemovedScratch.Add(Known);
+		}
+
+		if (RemovedScratch.Num() > 0)
+		{
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_SendDespawns);
+				SendDespawnChunk(RemovedScratch);
+			}
+
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_RemoveKnownEchoes);
+				for (int32 Removed : RemovedScratch)
+				{
+					KnownEchoes.Remove(Removed);
+					EchoLastHandledVersion.Remove(Removed);
+				}
+			}
+		}
+	}
+
+	const TArray<int32>* Selected = nullptr;
+	switch (Band)
+	{
+	case EEchoRelevancyBand::Near: Selected = &NearScratch; break;
+	case EEchoRelevancyBand::Mid:  Selected = &MidScratch;  break;
+	case EEchoRelevancyBand::Far:  Selected = &FarScratch;  break;
+	}
+
+	int32 Sent = 0;
+	if (Selected)
+	{
+		Sent = BuildAndSendBand(Sub, Band, *Selected, MaxSnapshotsForThisJob);
+	}
+
+	SnapshotsSentThisFrame += Sent;
+	MarkBandProcessed(Band, NowSeconds);
+
+	return Sent;
 }
 
 // ─── Quantization + Codec ─────────────────────────────────────────────────────

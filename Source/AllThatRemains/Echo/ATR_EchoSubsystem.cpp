@@ -188,6 +188,13 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	PositionDirtyThresholdSq = FMath::Square(Settings->PositionDirtyThreshold);
 	YawDirtyThresholdDeg     = Settings->YawDirtyThresholdDegrees;
 
+	ServerReplicationBudgetMs      = Settings->ServerReplicationBudgetMs;
+	MaxReplicationJobsPerFrame     = Settings->MaxReplicationJobsPerFrame;
+	MaxSnapshotsPerClientPerFrame  = Settings->MaxSnapshotsPerClientPerFrame;
+	MaxNearReplicationJobsPerFrame = Settings->MaxNearReplicationJobsPerFrame;
+	MaxMidReplicationJobsPerFrame  = Settings->MaxMidReplicationJobsPerFrame;
+	MaxFarReplicationJobsPerFrame  = Settings->MaxFarReplicationJobsPerFrame;
+
 	PromotedIndices.Reserve(PoolSize);
 	LocalEntityScratch.Reserve(256);
 	LastLocalEntityScratch.Reserve(512);
@@ -310,24 +317,7 @@ void UATR_EchoSubsystem::Tick(float DeltaTime)
 	if (NetMode != NM_Client)
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(Echo_ServerReplication);
-		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-		{
-			APlayerController* PC = It->Get();
-			if (!PC) continue;
-
-			UATR_EchoReplicationComponent* Comp =
-				PC->FindComponentByClass<UATR_EchoReplicationComponent>();
-			if (!Comp)
-			{
-				Comp = NewObject<UATR_EchoReplicationComponent>(PC);
-				Comp->RegisterComponent();
-				UE_LOG(LogATR_EchoNet, Log,
-					TEXT("Created EchoReplicationComponent for PlayerController %s"),
-					*GetNameSafe(PC));
-			}
-
-			Comp->ServerTickReplication(this, DeltaTime);
-		}
+		TickReplicationScheduler(DeltaTime);
 	}
 }
 
@@ -1203,4 +1193,113 @@ void UATR_EchoSubsystem::ForceDestroyEcho(AATR_ActiveEcho* Actor)
 	if (!ensureAlways(IndexToActor[Idx] == nullptr)) return;
 
 	RemoveEcho(Idx);
+}
+
+// ─── Replication Scheduler ───────────────────────────────────────────────────
+
+void UATR_EchoSubsystem::GatherReplicationClients()
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_GatherReplicationClients);
+
+	ReplicationClientsScratch.Reset();
+
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		APlayerController* PC = It->Get();
+		if (!PC) continue;
+
+		UATR_EchoReplicationComponent* Comp =
+			PC->FindComponentByClass<UATR_EchoReplicationComponent>();
+
+		if (!Comp)
+		{
+			Comp = NewObject<UATR_EchoReplicationComponent>(PC);
+			Comp->RegisterComponent();
+			UE_LOG(LogATR_EchoNet, Log,
+				TEXT("Created EchoReplicationComponent for PlayerController %s"),
+				*GetNameSafe(PC));
+		}
+
+		ReplicationClientsScratch.Add(Comp);
+	}
+
+	if (ReplicationClientCursor >= ReplicationClientsScratch.Num())
+	{
+		ReplicationClientCursor = 0;
+	}
+}
+
+void UATR_EchoSubsystem::TickReplicationScheduler(float DeltaTime)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoRep_Scheduler);
+
+	GatherReplicationClients();
+
+	const int32 NumClients = ReplicationClientsScratch.Num();
+	if (NumClients == 0) return;
+
+	const double Now = GetWorld()->GetTimeSeconds();
+
+	int32 JobsProcessed = 0;
+	int32 NearJobs = 0;
+	int32 MidJobs  = 0;
+	int32 FarJobs  = 0;
+
+	const int32 StartCursor = ReplicationClientCursor;
+
+	auto TryProcessBandForClient = [&](UATR_EchoReplicationComponent* Comp,
+	                                    EEchoRelevancyBand Band) -> bool
+	{
+		if (!Comp) return false;
+		if (!Comp->IsBandDue(Band, Now)) return false;
+		if (JobsProcessed >= MaxReplicationJobsPerFrame) return false;
+
+		if (Band == EEchoRelevancyBand::Near && NearJobs >= MaxNearReplicationJobsPerFrame) return false;
+		if (Band == EEchoRelevancyBand::Mid  && MidJobs  >= MaxMidReplicationJobsPerFrame)  return false;
+		if (Band == EEchoRelevancyBand::Far  && FarJobs  >= MaxFarReplicationJobsPerFrame)  return false;
+
+		const int32 RemainingClientBudget = Comp->GetRemainingSnapshotBudget();
+		if (RemainingClientBudget <= 0) return false;
+
+		FVector ViewOrigin = FVector::ZeroVector;
+		APlayerController* PC = Cast<APlayerController>(Comp->GetOwner());
+		if (!PC) return false;
+
+		FRotator ViewRot;
+		PC->GetPlayerViewPoint(ViewOrigin, ViewRot);
+
+		const int32 Sent = Comp->ServerReplicateBandBudgeted(
+			this, Band, ViewOrigin, Now, RemainingClientBudget);
+
+		if (Sent < 0) return false;
+
+		++JobsProcessed;
+		if      (Band == EEchoRelevancyBand::Near) ++NearJobs;
+		else if (Band == EEchoRelevancyBand::Mid)  ++MidJobs;
+		else                                        ++FarJobs;
+
+		return true;
+	};
+
+	for (int32 Pass = 0; Pass < NumClients && JobsProcessed < MaxReplicationJobsPerFrame; ++Pass)
+	{
+		const int32 ClientIdx = (StartCursor + Pass) % NumClients;
+		UATR_EchoReplicationComponent* Comp = ReplicationClientsScratch[ClientIdx];
+		if (!Comp) continue;
+
+		Comp->ResetFrameReplicationBudget();
+
+		TryProcessBandForClient(Comp, EEchoRelevancyBand::Near);
+		if (JobsProcessed >= MaxReplicationJobsPerFrame) break;
+
+		TryProcessBandForClient(Comp, EEchoRelevancyBand::Mid);
+		if (JobsProcessed >= MaxReplicationJobsPerFrame) break;
+
+		TryProcessBandForClient(Comp, EEchoRelevancyBand::Far);
+	}
+
+	ReplicationClientCursor = (StartCursor + 1) % NumClients;
 }

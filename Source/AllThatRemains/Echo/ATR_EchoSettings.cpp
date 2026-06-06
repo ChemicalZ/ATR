@@ -51,6 +51,13 @@ void UATR_EchoSettings::ValidateAndClamp()
 	FullResyncCooldownSeconds       = FMath::Max(0.f, FullResyncCooldownSeconds);
 	MaxMissingSequencesBeforeResync = FMath::Max(1, MaxMissingSequencesBeforeResync);
 
+	ServerReplicationBudgetMs        = FMath::Clamp(ServerReplicationBudgetMs, 0.1f, 10.f);
+	MaxReplicationJobsPerFrame       = FMath::Clamp(MaxReplicationJobsPerFrame, 1, 64);
+	MaxSnapshotsPerClientPerFrame    = FMath::Clamp(MaxSnapshotsPerClientPerFrame, 1, 2048);
+	MaxNearReplicationJobsPerFrame   = FMath::Clamp(MaxNearReplicationJobsPerFrame, 1, MaxReplicationJobsPerFrame);
+	MaxMidReplicationJobsPerFrame    = FMath::Clamp(MaxMidReplicationJobsPerFrame, 0, MaxReplicationJobsPerFrame);
+	MaxFarReplicationJobsPerFrame    = FMath::Clamp(MaxFarReplicationJobsPerFrame, 0, MaxReplicationJobsPerFrame);
+
 	// Dirty State
 	PositionDirtyThreshold   = FMath::Max(0.f, PositionDirtyThreshold);
 	YawDirtyThresholdDegrees = FMath::Max(0.f, YawDirtyThresholdDegrees);
