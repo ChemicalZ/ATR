@@ -49,6 +49,17 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category="Echo|World", meta=(ClampMin=1000.f, ForceUnits="cm"))
 	float WorldHalfExtent = 512000.f;
 
+	// Radius around each player within which entities enter the fine spatial grid.
+	// Must be >= FarRelevancyRange (default 25000) for QueryEchoesByRelevancyBands to
+	// return all replication candidates. Must also be >= DemoteRadius.
+	UPROPERTY(Config, EditAnywhere, Category="Echo|World", meta=(ClampMin=100.f, ForceUnits="cm"))
+	float LocalZoneRadius = 27500.f;
+
+	// Coarse global grid cell side length. Used for migration/density tracking.
+	// Larger = less frequent incremental updates. Recommended: 30x+ GridCellSize.
+	UPROPERTY(Config, EditAnywhere, Category="Echo|World", meta=(ClampMin=1000.f, ForceUnits="cm"))
+	float CoarseGridCellSize = 15000.f;
+
 	// ── Pool ──────────────────────────────────────────────────────────────────
 
 	// ActiveEcho actors pre-warmed in the pool at BeginPlay (server only).

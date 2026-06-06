@@ -7,6 +7,7 @@
 #include "Components/CapsuleComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "Engine/World.h"
+#include "Async/ParallelFor.h"
 
 // ─── Construction ─────────────────────────────────────────────────────────────
 
@@ -99,7 +100,11 @@ void UATR_EchoReplicationComponent::BuildAndSendBand(UATR_EchoSubsystem* Sub,
 
 	const float CellSz = Sub->SpatialGrid.GetCellSize();
 
-	SnapshotScratch.Reset(EchoIndices.Num());
+	// Phase 1 (game thread): dirty check, TSet/TMap bookkeeping, promoted actor reads (CMC).
+	// These cannot be parallelized — TSet/TMap are not thread-safe, CMC requires game thread.
+	struct FEncodeInput { FVector3f Pos; float Yaw; uint8 Anim; int32 Index; };
+	TArray<FEncodeInput> ToEncode;
+	ToEncode.Reserve(EchoIndices.Num());
 	bool bAnyNew = false;
 
 	for (int32 i : EchoIndices)
@@ -134,13 +139,22 @@ void UATR_EchoReplicationComponent::BuildAndSendBand(UATR_EchoSubsystem* Sub,
 			}
 		}
 
-		const int32    CellId     = Sub->SpatialGrid.GetCellId(FVector2f(EncodePos.X, EncodePos.Y));
-		const FVector2f CellOrigin = Sub->SpatialGrid.GetCellOrigin2D(CellId);
-		SnapshotScratch.Add(EncodeEchoCell(EncodePos, EncodeYaw, Sub->AnimState[i], i,
-		                                   CellId, CellOrigin, CellSz));
+		ToEncode.Add({ EncodePos, EncodeYaw, Sub->AnimState[i], i });
 	}
 
-	if (SnapshotScratch.IsEmpty()) return; // all echoes clean this band
+	if (ToEncode.IsEmpty()) return; // all echoes clean this band
+
+	// Phase 2 (parallel): encode inputs into snapshots — pure math, no UObject access.
+	// Pre-sized array; each lane writes only its unique slot — no data races.
+	SnapshotScratch.SetNumUninitialized(ToEncode.Num());
+	ParallelFor(ToEncode.Num(), [this, &ToEncode, Sub, CellSz](int32 j)
+	{
+		const FEncodeInput& In = ToEncode[j];
+		const int32     CellId     = Sub->SpatialGrid.GetCellId(FVector2f(In.Pos.X, In.Pos.Y));
+		const FVector2f CellOrigin = Sub->SpatialGrid.GetCellOrigin2D(CellId);
+		SnapshotScratch[j] = EncodeEchoCell(In.Pos, In.Yaw, In.Anim, In.Index,
+		                                    CellId, CellOrigin, CellSz);
+	});
 
 	const EEchoSnapshotKind Kind = bAnyNew ? EEchoSnapshotKind::Full : EEchoSnapshotKind::Delta;
 

@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/BitArray.h"
 #include "Subsystems/WorldSubsystem.h"
 #include "ATR_EchoSubsystem.generated.h"
 
@@ -27,13 +28,16 @@ struct FEchoDirtyState
 	uint32          Version = 0; // increments each dirty marking; never wraps to 0
 };
 
-// CSR-style uniform spatial grid. Stores SoA indices — never source of truth.
-// Rebuilt every frame from Positions SoA. Never owns entity data.
-struct FATR_SpatialGrid
+// Sparse uniform spatial grid. Only occupied cells allocate memory.
+// Rebuilt each frame from a local-entity set (entities near players only).
+// Never owns entity data. Member named SpatialGrid on the subsystem for
+// backward compat with ATR_EchoReplicationComponent direct access.
+struct FATR_SparseGrid
 {
 public:
 	void  Initialize(FVector2D InWorldMin, FVector2D InWorldMax, float InCellSize);
-	void  Rebuild(TArrayView<const FVector3f> Positions, int32 Count);
+	void  Reset();
+	void  Build(TArrayView<const FVector3f> Positions, const TArray<int32>& LocalIndices);
 	int32 QueryRadius(FVector3f QueryPos, float Radius,
 	                  TArrayView<const FVector3f> Positions,
 	                  TArray<int32>& OutIndices) const;
@@ -46,14 +50,15 @@ public:
 		for (int32 Cy = MinCy; Cy <= MaxCy; ++Cy)
 			for (int32 Cx = MinCx; Cx <= MaxCx; ++Cx)
 			{
-				const int32 C = CellIndex(Cx, Cy);
-				for (int32 i = CellStart[C]; i < CellStart[C + 1]; ++i)
-					Func(SortedEntities[i]);
+				const int32 Key = CellIndex(Cx, Cy);
+				if (const TArray<int32>* Bucket = Cells.Find(Key))
+					for (int32 i : *Bucket)
+						Func(i);
 			}
 	}
 
-	int32 GetNumCells()    const { return NumCellsX * NumCellsY; }
-	bool  IsInitialized()  const { return NumCellsX > 0; }
+	int32 GetNumCells()   const { return NumCellsX * NumCellsY; }
+	bool  IsInitialized() const { return NumCellsX > 0; }
 
 	FORCEINLINE float GetCellSize() const { return CellSize; }
 
@@ -62,13 +67,11 @@ public:
 		return InCellId >= 0 && InCellId < NumCellsX * NumCellsY;
 	}
 
-	// Returns the flat cell index for a 2D world position.
 	FORCEINLINE int32 GetCellId(FVector2f Pos2D) const
 	{
 		return CellIndex(CellX(Pos2D.X), CellY(Pos2D.Y));
 	}
 
-	// Returns the world-space XY origin (bottom-left corner) of the given cell.
 	FORCEINLINE FVector2f GetCellOrigin2D(int32 InCellId) const
 	{
 		const int32 Cx = InCellId % FMath::Max(1, NumCellsX);
@@ -96,9 +99,55 @@ private:
 	int32     NumCellsX   = 0;
 	int32     NumCellsY   = 0;
 
-	TArray<int32> CellStart;       // size = NumCells + 1
-	TArray<int32> SortedEntities;  // size = live entity count
-	TArray<int32> CellCounts;      // rebuild scratch
+	TMap<int32, TArray<int32>> Cells;
+	TArray<int32>              PopulatedCells;
+};
+
+// Global coarse grid tracking entity counts per large cell.
+// Updated incrementally — only when an entity crosses a coarse cell boundary.
+struct FATR_CoarseGrid
+{
+public:
+	void Initialize(FVector2D InWorldMin, FVector2D InWorldMax, float InCellSize);
+
+	FORCEINLINE int32 GetCellId(FVector2f Pos2D) const
+	{
+		return CellIndex(CellX(Pos2D.X), CellY(Pos2D.Y));
+	}
+
+	void OnEntityAdded(int32 CellId)
+	{
+		CellCounts.FindOrAdd(CellId)++;
+	}
+
+	void OnEntityRemoved(int32 CellId)
+	{
+		int32* Count = CellCounts.Find(CellId);
+		if (!ensureAlways(Count)) return;
+		if (--(*Count) == 0)
+			CellCounts.Remove(CellId);
+	}
+
+	const TMap<int32, int32>& GetCellCounts() const { return CellCounts; }
+
+private:
+	FORCEINLINE int32 CellX(float X) const
+	{
+		return FMath::Clamp(static_cast<int32>((X - WorldMin.X) * InvCellSize), 0, NumCellsX - 1);
+	}
+	FORCEINLINE int32 CellY(float Y) const
+	{
+		return FMath::Clamp(static_cast<int32>((Y - WorldMin.Y) * InvCellSize), 0, NumCellsY - 1);
+	}
+	FORCEINLINE int32 CellIndex(int32 Cx, int32 Cy) const { return Cy * NumCellsX + Cx; }
+
+	FVector2D WorldMin    = FVector2D::ZeroVector;
+	float     CellSize    = 15000.f;
+	float     InvCellSize = 1.f / 15000.f;
+	int32     NumCellsX   = 0;
+	int32     NumCellsY   = 0;
+
+	TMap<int32, int32> CellCounts;
 };
 
 UCLASS()
@@ -201,7 +250,7 @@ public:
 	// Flush Actor state to SoA, deactivate, return to pool.
 	void DemoteEcho(AATR_ActiveEcho* Actor);
 
-	const FATR_SpatialGrid& GetSpatialGrid() const { return SpatialGrid; }
+	const FATR_SparseGrid& GetSpatialGrid() const { return SpatialGrid; }
 	bool                    IsGridReady()    const { return bGridReady; }
 
 	void MarkEchoDirty(int32 Index, EEchoDirtyFlags Flags);
@@ -243,14 +292,25 @@ public:
 	// Raw observer pointers — lifetime guaranteed by EchoPool TObjectPtr.
 	UPROPERTY()
 	TArray<AATR_ActiveEcho*> IndexToActor;
-	
+
+	// Compact list of SoA indices currently promoted to an Actor.
+	// Maintained by PromoteEcho/DemoteEcho/RemoveEcho. Never has nullptr entries.
+	TArray<int32> PromotedIndices;
+
+	// SoA parallel array: current coarse cell per entity (INDEX_NONE = not yet registered).
+	// Updated incrementally in UpdateCoarseGrid() on cell boundary crossings.
+	TArray<int32> CoarseCellIds;
+
 	void SimTick(float DeltaTime);
-	void RebuildGrid();
+	void RebuildFineGrid();
+	void UpdateCoarseGrid();
 
-	// Grid rebuilt every frame from Positions. Never source of truth.
-	FATR_SpatialGrid SpatialGrid;
+	// Fine local grid — rebuilt each tick from entities within LocalZoneRadius of any player.
+	// Member name SpatialGrid preserved for ATR_EchoReplicationComponent direct access.
+	FATR_SparseGrid SpatialGrid;
 
-
+	// Global coarse grid — incremental count-only, updated on cell boundary crossings.
+	FATR_CoarseGrid CoarseGrid;
 
 	UPROPERTY()
 	TObjectPtr<AATR_EchoManager> Manager;
@@ -263,6 +323,18 @@ public:
 
 	void RunSteeringPass();
 	void RunPromotionPass();
+
+	// Frame-scope scratch for local entity indices; allocation persists across ticks.
+	TArray<int32> LocalEntityScratch;
+
+	// Bit per SoA slot: was this entity in the local zone last frame?
+	// Used to zero stale steering velocities when an entity exits the zone.
+	TBitArray<> WasLocalLastFrame;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Echo|Config")
+	float LocalZoneRadius = 27500.f;  // must be >= FarRelevancyRange for replication queries
+
+	float CoarseGridCellSize = 15000.f;
 
 	float TickAccumulator = 0.f;
 	bool  bGridReady      = false;

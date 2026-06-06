@@ -131,7 +131,7 @@ public:
 
 	virtual void BeginPlay() override;
 
-	// Called by UATR_EchoSubsystem::Tick after RebuildGrid.
+	// Called by UATR_EchoSubsystem::Tick after RebuildFineGrid.
 	// Skipped on NM_DedicatedServer (no GPU).
 	void UpdateISM(UATR_EchoSubsystem* Sub);
 
