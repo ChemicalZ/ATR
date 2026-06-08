@@ -1,9 +1,12 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
 #include "ATR_EchoAIController.h"
+#include "ATR_EchoAILog.h"
 #include "Perception/AISenseConfig_Sight.h"
 #include "Perception/AISenseConfig_Hearing.h"
 #include "Perception/AISense_Sight.h"
+
+DEFINE_LOG_CATEGORY(LogATR_EchoAI);
 
 // ─── Construction ─────────────────────────────────────────────────────────────
 
@@ -36,21 +39,26 @@ AATR_EchoAIController::AATR_EchoAIController()
 
 void AATR_EchoAIController::OnPossess(APawn* InPawn)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_OnPossess);
 	Super::OnPossess(InPawn);
 
 	if (AIPerception)
 	{
 		AIPerception->SetComponentTickEnabled(true);
-		AIPerception->OnPerceptionUpdated.AddDynamic(this, &AATR_EchoAIController::HandlePerceptionUpdated);
+		// Guard against double-binding if a lifecycle bug ever possesses without an
+		// intervening unpossess. AddUnique is a no-op when already bound.
+		AIPerception->OnPerceptionUpdated.AddUniqueDynamic(this, &AATR_EchoAIController::HandlePerceptionUpdated);
 	}
 
 	if (StateTreeComp) StateTreeComp->StartLogic();
-	UE_LOG(LogTemp, Warning, TEXT("Possessed %s"),
-	*InPawn->GetName());
+
+	UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("OnPossess — %s possessed %s"),
+		*GetName(), InPawn ? *InPawn->GetName() : TEXT("null"));
 }
 
 void AATR_EchoAIController::OnUnPossess()
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_OnUnPossess);
 	StopMovement(); // must be before Super — Super clears the pawn reference
 	CurrentTarget.Reset();
 
@@ -67,6 +75,8 @@ void AATR_EchoAIController::OnUnPossess()
 
 void AATR_EchoAIController::EnterPool()
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_EnterPool);
+
 	// Safety net — normally OnUnPossess already cleaned up.
 	// RemoveDynamic on an unbound delegate is a no-op.
 	CurrentTarget.Reset();
@@ -84,12 +94,14 @@ void AATR_EchoAIController::EnterPool()
 
 void AATR_EchoAIController::HandlePerceptionUpdated(const TArray<AActor*>& UpdatedActors)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_HandlePerceptionUpdated);
 	if (!HasAuthority()) return;
 	CurrentTarget = SelectBestTarget();
 }
 
 AActor* AATR_EchoAIController::SelectBestTarget() const
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_SelectBestTarget);
 	if (!AIPerception) return nullptr;
 
 	APawn* MyPawn = GetPawn();

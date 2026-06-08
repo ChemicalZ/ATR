@@ -18,8 +18,10 @@
 //   UnPossess()  → OnUnPossess() (stops movement, unbinds delegate, dormant)
 //   Return to ControllerPool
 //
-// Team: Echoes are Team 1. Sight/hearing ignore friendlies, so echoes never perceive
-// each other. Players have no team (NoTeam) and are treated as neutral → detected.
+// Team: Echoes are Team 2 (see TeamNumber default below). Sight/hearing ignore friendlies,
+// so echoes never perceive each other. Players have no team (NoTeam) and are treated as
+// neutral → detected. The controller and the possessed AATR_ActiveEcho must share this team
+// id for friendly-filtering to work; both default to 2.
 UCLASS()
 class ALLTHATREMAINS_API AATR_EchoAIController : public AAIController
 {
