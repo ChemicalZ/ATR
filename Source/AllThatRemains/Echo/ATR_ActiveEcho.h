@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "GenericTeamAgentInterface.h"
 #include "GameFramework/Character.h"
+#include "ATR_EchoRuntimeTypes.h"
 #include "ATR_ActiveEcho.generated.h"
 
 class UATR_EchoSubsystem;
@@ -44,6 +45,15 @@ public:
 	UPROPERTY(ReplicatedUsing = OnRep_AnimStateCache, BlueprintReadOnly, Category = "Echo")
 	uint8 AnimStateCache = 0;
 
+	// PRESENTATION-ONLY canonical intent, replicated so clients can drive animation/FX (chase
+	// vs search vs investigate vs obstacle). This is NOT AI memory — clients never make
+	// decisions from it; the server owns intent selection. Server-written each intent tick.
+	UPROPERTY(ReplicatedUsing = OnRep_EchoIntent, BlueprintReadOnly, Category = "Echo")
+	EATR_EchoIntent ReplicatedIntent = EATR_EchoIntent::Idle;
+
+	// Server-only setter — updates ReplicatedIntent (replicates to clients on change).
+	void SetEchoIntentForPresentation(EATR_EchoIntent NewIntent);
+
 	// Set true by StateTree tasks that must not be interrupted (e.g., grab, death sequence).
 	// RunPromotionPass skips demotion while this is true.
 	// StateTree is responsible for clearing it in ExitState; EnterPool resets it as a safety net.
@@ -74,6 +84,7 @@ protected:
 
 	UFUNCTION() void OnRep_SourceIndex();
 	UFUNCTION() void OnRep_AnimStateCache();
+	UFUNCTION() void OnRep_EchoIntent();
 	
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Team")
 	uint8 TeamNumber = 2;

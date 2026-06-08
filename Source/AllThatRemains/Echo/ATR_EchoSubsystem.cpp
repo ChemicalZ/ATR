@@ -1189,6 +1189,11 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 	State.Movement.Request = Move;
 	State.LastUpdateTime   = Now;
 
+	// Push compact intent to the promoted actor for client animation/FX (presentation only —
+	// never AI memory). Replicates to clients on change.
+	if (AATR_ActiveEcho* Actor = IndexToActor.IsValidIndex(Index) ? IndexToActor[Index] : nullptr)
+		Actor->SetEchoIntentForPresentation(NewIntent);
+
 	if (NewIntent != OldIntent)
 	{
 		UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("Intent EchoId %d: %d -> %d (conf %.2f urg %.2f agit %.2f)"),

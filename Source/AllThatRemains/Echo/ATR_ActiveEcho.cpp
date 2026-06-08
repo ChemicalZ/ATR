@@ -50,6 +50,20 @@ void AATR_ActiveEcho::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutL
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	DOREPLIFETIME(AATR_ActiveEcho, SourceIndex);
 	DOREPLIFETIME(AATR_ActiveEcho, AnimStateCache);
+	DOREPLIFETIME(AATR_ActiveEcho, ReplicatedIntent);
+}
+
+void AATR_ActiveEcho::SetEchoIntentForPresentation(EATR_EchoIntent NewIntent)
+{
+	// Server authority only — replicates to clients on change for animation/FX.
+	if (ReplicatedIntent != NewIntent)
+		ReplicatedIntent = NewIntent;
+}
+
+void AATR_ActiveEcho::OnRep_EchoIntent()
+{
+	// AnimBP/FX can poll ReplicatedIntent directly each frame, or override this in a Blueprint
+	// subclass for event-driven intent transitions. No gameplay decision is made here.
 }
 
 void AATR_ActiveEcho::OnRep_SourceIndex()
@@ -107,9 +121,10 @@ void AATR_ActiveEcho::EnterPool()
 		CMC->SetComponentTickEnabled(false);
 	}
 
-	bBlockDemotion = false; // safety net — StateTree (on controller) should clear this in ExitState
-	SourceIndex    = INDEX_NONE;
-	AnimStateCache = 0;
+	bBlockDemotion   = false; // safety net — StateTree (on controller) should clear this in ExitState
+	SourceIndex      = INDEX_NONE;
+	AnimStateCache   = 0;
+	ReplicatedIntent = EATR_EchoIntent::Idle;
 }
 
 void AATR_ActiveEcho::InitFromSoA(const UATR_EchoSubsystem* Sub, int32 Index)
