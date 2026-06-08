@@ -304,6 +304,7 @@ void UATR_EchoSubsystem::Tick(float DeltaTime)
 		RebuildFineGrid();
 		RunSteeringPass();
 		RunPromotionPass();
+		RunIntentPass(DeltaTime);
 	}
 
 	// ── Client ────────────────────────────────────────────────────────────────
@@ -778,6 +779,151 @@ void UATR_EchoSubsystem::ReportEchoStimulus(int32 EchoId, const FATR_StimulusEve
 	}
 
 	State->LastUpdateTime = Event.TimeSeconds;
+}
+
+// ─── Intent Selection (Phase 3) ──────────────────────────────────────────────
+
+void UATR_EchoSubsystem::RunIntentPass(float DeltaTime)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_RunIntentPass);
+
+	const UWorld* W = GetWorld();
+	if (!W) return;
+	const float Now = W->GetTimeSeconds();
+
+	// Active (promoted) echoes drive the StateTree, so they need fresh intent every tick.
+	// Lower-tier simulated echoes are folded into this pass in Phase 11.
+	for (int32 Idx : PromotedIndices)
+	{
+		if (RuntimeStates.IsValidIndex(Idx))
+			UpdateEchoIntent(Idx, Now, DeltaTime);
+	}
+}
+
+void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTime)
+{
+	FATR_EchoRuntimeState* StatePtr = GetMutableEchoStateByIndex(Index);
+	if (!StatePtr) return;
+	FATR_EchoRuntimeState& State = *StatePtr;
+
+	// Refresh live transform from the SoA / promoted actor so distance checks are accurate.
+	State.Location = FVector(GetEchoQueryPosition(Index));
+	State.Velocity = FVector(Velocities[Index]);
+	const float YawRad = FMath::DegreesToRadians(Yaws[Index]);
+	State.FacingDirection = FVector(FMath::Cos(YawRad), FMath::Sin(YawRad), 0.f);
+
+	FATR_EchoAwarenessState& A = State.Awareness;
+	FATR_EchoSearchState&    S = State.Search;
+
+	// --- Decays --- (confidence holds at full while we actually see the target)
+	if (A.bHasCurrentLineOfSight && A.ConfirmedVisibleActor.IsValid())
+		A.Confidence = 1.f;
+	else
+		A.Confidence = FMath::Max(0.f, A.Confidence - ConfidenceDecayPerSec * DeltaTime);
+
+	A.Urgency       = FMath::Max(0.f, A.Urgency       - UrgencyDecayPerSec   * DeltaTime);
+	State.Agitation = FMath::Max(0.f, State.Agitation - AgitationDecayPerSec * DeltaTime);
+
+	const EATR_EchoIntent OldIntent = State.Intent;
+	EATR_EchoIntent      NewIntent = EATR_EchoIntent::Idle;
+	FATR_EchoMoveRequest Move; // defaults to Type=None — no accidental origin move
+
+	const bool bHeardRecent = (A.LastHeardTime >= 0.f) && (Now - A.LastHeardTime <= HeardMemorySeconds);
+
+	if (A.bHasCurrentLineOfSight && A.ConfirmedVisibleActor.IsValid())
+	{
+		// Confirmed visible → chase the actor itself.
+		NewIntent           = EATR_EchoIntent::ChaseVisibleActor;
+		Move.Type           = EATR_EchoMoveTargetType::Actor;
+		Move.Actor          = A.ConfirmedVisibleActor;
+		Move.AcceptanceRadius = ReachLocationRadius;
+		S.bSearchActive     = false; // reacquired — abandon any search
+	}
+	else if (A.Confidence > LostSightMemoryThreshold)
+	{
+		// Lost sight, memory still warm → memory/search progression.
+		const float DistLastSeen = FVector::Dist(State.Location, A.LastSeenLocation);
+		if (!S.bSearchActive && DistLastSeen > ReachLocationRadius)
+		{
+			NewIntent           = EATR_EchoIntent::ChaseLastSeenLocation;
+			Move.Type           = EATR_EchoMoveTargetType::Location;
+			Move.Location       = A.LastSeenLocation;
+			Move.AcceptanceRadius = ReachLocationRadius;
+		}
+		else
+		{
+			// Arrived at last-seen (or already searching) → projected-direction / fan search.
+			if (!S.bSearchActive)
+			{
+				S.bSearchActive = true;
+				S.Origin        = A.LastSeenLocation;
+				FVector Dir     = A.LastSeenVelocity.GetSafeNormal2D();
+				if (Dir.IsNearlyZero()) Dir = State.FacingDirection.GetSafeNormal2D();
+				if (Dir.IsNearlyZero()) Dir = FVector::ForwardVector;
+				S.PrimaryDirection = Dir;
+				S.StartedTime      = Now;
+				S.SearchStepIndex  = 0;
+			}
+
+			// Phase 3 uses a single clamped projected point. Phase 6 replaces this with the
+			// stepped fan-search generator and per-Echo variation.
+			const float Lead = FMath::Min(A.LastSeenVelocity.Size() * SightProjectionSeconds, MaxSightProjectionDistance);
+			const FVector Projected = S.Origin + S.PrimaryDirection * FMath::Max(Lead, S.SearchRadius);
+			A.ProjectedSearchLocation = Projected;
+
+			NewIntent           = (S.SearchStepIndex == 0) ? EATR_EchoIntent::SearchProjectedDirection
+			                                               : EATR_EchoIntent::FanSearchArea;
+			Move.Type           = EATR_EchoMoveTargetType::Location;
+			Move.Location       = Projected;
+			Move.AcceptanceRadius = ReachLocationRadius;
+		}
+	}
+	else if (bHeardRecent)
+	{
+		// Heard a noise but never saw anything → investigate the LOCATION only.
+		S.bSearchActive = false;
+		if (A.Urgency >= HeardInvestigateUrgency)
+		{
+			NewIntent           = EATR_EchoIntent::InvestigateLocation;
+			Move.Type           = EATR_EchoMoveTargetType::Location;
+			Move.Location       = A.LastHeardLocation;
+			Move.AcceptanceRadius = ReachLocationRadius;
+		}
+		else
+		{
+			NewIntent = EATR_EchoIntent::TurnTowardStimulus; // weak — orient only, no path move
+		}
+	}
+	else if (State.Agitation >= AgitationJoinThreshold && !A.HordePressureDirection.IsNearlyZero())
+	{
+		// Pulled by indirect horde pressure (direction-only). Concrete fields land in Phase 8.
+		NewIntent           = EATR_EchoIntent::JoinHordePressure;
+		Move.Type           = EATR_EchoMoveTargetType::Location;
+		Move.Location       = State.Location + A.HordePressureDirection.GetSafeNormal2D() * S.SearchRadius;
+		Move.AcceptanceRadius = ReachLocationRadius;
+	}
+	else if (State.Agitation >= AgitationJoinThreshold)
+	{
+		NewIntent = EATR_EchoIntent::TurnTowardStimulus; // agitated but no direction yet
+	}
+	else
+	{
+		// Nothing actionable — wind down to idle and forget.
+		NewIntent       = EATR_EchoIntent::ReturnToIdle;
+		A.Mode          = EATR_AwarenessMode::None;
+		S.bSearchActive = false;
+	}
+
+	State.Intent           = NewIntent;
+	State.Movement.Request = Move;
+	State.LastUpdateTime   = Now;
+
+	if (NewIntent != OldIntent)
+	{
+		UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("Intent EchoId %d: %d -> %d (conf %.2f urg %.2f agit %.2f)"),
+			State.EchoId, static_cast<int32>(OldIntent), static_cast<int32>(NewIntent),
+			A.Confidence, A.Urgency, State.Agitation);
+	}
 }
 
 bool UATR_EchoSubsystem::PromoteToActive(int32 SoAIndex, AATR_ActiveEcho* Actor)

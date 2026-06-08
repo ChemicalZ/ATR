@@ -436,6 +436,29 @@ public:
 	void RunSteeringPass();
 	void RunPromotionPass();
 
+	// --- Intent selection (Phase 3) ---
+	// Chooses each relevant Echo's high-level EATR_EchoIntent + move request from its
+	// canonical awareness, and decays confidence/urgency/agitation. Runs server-side on
+	// the render tick over active (promoted) echoes; lower-tier echoes are folded in by
+	// Phase 11. The active StateTree consumes the result via the Phase 4 intent evaluator.
+	void RunIntentPass(float DeltaTime);
+
+	// Per-Echo intent state machine. Refreshes live transform from the SoA, applies
+	// decays, and writes State.Intent + State.Movement.Request. Pure function of state.
+	void UpdateEchoIntent(int32 Index, float Now, float DeltaTime);
+
+	// Intent tuning (defaults here; migrate to UATR_EchoSettings when values stabilise).
+	float ConfidenceDecayPerSec        = 0.15f; // sight memory fade rate when not looking
+	float UrgencyDecayPerSec           = 0.20f; // pursuit aggression fade rate
+	float AgitationDecayPerSec         = 0.10f; // horde-pressure fade rate
+	float LostSightMemoryThreshold     = 0.05f; // confidence below this → forget & idle
+	float HeardInvestigateUrgency      = 0.40f; // >= → InvestigateLocation, else TurnTowardStimulus
+	float HeardMemorySeconds           = 8.0f;  // how long a heard location stays actionable
+	float AgitationJoinThreshold       = 0.50f; // >= → JoinHordePressure
+	float ReachLocationRadius          = 120.f; // "arrived" tolerance for memory/search points
+	float SightProjectionSeconds       = 2.0f;  // lead time for projected-direction search
+	float MaxSightProjectionDistance   = 800.f; // clamp so prediction can't be supernatural
+
 	// Frame-scope scratch for local entity indices; allocation persists across ticks.
 	TArray<int32> LocalEntityScratch;
 
