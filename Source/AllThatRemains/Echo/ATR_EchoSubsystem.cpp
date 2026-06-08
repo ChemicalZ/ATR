@@ -657,6 +657,24 @@ void UATR_EchoSubsystem::RegisterActiveEcho(int32 EchoId, AATR_EchoAIController*
 	State->ActiveController  = Controller;
 	State->ActivePawn        = Pawn;
 
+	// Promotion continuity: canonical awareness/search/intent are intentionally PRESERVED so a
+	// re-promoted Echo resumes the chase/search it was on. Seed only the live transform (so the
+	// first intent tick measures distances correctly) and drop a long-stale obstacle hook and
+	// any leftover in-flight move flag — those belong to a previous, torn-down path follow.
+	const int32 Index = GetIndexForEchoId(EchoId);
+	if (Positions.IsValidIndex(Index))
+	{
+		State->Location = FVector(Positions[Index]);
+		const float YawRad = FMath::DegreesToRadians(Yaws[Index]);
+		State->FacingDirection = FVector(FMath::Cos(YawRad), FMath::Sin(YawRad), 0.f);
+	}
+
+	State->Movement.bMoveInProgress = false;
+
+	const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+	if (State->Obstacle.bHasObstacle && (Now - State->Obstacle.LastObstacleTime) > ObstacleHandleTimeoutSeconds)
+		State->Obstacle.bHasObstacle = false;
+
 	UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("RegisterActiveEcho — EchoId %d → %s"),
 		EchoId, Controller ? *Controller->GetName() : TEXT("null"));
 }
@@ -668,10 +686,17 @@ void UATR_EchoSubsystem::UnregisterActiveEcho(int32 EchoId)
 	FATR_EchoRuntimeState* State = GetMutableEchoState(EchoId);
 	if (!State) return; // already gone (e.g. echo destroyed) — nothing to sever
 
-	// Keep canonical awareness/intent/search; only drop the active bridge + tier.
+	// Keep canonical awareness/intent/search (MEMORY survives demotion); only drop the active
+	// bridge + tier and the live-only facts that can't hold without an active perception/path:
+	//   - no live line of sight while dormant (but LastSeenLocation/Confidence are kept),
+	//   - no in-flight move (the path-following component was torn down on unpossess).
 	State->Tier            = EATR_EchoSimulationTier::LowDetail;
 	State->ActiveController = nullptr;
 	State->ActivePawn       = nullptr;
+
+	State->Awareness.bHasCurrentLineOfSight = false;
+	State->Awareness.ConfirmedVisibleActor  = nullptr;
+	State->Movement.bMoveInProgress          = false;
 
 	UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("UnregisterActiveEcho — EchoId %d"), EchoId);
 }
