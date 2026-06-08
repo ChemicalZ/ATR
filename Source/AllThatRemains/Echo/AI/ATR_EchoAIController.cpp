@@ -30,7 +30,7 @@ AATR_EchoAIController::AATR_EchoAIController()
 	AIPerception->SetDominantSense(SightConfig->GetSenseImplementation());
 
 	UAISenseConfig_Hearing* HearingConfig = CreateDefaultSubobject<UAISenseConfig_Hearing>(TEXT("HearingConfig"));
-	HearingConfig->HearingRange                              = 3000.f;
+	HearingConfig->HearingRange                              = HearingRange;
 	HearingConfig->DetectionByAffiliation.bDetectEnemies    = true;
 	HearingConfig->DetectionByAffiliation.bDetectNeutrals   = true;
 	HearingConfig->DetectionByAffiliation.bDetectFriendlies = false;
@@ -173,8 +173,23 @@ void AATR_EchoAIController::ReportPerceptionFacts(const TArray<AActor*>& Updated
 			}
 			else if (Stim.Type == HearingID && Stim.WasSuccessfullySensed())
 			{
-				// Location-only — never report the noise's source actor as a target.
-				CachedSubsystem->ReportEchoHeardLocation(CachedEchoId, Stim.StimulusLocation, Stim.Strength, Now);
+				// Location-only. Model the noise as a Noise stimulus event with distance
+				// falloff applied; the source actor is carried ONLY as debug metadata and is
+				// never consumed as behavioral target knowledge.
+				const FVector PawnLoc = MyPawn ? MyPawn->GetActorLocation() : Stim.StimulusLocation;
+				const float   Dist    = FVector::Dist(PawnLoc, Stim.StimulusLocation);
+				const float   Falloff = FMath::Clamp(1.f - Dist / FMath::Max(HearingRange, 1.f), 0.f, 1.f);
+
+				FATR_StimulusEvent Noise;
+				Noise.Type                 = EATR_StimulusType::Noise;
+				Noise.Location             = Stim.StimulusLocation;
+				Noise.Direction            = (Stim.StimulusLocation - PawnLoc).GetSafeNormal();
+				Noise.Strength             = Stim.Strength * Falloff;
+				Noise.Radius               = 0.f;
+				Noise.TimeSeconds          = Now;
+				Noise.SourceActor_DebugOnly = Actor; // metadata only — not a target
+
+				CachedSubsystem->ReportEchoStimulus(CachedEchoId, Noise);
 			}
 		}
 	}
@@ -291,7 +306,9 @@ AActor* AATR_EchoAIController::SelectBestTarget() const
 	if (!MyPawn) return nullptr;
 
 
-	// Only evaluate sight — hearing is used for alerting, not targeting.
+	// Only evaluate sight. Hearing never targets an actor — it is reported to the subsystem
+	// as a location-only Noise stimulus (see ReportPerceptionFacts) and drives investigation
+	// through canonical intent, not local target scoring.
 	TArray<AActor*> KnownActors;
 	AIPerception->GetKnownPerceivedActors(UAISense_Sight::StaticClass(), KnownActors);
 	if (KnownActors.IsEmpty()) return nullptr;

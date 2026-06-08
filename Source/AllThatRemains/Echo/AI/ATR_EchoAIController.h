@@ -52,6 +52,12 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Echo|AI", meta = (ClampMin = 1.f))
 	float LoyaltyBonusMultiplier = 1.2f;
 
+	// Hearing range (cm). Single source of truth for both the hearing sense config and the
+	// distance-falloff applied when a heard noise is reported as a stimulus. Keep in sync
+	// with the sight/hearing tuning pass.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Echo|AI", meta = (ClampMin = 1.f, ForceUnits = "cm"))
+	float HearingRange = 3000.f;
+
 	// Returns the current best target selected by perception scoring. Used by StateTree evaluators.
 	// TRANSITIONAL (Phases 2–4): superseded by subsystem intent; removed in final cleanup.
 	AActor* GetCurrentTarget() const { return CurrentTarget.Get(); }

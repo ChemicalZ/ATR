@@ -742,7 +742,12 @@ void UATR_EchoSubsystem::ReportEchoHeardLocation(int32 EchoId, const FVector& Lo
 		A.Mode = EATR_AwarenessMode::HeardLocation;
 	}
 
-	A.Urgency = FMath::Max(A.Urgency, FMath::Clamp(Strength, 0.f, 1.f));
+	const float Loud = FMath::Clamp(Strength, 0.f, 1.f);
+	A.Urgency = FMath::Max(A.Urgency, Loud);
+
+	// Mild agitation contribution — even weak noise nudges horde pressure (Phase 8). Strong
+	// noise raises urgency enough to investigate; weak noise mostly just agitates/orients.
+	State->Agitation = FMath::Min(1.f, State->Agitation + Loud * 0.25f);
 
 	State->LastUpdateTime = TimeSeconds;
 }
