@@ -213,6 +213,16 @@ struct FATR_EchoMovementIntent
 	float LastResultTime   = -1.f;
 };
 
+// One cell of the indirect horde-agitation field. Agitation spreads as a scalar pressure
+// plus a weighted direction — Echoes sample it to become curious / investigate / join a
+// horde WITHOUT ever receiving another Echo's exact target actor.
+struct FATR_AgitationCell
+{
+	float   Agitation         = 0.f;
+	FVector WeightedDirection  = FVector::ZeroVector; // accumulated direction*amount; normalize on read
+	float   LastUpdatedTime    = -1.f;
+};
+
 // Obstacle hook record. Breaking is deferred, but the classified failure + location
 // are recorded now so HandleObstacle has something to act on.
 struct FATR_EchoObstacleIntent

@@ -454,6 +454,37 @@ public:
 	// decays, and writes State.Intent + State.Movement.Request. Pure function of state.
 	void UpdateEchoIntent(int32 Index, float Now, float DeltaTime);
 
+	// --- Horde agitation field (Phase 8) ---
+	// Indirect, hive-mind-free horde model. Sources (noise, combat, a seeing Echo) deposit a
+	// scalar + weighted direction into a coarse cell; the field decays each tick; Echoes sample
+	// their neighborhood to gain curiosity/pressure — never another Echo's exact target.
+	//
+	// Keyed by quantized (x,y) cell so it needs no world-size precomputation. Only agitated
+	// cells consume memory; cells are pruned once they decay to nothing.
+	TMap<FIntPoint, FATR_AgitationCell> AgitationField;
+
+	float AgitationCellSize        = 2000.f; // cm per agitation cell
+	float AgitationFieldDecayPerSec = 0.25f; // how fast deposited pressure fades
+	float HordeCuriosityThreshold   = 0.20f; // >= → TurnTowardStimulus (curious)
+
+	// Deposit agitation at a world location with an optional pressure direction. Public so
+	// gameplay (gunshots, sprint noise, combat, scripted events) can drive the horde field.
+	void AddWorldAgitation(const FVector& Location, float Amount, const FVector& Direction);
+
+	// Decay + prune the agitation field. Runs once per server tick.
+	void DecayAgitationField(float DeltaTime);
+
+	// Sample the 3x3 neighborhood around a world location. Returns the blended agitation and
+	// a normalized pressure direction (zero if no meaningful pressure). Pure read.
+	void SampleAgitationField(const FVector& Location, float& OutAgitation, FVector& OutDirection) const;
+
+	FORCEINLINE FIntPoint AgitationCellKey(const FVector& Location) const
+	{
+		return FIntPoint(
+			FMath::FloorToInt(static_cast<float>(Location.X) / AgitationCellSize),
+			FMath::FloorToInt(static_cast<float>(Location.Y) / AgitationCellSize));
+	}
+
 	// Intent tuning (defaults here; migrate to UATR_EchoSettings when values stabilise).
 	float ConfidenceDecayPerSec        = 0.15f; // sight memory fade rate when not looking
 	float UrgencyDecayPerSec           = 0.20f; // pursuit aggression fade rate

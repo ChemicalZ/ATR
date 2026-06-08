@@ -304,6 +304,7 @@ void UATR_EchoSubsystem::Tick(float DeltaTime)
 		RebuildFineGrid();
 		RunSteeringPass();
 		RunPromotionPass();
+		DecayAgitationField(DeltaTime);
 		RunIntentPass(DeltaTime);
 	}
 
@@ -694,6 +695,11 @@ void UATR_EchoSubsystem::ReportEchoSawActor(int32 EchoId, AActor* Actor, const F
 	A.Confidence            = 1.f;            // fresh sight = full confidence
 	A.Urgency               = FMath::Max(A.Urgency, 1.f);
 
+	// Indirect spread: a seeing Echo agitates its neighborhood and biases pressure toward the
+	// action — but deposits only a scalar + direction, never the target actor. Neighbors get
+	// curious/pulled; distant edge Echoes get nothing and can peel away.
+	AddWorldAgitation(State->Location, 0.6f, (Location - State->Location));
+
 	State->LastUpdateTime = TimeSeconds;
 }
 
@@ -769,6 +775,8 @@ void UATR_EchoSubsystem::ReportEchoStimulus(int32 EchoId, const FATR_StimulusEve
 		case EATR_StimulusType::Combat:
 		case EATR_StimulusType::Scripted:
 			ReportEchoHeardLocation(EchoId, Event.Location, Event.Strength, Event.TimeSeconds);
+			// Loud world events also deposit directional horde pressure at their source.
+			AddWorldAgitation(Event.Location, Event.Strength, Event.Direction);
 			break;
 
 		case EATR_StimulusType::Smell:
@@ -828,6 +836,64 @@ void UATR_EchoSubsystem::ReportEchoMoveResult(int32 EchoId, bool bSuccess, EATR_
 
 	UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("MoveResult EchoId %d: %s (reason %d)"),
 		EchoId, bSuccess ? TEXT("success") : TEXT("FAIL"), static_cast<int32>(Reason));
+}
+
+// ─── Horde Agitation Field (Phase 8) ─────────────────────────────────────────
+
+void UATR_EchoSubsystem::AddWorldAgitation(const FVector& Location, float Amount, const FVector& Direction)
+{
+	if (Amount <= 0.f) return;
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_AddWorldAgitation);
+
+	const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+
+	FATR_AgitationCell& Cell = AgitationField.FindOrAdd(AgitationCellKey(Location));
+	Cell.Agitation        = FMath::Min(1.f, Cell.Agitation + Amount);
+	Cell.WeightedDirection += Direction.GetSafeNormal2D() * Amount; // accumulate; normalized on read
+	Cell.LastUpdatedTime   = Now;
+}
+
+void UATR_EchoSubsystem::DecayAgitationField(float DeltaTime)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_DecayAgitationField);
+
+	const float Decay = AgitationFieldDecayPerSec * DeltaTime;
+
+	for (auto It = AgitationField.CreateIterator(); It; ++It)
+	{
+		FATR_AgitationCell& Cell = It.Value();
+		Cell.Agitation        = FMath::Max(0.f, Cell.Agitation - Decay);
+		Cell.WeightedDirection *= FMath::Max(0.f, 1.f - Decay); // direction fades with pressure
+
+		if (Cell.Agitation <= KINDA_SMALL_NUMBER)
+			It.RemoveCurrent(); // prune dead cells so the map stays proportional to active hotspots
+	}
+}
+
+void UATR_EchoSubsystem::SampleAgitationField(const FVector& Location, float& OutAgitation, FVector& OutDirection) const
+{
+	OutAgitation = 0.f;
+	OutDirection = FVector::ZeroVector;
+
+	if (AgitationField.IsEmpty()) return;
+
+	// Blend the 3x3 neighborhood so pressure spreads smoothly across cell borders. The center
+	// cell dominates; neighbors contribute toward the edge so groups drift toward hotspots.
+	const FIntPoint Center = AgitationCellKey(Location);
+	FVector AccumDir = FVector::ZeroVector;
+
+	for (int32 dy = -1; dy <= 1; ++dy)
+	for (int32 dx = -1; dx <= 1; ++dx)
+	{
+		const FATR_AgitationCell* Cell = AgitationField.Find(FIntPoint(Center.X + dx, Center.Y + dy));
+		if (!Cell || Cell->Agitation <= 0.f) continue;
+
+		const float Weight = (dx == 0 && dy == 0) ? 1.f : 0.5f;
+		OutAgitation = FMath::Max(OutAgitation, Cell->Agitation * Weight);
+		AccumDir    += Cell->WeightedDirection * Weight;
+	}
+
+	OutDirection = AccumDir.GetSafeNormal2D();
 }
 
 // ─── Intent Selection (Phase 3) + Lost-Sight Search (Phase 6) ────────────────
@@ -993,6 +1059,15 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 	A.Urgency       = FMath::Max(0.f, A.Urgency       - UrgencyDecayPerSec   * DeltaTime);
 	State.Agitation = FMath::Max(0.f, State.Agitation - AgitationDecayPerSec * DeltaTime);
 
+	// Sample the indirect horde-agitation field around this Echo. The effective agitation is
+	// the stronger of its own (direct stimulus) and the surrounding field; the pressure
+	// direction comes from the field only. This is the only horde coupling — no shared target.
+	float   FieldAgitation = 0.f;
+	FVector FieldDirection  = FVector::ZeroVector;
+	SampleAgitationField(State.Location, FieldAgitation, FieldDirection);
+	const float EffectiveAgitation = FMath::Max(State.Agitation, FieldAgitation);
+	A.HordePressureDirection = FieldDirection;
+
 	const EATR_EchoIntent OldIntent = State.Intent;
 	EATR_EchoIntent      NewIntent = EATR_EchoIntent::Idle;
 	FATR_EchoMoveRequest Move; // defaults to Type=None — no accidental origin move
@@ -1036,17 +1111,26 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 			NewIntent = EATR_EchoIntent::TurnTowardStimulus; // weak — orient only, no path move
 		}
 	}
-	else if (State.Agitation >= AgitationJoinThreshold && !A.HordePressureDirection.IsNearlyZero())
+	else if (EffectiveAgitation >= AgitationJoinThreshold && !A.HordePressureDirection.IsNearlyZero())
 	{
-		// Pulled by indirect horde pressure (direction-only). Concrete fields land in Phase 8.
+		// Strong indirect pressure with a clear direction → migrate toward the hotspot.
+		// Direction-only: this Echo never learns the seer's actual target.
 		NewIntent           = EATR_EchoIntent::JoinHordePressure;
 		Move.Type           = EATR_EchoMoveTargetType::Location;
-		Move.Location       = State.Location + A.HordePressureDirection.GetSafeNormal2D() * S.SearchRadius;
+		Move.Location       = State.Location + A.HordePressureDirection * 800.f;
 		Move.AcceptanceRadius = ReachLocationRadius;
+		A.Mode              = EATR_AwarenessMode::HordeAgitated;
 	}
-	else if (State.Agitation >= AgitationJoinThreshold)
+	else if (EffectiveAgitation >= AgitationJoinThreshold)
 	{
-		NewIntent = EATR_EchoIntent::TurnTowardStimulus; // agitated but no direction yet
+		NewIntent = EATR_EchoIntent::TurnTowardStimulus; // agitated but no clear direction
+		A.Mode    = EATR_AwarenessMode::HordeAgitated;
+	}
+	else if (EffectiveAgitation >= HordeCuriosityThreshold)
+	{
+		// Mild pressure → curious. Orient toward the hotspot but don't commit to migrating.
+		NewIntent = EATR_EchoIntent::TurnTowardStimulus;
+		A.Mode    = EATR_AwarenessMode::HordeAgitated;
 	}
 	else
 	{
