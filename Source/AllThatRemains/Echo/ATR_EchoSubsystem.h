@@ -301,6 +301,13 @@ public:
 	void ReportEchoHeardLocation(int32 EchoId, const FVector& Location, float Strength, float TimeSeconds);
 	void ReportEchoStimulus(int32 EchoId, const FATR_StimulusEvent& Event);
 
+	// --- Movement result reporting (Phase 5) ---
+	// The active controller reports classified movement outcomes here. Records the result on
+	// the Echo's movement intent and, for blocked/unreachable failures, seeds the obstacle
+	// hook (fully consumed in Phase 9). Never paths anywhere itself.
+	void ReportEchoMoveResult(int32 EchoId, bool bSuccess, EATR_MoveFailureReason Reason,
+	                          const FVector& Location, AActor* BlockingActor, float TimeSeconds);
+
 	// --- Public API ---
 
 	int32 AddEcho(FVector3f Position);

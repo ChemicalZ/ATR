@@ -781,6 +781,50 @@ void UATR_EchoSubsystem::ReportEchoStimulus(int32 EchoId, const FATR_StimulusEve
 	State->LastUpdateTime = Event.TimeSeconds;
 }
 
+void UATR_EchoSubsystem::ReportEchoMoveResult(int32 EchoId, bool bSuccess, EATR_MoveFailureReason Reason,
+                                              const FVector& Location, AActor* BlockingActor, float TimeSeconds)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_ReportMoveResult);
+
+	FATR_EchoRuntimeState* State = GetMutableEchoState(EchoId);
+	if (!State) return;
+
+	FATR_EchoMovementIntent& M = State->Movement;
+	M.bMoveInProgress    = false;
+	M.bLastMoveSucceeded = bSuccess;
+	M.LastFailure        = bSuccess ? EATR_MoveFailureReason::None : Reason;
+	M.LastResultTime     = TimeSeconds;
+
+	// Seed the obstacle hook for blocked/unreachable failures so HandleObstacle (Phase 9)
+	// has a classified record to act on. Successful/aborted moves clear it.
+	FATR_EchoObstacleIntent& O = State->Obstacle;
+	const bool bIsObstacleFailure =
+		!bSuccess &&
+		(Reason == EATR_MoveFailureReason::BlockedByDynamicActor ||
+		 Reason == EATR_MoveFailureReason::BlockedByDoor   ||
+		 Reason == EATR_MoveFailureReason::BlockedByWindow ||
+		 Reason == EATR_MoveFailureReason::BlockedByFence  ||
+		 Reason == EATR_MoveFailureReason::TargetUnreachable);
+
+	if (bIsObstacleFailure)
+	{
+		O.bHasObstacle     = true;
+		O.Reason           = Reason;
+		O.ObstacleActor    = BlockingActor;
+		O.ObstacleLocation = Location;
+		O.LastObstacleTime = TimeSeconds;
+	}
+	else if (bSuccess)
+	{
+		O.bHasObstacle = false;
+	}
+
+	State->LastUpdateTime = TimeSeconds;
+
+	UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("MoveResult EchoId %d: %s (reason %d)"),
+		EchoId, bSuccess ? TEXT("success") : TEXT("FAIL"), static_cast<int32>(Reason));
+}
+
 // ─── Intent Selection (Phase 3) ──────────────────────────────────────────────
 
 void UATR_EchoSubsystem::RunIntentPass(float DeltaTime)

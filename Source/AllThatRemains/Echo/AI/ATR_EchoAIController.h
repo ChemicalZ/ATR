@@ -6,6 +6,7 @@
 #include "AIController.h"
 #include "Perception/AIPerceptionComponent.h"
 #include "Components/StateTreeComponent.h"
+#include "../ATR_EchoRuntimeTypes.h"
 #include "ATR_EchoAIController.generated.h"
 
 class UATR_EchoSubsystem;
@@ -58,6 +59,12 @@ public:
 	// Stable EchoId of the possessed Echo, resolved at OnPossess. INDEX_NONE when pooled.
 	int32 GetEchoId() const { return CachedEchoId; }
 
+	// Issue an explicit, typed move for the Echo move task. Rejects None/invalid requests
+	// (never moves to world origin). Returns the path-following request code so the task can
+	// branch on AlreadyAtGoal / Failed / Running. The classified completion result is
+	// reported to the subsystem via HandleMoveCompleted.
+	EPathFollowingRequestResult::Type IssueMoveRequest(const FATR_EchoMoveRequest& Request);
+
 	// --- Pool ---
 
 	// Stop all AI logic and clear state. Called after UnPossess when returning to pool.
@@ -89,6 +96,14 @@ private:
 	// Returns nullptr if nothing is perceived.
 	AActor* SelectBestTarget() const;
 
+	// Movement completion callback bound to ReceiveMoveCompleted. Classifies the result
+	// and reports it to the subsystem (success or a EATR_MoveFailureReason).
+	UFUNCTION()
+	void HandleMoveCompleted(FAIRequestID RequestID, EPathFollowingResult::Type Result);
+
+	// Forward a classified move result to the subsystem for the possessed Echo.
+	void ReportMoveResultToSubsystem(bool bSuccess, EATR_MoveFailureReason Reason, float TimeSeconds, AActor* BlockingActor);
+
 	// Resolved once at OnPossess from the possessed AATR_ActiveEcho's SoA row.
 	// Stable for the Echo's lifetime (EchoId never changes; SoA index can).
 	int32 CachedEchoId = INDEX_NONE;
@@ -96,6 +111,9 @@ private:
 	// World subsystem cache — world subsystems outlive controllers, so a raw observer
 	// pointer is safe. Cleared on unpossess/pool to avoid use across worlds.
 	UATR_EchoSubsystem* CachedSubsystem = nullptr;
+
+	// Id of the most recently submitted move; used to ignore stale completion callbacks.
+	FAIRequestID ActiveMoveRequestId;
 
 	// Last selected target. Weak so destroyed actors clear automatically.
 	// TRANSITIONAL (Phase 1): this is controller-owned canonical target state. It will be

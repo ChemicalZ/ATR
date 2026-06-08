@@ -8,6 +8,7 @@
 #include "Perception/AISenseConfig_Hearing.h"
 #include "Perception/AISense_Sight.h"
 #include "Perception/AISense_Hearing.h"
+#include "Navigation/PathFollowingComponent.h"
 
 DEFINE_LOG_CATEGORY(LogATR_EchoAI);
 
@@ -64,6 +65,9 @@ void AATR_EchoAIController::OnPossess(APawn* InPawn)
 		AIPerception->OnPerceptionUpdated.AddUniqueDynamic(this, &AATR_EchoAIController::HandlePerceptionUpdated);
 	}
 
+	// Classified move results flow back to the subsystem through this callback.
+	ReceiveMoveCompleted.AddUniqueDynamic(this, &AATR_EchoAIController::HandleMoveCompleted);
+
 	if (StateTreeComp) StateTreeComp->StartLogic();
 
 	UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("OnPossess — %s possessed %s (EchoId %d)"),
@@ -85,6 +89,8 @@ void AATR_EchoAIController::OnUnPossess()
 		AIPerception->SetComponentTickEnabled(false);
 	}
 
+	ReceiveMoveCompleted.RemoveDynamic(this, &AATR_EchoAIController::HandleMoveCompleted);
+	ActiveMoveRequestId = FAIRequestID::InvalidRequest;
 	CachedEchoId    = INDEX_NONE;
 	CachedSubsystem = nullptr;
 
@@ -108,6 +114,8 @@ void AATR_EchoAIController::EnterPool()
 		AIPerception->SetComponentTickEnabled(false);
 	}
 
+	ReceiveMoveCompleted.RemoveDynamic(this, &AATR_EchoAIController::HandleMoveCompleted);
+	ActiveMoveRequestId = FAIRequestID::InvalidRequest;
 	CachedEchoId    = INDEX_NONE;
 	CachedSubsystem = nullptr;
 }
@@ -181,6 +189,96 @@ void AATR_EchoAIController::SetSensesEnabled(bool bEnabled)
 
 	if (!bEnabled)
 		AIPerception->ForgetAll(); // drop stale stimuli so a recycled controller starts clean
+}
+
+// ─── Movement Execution (Phase 5) ───────────────────────────────────────────────
+
+EPathFollowingRequestResult::Type AATR_EchoAIController::IssueMoveRequest(const FATR_EchoMoveRequest& Request)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_IssueMoveRequest);
+
+	const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+
+	// Build an explicit, typed move request. None/invalid is rejected up front so movement
+	// can never silently fall back to FVector::ZeroVector.
+	FAIMoveRequest MoveReq;
+	MoveReq.SetAcceptanceRadius(Request.AcceptanceRadius);
+	MoveReq.SetUsePathfinding(true);
+	MoveReq.SetReachTestIncludesAgentRadius(true);
+
+	switch (Request.Type)
+	{
+		case EATR_EchoMoveTargetType::Actor:
+			if (!Request.Actor.IsValid())
+			{
+				ReportMoveResultToSubsystem(false, EATR_MoveFailureReason::InvalidTarget, Now, nullptr);
+				return EPathFollowingRequestResult::Failed;
+			}
+			MoveReq.SetGoalActor(Request.Actor.Get());
+			break;
+
+		case EATR_EchoMoveTargetType::Location:
+			MoveReq.SetGoalLocation(Request.Location);
+			break;
+
+		case EATR_EchoMoveTargetType::None:
+		default:
+			ReportMoveResultToSubsystem(false, EATR_MoveFailureReason::InvalidTarget, Now, nullptr);
+			return EPathFollowingRequestResult::Failed;
+	}
+
+	const FPathFollowingRequestResult Result = MoveTo(MoveReq);
+	ActiveMoveRequestId = Result.MoveId;
+
+	if (CachedSubsystem && CachedEchoId != INDEX_NONE)
+	{
+		if (FATR_EchoRuntimeState* State = CachedSubsystem->GetMutableEchoState(CachedEchoId))
+			State->Movement.bMoveInProgress = true;
+	}
+
+	// Immediate terminal codes are reported now; Running results are reported later via
+	// HandleMoveCompleted when path following finishes.
+	if (Result.Code == EPathFollowingRequestResult::AlreadyAtGoal)
+		ReportMoveResultToSubsystem(true, EATR_MoveFailureReason::None, Now, nullptr);
+	else if (Result.Code == EPathFollowingRequestResult::Failed)
+		ReportMoveResultToSubsystem(false, EATR_MoveFailureReason::NoPath, Now, nullptr);
+
+	return Result.Code;
+}
+
+void AATR_EchoAIController::HandleMoveCompleted(FAIRequestID RequestID, EPathFollowingResult::Type Result)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_HandleMoveCompleted);
+	if (!HasAuthority()) return;
+
+	// Ignore completions for superseded requests.
+	if (ActiveMoveRequestId.IsValid() && !RequestID.IsEquivalent(ActiveMoveRequestId)) return;
+
+	const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+
+	bool                   bSuccess = false;
+	EATR_MoveFailureReason Reason   = EATR_MoveFailureReason::None;
+
+	switch (Result)
+	{
+		case EPathFollowingResult::Success: bSuccess = true; break;
+		// Exact obstacle (door/window/fence) is refined in Phase 9; generic for now.
+		case EPathFollowingResult::Blocked: Reason = EATR_MoveFailureReason::BlockedByDynamicActor; break;
+		case EPathFollowingResult::OffPath: Reason = EATR_MoveFailureReason::TargetUnreachable;     break;
+		case EPathFollowingResult::Aborted: Reason = EATR_MoveFailureReason::AbortedByNewIntent;    break;
+		case EPathFollowingResult::Invalid: Reason = EATR_MoveFailureReason::InvalidTarget;         break;
+		default:                            Reason = EATR_MoveFailureReason::NoPath;                break;
+	}
+
+	ReportMoveResultToSubsystem(bSuccess, Reason, Now, nullptr);
+}
+
+void AATR_EchoAIController::ReportMoveResultToSubsystem(bool bSuccess, EATR_MoveFailureReason Reason, float TimeSeconds, AActor* BlockingActor)
+{
+	if (!CachedSubsystem || CachedEchoId == INDEX_NONE) return;
+
+	const FVector Loc = GetPawn() ? GetPawn()->GetActorLocation() : FVector::ZeroVector;
+	CachedSubsystem->ReportEchoMoveResult(CachedEchoId, bSuccess, Reason, Loc, BlockingActor, TimeSeconds);
 }
 
 AActor* AATR_EchoAIController::SelectBestTarget() const
