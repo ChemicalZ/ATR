@@ -8,7 +8,7 @@
 #include "ATR_EchoHandleObstacleTask.generated.h"
 
 // Instance data — bind MoveRequest/bHasValidMoveRequest from the intent evaluator. When the
-// subsystem chose HandleObstacle, MoveRequest is the placeholder sidestep around the obstacle.
+// subsystem chose HandleObstacle, MoveRequest is the sidestep/repath around the obstacle.
 USTRUCT(BlueprintType)
 struct FATR_EchoHandleObstacleTaskInstanceData
 {
@@ -19,13 +19,17 @@ struct FATR_EchoHandleObstacleTaskInstanceData
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Input")
 	bool bHasValidMoveRequest = false;
+
+	// Internal — serial of the sidestep/repath move issued in EnterState, polled in Tick.
+	UPROPERTY(Transient)
+	int32 WaitMoveSerial = 0;
 };
 
-// Placeholder obstacle-handling task (Phase 9). Logs the classified obstacle, executes the
-// subsystem's sidestep/repath fallback, and returns gracefully so the StateTree falls back to
-// search/idle if the obstacle is not resolved. This is the seam where real door/window/fence
-// breaking, group pounding, and obstacle audio/FX attach in a later pass — without reworking
-// the movement/intent architecture.
+// Obstacle-handling task. Logs the classified obstacle, executes the subsystem's sidestep/repath
+// fallback, and resolves from the classified move result so the StateTree falls back to search/idle
+// when the obstacle is not cleared. This is the seam where real door/window/fence breaking, group
+// pounding, and obstacle audio/FX attach via UATR_EchoObstacleBehaviorDataAsset in a later pass —
+// without reworking the movement/intent architecture.
 //
 // Context owner must be AATR_EchoAIController.
 USTRUCT(BlueprintType, meta = (DisplayName = "Echo Handle Obstacle"))

@@ -21,15 +21,17 @@ struct FATR_EchoMoveRequestTaskInstanceData
 	// Gate flag — false for orient-only / idle intents that must not path-move.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Input")
 	bool bHasValidMoveRequest = false;
+
+	// Internal — serial of the move issued in EnterState, polled in Tick. Not designer-bound.
+	UPROPERTY(Transient)
+	int32 WaitMoveSerial = 0;
 };
 
 // StateTree task that executes a typed FATR_EchoMoveRequest through the Echo controller.
-//
-// Replaces FATR_EchoMoveToTask. Differences:
-//   - Move target is explicit (Actor vs Location) — never the old "null actor → ZeroVector".
-//   - None / invalid requests are rejected instead of silently moving to world origin.
-//   - The controller tracks the FAIRequestID and reports a classified success/failure to
-//     the subsystem; this task only drives StateTree flow (Running until path following ends).
+//   - Move target is explicit (Actor vs Location) — never an implicit "null actor → ZeroVector".
+//   - None / invalid requests are rejected instead of moving to world origin.
+//   - The controller tracks the request serial and reports a classified success/failure to the
+//     subsystem; this task resolves from that result, not from path-following going Idle.
 //
 // Context owner must be AATR_EchoAIController. Set Context Actor = AIController in the asset.
 USTRUCT(BlueprintType, meta = (DisplayName = "Echo Move Request"))

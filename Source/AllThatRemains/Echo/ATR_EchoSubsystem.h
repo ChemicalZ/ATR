@@ -12,6 +12,9 @@ class UATR_EchoReplicationComponent;
 class AATR_EchoManager;
 class AATR_ActiveEcho;
 class AATR_EchoAIController;
+class UATR_EchoSettings;
+class UATR_EchoSearchPatternDataAsset;
+class UATR_EchoObstacleBehaviorDataAsset;
 
 UENUM()
 enum class EEchoDirtyFlags : uint8
@@ -249,7 +252,7 @@ public:
 	TArray<FEchoDirtyState> DirtyStates;
 	int32             ActiveEntities = 0;
 
-	// --- Canonical runtime state (Phase 1) ---
+	// --- Canonical runtime state ---
 	// Stable identity layer. The SoA index is NOT stable (RemoveEcho swap-removes and
 	// relabels rows), so canonical intelligence is keyed by a monotonic EchoId instead.
 	//
@@ -287,24 +290,38 @@ public:
 	}
 
 	// Active-layer registration. Called on promotion/demotion to wire (or sever) the
-	// controller/pawn bridge and flip the simulation tier. Does not change behavior in
-	// Phase 1 — it only records the bridge and tier.
+	// controller/pawn bridge and flip the simulation tier.
 	void RegisterActiveEcho(int32 EchoId, AATR_EchoAIController* Controller, APawn* Pawn);
 	void UnregisterActiveEcho(int32 EchoId);
 
-	// --- Perception fact reporting (Phase 2) ---
+	// --- Perception fact reporting ---
 	// The active AIController calls these to feed canonical awareness. They only WRITE
-	// awareness state; intent selection that consumes it lands in Phase 3. Hearing is
-	// strictly location-only — it never records an actor as a behavioral target.
-	void ReportEchoSawActor(int32 EchoId, AActor* Actor, const FVector& Location, const FVector& Velocity, float TimeSeconds);
-	void ReportEchoLostSight(int32 EchoId, AActor* Actor, const FVector& LastKnownLocation, const FVector& LastKnownVelocity, float TimeSeconds);
+	// awareness state; intent selection consumes it in RunIntentPass. Hearing is strictly
+	// location-only — it never records an actor as a behavioral target.
+	//
+	// No-cheat boundary: ReportEchoSawActor receives a location/velocity that were sampled
+	// while the target was ACTUALLY visible (the controller derives velocity from a visible
+	// position delta). ReportEchoLostSight deliberately takes NO location/velocity — on sight
+	// loss the subsystem keeps the previously observed LastSeen* and must never sample the
+	// actor's current state.
+	void ReportEchoSawActor(int32 EchoId, AActor* Actor, const FVector& Location, const FVector& ObservedVelocity, float TimeSeconds);
+	void ReportEchoLostSight(int32 EchoId, AActor* Actor, float TimeSeconds);
 	void ReportEchoHeardLocation(int32 EchoId, const FVector& Location, float Strength, float TimeSeconds);
 	void ReportEchoStimulus(int32 EchoId, const FATR_StimulusEvent& Event);
 
-	// --- Movement result reporting (Phase 5) ---
+	// --- World-level stimulus API ---
+	// Gameplay-facing entry point for world events (gunshot, footstep, door slam, scream, blood,
+	// corpse smell, etc.). Validates/clamps the event, applies radius falloff, deposits agitation,
+	// fans location-only awareness to nearby active AND low-detail Echoes, feeds Abstract cell
+	// pressure, and raises promotion priority for strongly affected Echoes by boosting their
+	// urgency/agitation. It NEVER grants actor-target knowledge — only location/field data.
+	UFUNCTION(BlueprintCallable, Category = "Echo|Stimulus")
+	void EmitWorldStimulus(const FATR_StimulusEvent& Event);
+
+	// --- Movement result reporting ---
 	// The active controller reports classified movement outcomes here. Records the result on
 	// the Echo's movement intent and, for blocked/unreachable failures, seeds the obstacle
-	// hook (fully consumed in Phase 9). Never paths anywhere itself.
+	// hook (consumed by obstacle handling). Never paths anywhere itself.
 	void ReportEchoMoveResult(int32 EchoId, bool bSuccess, EATR_MoveFailureReason Reason,
 	                          const FVector& Location, AActor* BlockingActor, float TimeSeconds);
 
@@ -443,18 +460,51 @@ public:
 	void RunSteeringPass();
 	void RunPromotionPass();
 
-	// --- Intent selection (Phase 3) ---
+	// --- Intent selection ---
 	// Chooses each relevant Echo's high-level EATR_EchoIntent + move request from its
 	// canonical awareness, and decays confidence/urgency/agitation. Runs server-side on
-	// the render tick over active (promoted) echoes; lower-tier echoes are folded in by
-	// Phase 11. The active StateTree consumes the result via the Phase 4 intent evaluator.
+	// the render tick over active (promoted) echoes; lower-tier echoes are driven by the
+	// LowDetail/Abstract passes. The active StateTree consumes the result via the intent evaluator.
 	void RunIntentPass(float DeltaTime);
 
 	// Per-Echo intent state machine. Refreshes live transform from the SoA, applies
 	// decays, and writes State.Intent + State.Movement.Request. Pure function of state.
 	void UpdateEchoIntent(int32 Index, float Now, float DeltaTime);
 
-	// --- Horde agitation field (Phase 8) ---
+	// --- Lower-tier simulation ---
+	// LowDetail: budgeted individual simulation for non-active Echoes near players. Each updated
+	// Echo decays awareness, samples stimuli/agitation, picks an intent from the same enum, and
+	// produces a low-detail velocity (never an active MoveTo). Runs at LowDetailUpdateHz with a
+	// per-tick cap; a round-robin cursor spreads the population across ticks.
+	void RunLowDetailPass(float DeltaTime);
+	void UpdateLowDetailEcho(int32 Index, float Now, float DeltaTime);
+
+	// Abstract: cell-level simulation for the far population. Aggregates population/agitation/
+	// memory per coarse cell and migrates a fraction of each cell toward neighboring pressure so a
+	// distant horde still drifts toward sustained activity. No per-frame pathing. Runs at
+	// AbstractUpdateHz. Cell pressure can seed LowDetail behavior when relevancy enters the area.
+	void RunAbstractPass(float DeltaTime);
+	void DecayAbstractCells(float DeltaTime);
+
+	// Coarse cell key for the Abstract tier (keyed off the coarse grid cell size).
+	FORCEINLINE FIntPoint AbstractCellKey(const FVector& Location) const
+	{
+		const float CS = FMath::Max(1.f, CoarseGridCellSize);
+		return FIntPoint(
+			FMath::FloorToInt(static_cast<float>(Location.X) / CS),
+			FMath::FloorToInt(static_cast<float>(Location.Y) / CS));
+	}
+
+	// Abstract tier population/pressure state. Only occupied/agitated cells consume memory.
+	TMap<FIntPoint, FATR_AbstractCell> AbstractCells;
+
+	// Lower-tier pass scheduling. Accumulators fire the passes at their configured Hz; the cursor
+	// round-robins LowDetail updates so each Echo is serviced within its budget over several ticks.
+	float LowDetailAccumulator = 0.f;
+	float AbstractAccumulator  = 0.f;
+	int32 LowDetailCursor      = 0;
+
+	// --- Horde agitation field ---
 	// Indirect, hive-mind-free horde model. Sources (noise, combat, a seeing Echo) deposit a
 	// scalar + weighted direction into a coarse cell; the field decays each tick; Echoes sample
 	// their neighborhood to gain curiosity/pressure — never another Echo's exact target.
@@ -485,10 +535,20 @@ public:
 			FMath::FloorToInt(static_cast<float>(Location.Y) / AgitationCellSize));
 	}
 
-	// Intent tuning (defaults here; migrate to UATR_EchoSettings when values stabilise).
+	// Cached settings CDO (program-lifetime object). Behavior code reads tuning from here so
+	// nothing behavior-critical is hardcoded; set once in Initialize. The members below mirror
+	// the hottest values to keep existing intent/agitation use sites unchanged.
+	const UATR_EchoSettings* CachedSettings = nullptr;
+
+	// Default behavior DataAssets resolved once at OnWorldBeginPlay (soft refs in settings).
+	// Null = use built-in defaults (standard search fan / sidestep-repath obstacle handling).
+	const UATR_EchoSearchPatternDataAsset*    ResolvedDefaultSearchPattern    = nullptr;
+	const UATR_EchoObstacleBehaviorDataAsset* ResolvedDefaultObstacleBehavior = nullptr;
+
+	// Intent tuning — mirrored from UATR_EchoSettings in Initialize (see Echo|Awareness/Sight/Search).
 	float ConfidenceDecayPerSec        = 0.15f; // sight memory fade rate when not looking
 	float UrgencyDecayPerSec           = 0.20f; // pursuit aggression fade rate
-	float AgitationDecayPerSec         = 0.10f; // horde-pressure fade rate
+	float AgitationDecayPerSec         = 0.10f; // personal agitation fade rate
 	float LostSightMemoryThreshold     = 0.05f; // confidence below this → forget & idle
 	float HeardInvestigateUrgency      = 0.40f; // >= → InvestigateLocation, else TurnTowardStimulus
 	float HeardMemorySeconds           = 8.0f;  // how long a heard location stays actionable
@@ -532,4 +592,13 @@ private:
 	void UnregisterEntityFromCoarseGrid(int32 EntityIndex);
 	void MoveEntityCoarseCell(int32 EntityIndex, int32 NewCellId);
 	bool ShouldProcessEchoForLocalHorde(int32 Index) const;
+
+	// Score-based promotion priority for an Echo relative to a player. Higher = more deserving of a
+	// full-actor slot. Combines distance, the must-promote bonus, awareness urgency/confidence,
+	// agitation, player-facing relevance, and a decaying recently-demoted penalty — all from settings.
+	float ComputePromotionScore(int32 Index, const FVector3f& PlayerPos, const FVector3f& PlayerForward, float Now) const;
+
+	// True if a promoted Echo must be kept active (engaged) and should not be demoted. Reads the
+	// Echo|Demotion guards from settings (visible chase, fresh search, fresh obstacle, thresholds).
+	bool IsDemotionBlocked(int32 Index, float Now) const;
 };

@@ -3,6 +3,7 @@
 #include "ATR_EchoAIController.h"
 #include "ATR_EchoAILog.h"
 #include "../ATR_EchoSubsystem.h"
+#include "../ATR_EchoSettings.h"
 #include "../ATR_ActiveEcho.h"
 #include "Perception/AISenseConfig_Sight.h"
 #include "Perception/AISenseConfig_Hearing.h"
@@ -16,13 +17,19 @@ DEFINE_LOG_CATEGORY(LogATR_EchoAI);
 
 AATR_EchoAIController::AATR_EchoAIController()
 {
+	// Perception tuning comes from Project Settings (Echo|Sight, Echo|Hearing) — no hardcoded
+	// behavior numbers. The settings CDO is available during CDO construction.
+	const UATR_EchoSettings* Settings = GetDefault<UATR_EchoSettings>();
+	HearingRange         = Settings ? Settings->ActiveHearingRange        : HearingRange;
+	ObstacleTraceDistance = Settings ? Settings->ObstacleForwardTraceLength : ObstacleTraceDistance;
+
 	AIPerception = CreateDefaultSubobject<UAIPerceptionComponent>(TEXT("AIPerception"));
 
 	UAISenseConfig_Sight* SightConfig = CreateDefaultSubobject<UAISenseConfig_Sight>(TEXT("SightConfig"));
-	SightConfig->SightRadius                              = 2000.f;
-	SightConfig->LoseSightRadius                         = 2500.f;
-	SightConfig->PeripheralVisionAngleDegrees             = 90.f;
-	SightConfig->SetMaxAge(5.f);
+	SightConfig->SightRadius                              = Settings ? Settings->ActiveSightRadius : 2000.f;
+	SightConfig->LoseSightRadius                          = Settings ? Settings->ActiveLoseSightRadius : 2500.f;
+	SightConfig->PeripheralVisionAngleDegrees             = Settings ? Settings->ActivePeripheralVisionAngleDegrees : 90.f;
+	SightConfig->SetMaxAge(Settings ? Settings->ActiveSightMaxAgeSeconds : 5.f);
 	SightConfig->DetectionByAffiliation.bDetectEnemies    = true;
 	SightConfig->DetectionByAffiliation.bDetectNeutrals   = true;
 	SightConfig->DetectionByAffiliation.bDetectFriendlies = false;
@@ -30,7 +37,8 @@ AATR_EchoAIController::AATR_EchoAIController()
 	AIPerception->SetDominantSense(SightConfig->GetSenseImplementation());
 
 	UAISenseConfig_Hearing* HearingConfig = CreateDefaultSubobject<UAISenseConfig_Hearing>(TEXT("HearingConfig"));
-	HearingConfig->HearingRange                              = HearingRange;
+	HearingConfig->HearingRange                             = HearingRange;
+	HearingConfig->SetMaxAge(Settings ? Settings->ActiveHearingMaxAgeSeconds : 5.f);
 	HearingConfig->DetectionByAffiliation.bDetectEnemies    = true;
 	HearingConfig->DetectionByAffiliation.bDetectNeutrals   = true;
 	HearingConfig->DetectionByAffiliation.bDetectFriendlies = false;
@@ -78,7 +86,8 @@ void AATR_EchoAIController::OnUnPossess()
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_OnUnPossess);
 	StopMovement(); // must be before Super — Super clears the pawn reference
-	CurrentTarget.Reset();
+	PrevVisibleActor.Reset();
+	PrevVisibleTime = -1.f;
 
 	if (StateTreeComp) StateTreeComp->StopLogic(TEXT("Pooled"));
 
@@ -103,7 +112,8 @@ void AATR_EchoAIController::EnterPool()
 
 	// Safety net — normally OnUnPossess already cleaned up.
 	// RemoveDynamic on an unbound delegate is a no-op.
-	CurrentTarget.Reset();
+	PrevVisibleActor.Reset();
+	PrevVisibleTime = -1.f;
 
 	if (StateTreeComp) StateTreeComp->StopLogic(TEXT("Pooled"));
 
@@ -127,13 +137,9 @@ void AATR_EchoAIController::HandlePerceptionUpdated(const TArray<AActor*>& Updat
 	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_HandlePerceptionUpdated);
 	if (!HasAuthority()) return;
 
-	// Phase 2: perception now FEEDS the subsystem's canonical awareness instead of being
-	// the sole owner of "what this Echo knows". The legacy CurrentTarget update below is
-	// transitional — it keeps the old FATR_EchoTargetEvaluator working until Phase 3 makes
-	// subsystem intent authoritative, after which both are removed.
+	// Perception only FEEDS the subsystem's canonical awareness; the subsystem owns "what this
+	// Echo knows" and selects intent. The controller no longer holds its own target.
 	ReportPerceptionFacts(UpdatedActors);
-
-	CurrentTarget = SelectBestTarget();
 }
 
 void AATR_EchoAIController::ReportPerceptionFacts(const TArray<AActor*>& UpdatedActors)
@@ -160,15 +166,35 @@ void AATR_EchoAIController::ReportPerceptionFacts(const TArray<AActor*>& Updated
 			{
 				if (Stim.WasSuccessfullySensed())
 				{
-					// Currently visible — report live actor position/velocity as confirmed sight.
-					CachedSubsystem->ReportEchoSawActor(CachedEchoId, Actor,
-						Actor->GetActorLocation(), Actor->GetVelocity(), Now);
+					// Currently visible. Derive observed velocity from the delta of successive
+					// VISIBLE positions rather than Actor->GetVelocity(), so the Echo never reads
+					// motion it could not have seen. First sighting (or a different actor) yields
+					// zero velocity until a second visible sample arrives.
+					const FVector CurLoc = Actor->GetActorLocation();
+					FVector ObservedVelocity = FVector::ZeroVector;
+					if (PrevVisibleActor.Get() == Actor && PrevVisibleTime >= 0.f)
+					{
+						const float Dt = Now - PrevVisibleTime;
+						if (Dt > KINDA_SMALL_NUMBER)
+							ObservedVelocity = (CurLoc - PrevVisibleLocation) / Dt;
+					}
+					PrevVisibleActor    = Actor;
+					PrevVisibleLocation = CurLoc;
+					PrevVisibleTime     = Now;
+
+					CachedSubsystem->ReportEchoSawActor(CachedEchoId, Actor, CurLoc, ObservedVelocity, Now);
 				}
 				else
 				{
-					// Sight just lost — hand off to memory using the last sensed location.
-					CachedSubsystem->ReportEchoLostSight(CachedEchoId, Actor,
-						Stim.StimulusLocation, Actor->GetVelocity(), Now);
+					// Sight just lost — hand off to memory. No location/velocity is sampled here:
+					// the subsystem keeps the values it observed while the target was visible.
+					CachedSubsystem->ReportEchoLostSight(CachedEchoId, Actor, Now);
+
+					if (PrevVisibleActor.Get() == Actor)
+					{
+						PrevVisibleActor.Reset();
+						PrevVisibleTime = -1.f;
+					}
 				}
 			}
 			else if (Stim.Type == HearingID && Stim.WasSuccessfullySensed())
@@ -206,7 +232,7 @@ void AATR_EchoAIController::SetSensesEnabled(bool bEnabled)
 		AIPerception->ForgetAll(); // drop stale stimuli so a recycled controller starts clean
 }
 
-// ─── Movement Execution (Phase 5) ───────────────────────────────────────────────
+// ─── Movement Execution ───────────────────────────────────────────────
 
 EPathFollowingRequestResult::Type AATR_EchoAIController::IssueMoveRequest(const FATR_EchoMoveRequest& Request)
 {
@@ -248,7 +274,15 @@ EPathFollowingRequestResult::Type AATR_EchoAIController::IssueMoveRequest(const 
 	if (CachedSubsystem && CachedEchoId != INDEX_NONE)
 	{
 		if (FATR_EchoRuntimeState* State = CachedSubsystem->GetMutableEchoState(CachedEchoId))
-			State->Movement.bMoveInProgress = true;
+		{
+			// New monotonic serial for this issued request. The move/obstacle task records the
+			// serial and resolves only when the matching completion is reported — so a path that
+			// merely goes Idle is not treated as success.
+			State->Movement.MoveRequestSerial += 1;
+			State->Movement.bMoveInProgress     = true;
+			State->Movement.bLastMoveSucceeded  = false;
+			LastIssuedMoveSerial = State->Movement.MoveRequestSerial;
+		}
 	}
 
 	// Immediate terminal codes are reported now; Running results are reported later via
@@ -335,64 +369,22 @@ void AATR_EchoAIController::ReportMoveResultToSubsystem(bool bSuccess, EATR_Move
 	CachedSubsystem->ReportEchoMoveResult(CachedEchoId, bSuccess, Reason, Loc, BlockingActor, TimeSeconds);
 }
 
-AActor* AATR_EchoAIController::SelectBestTarget() const
+AATR_EchoAIController::EEchoMoveOutcome AATR_EchoAIController::GetMoveOutcomeForSerial(uint32 Serial) const
 {
-	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_SelectBestTarget);
-	if (!AIPerception) return nullptr;
+	if (!CachedSubsystem || CachedEchoId == INDEX_NONE) return EEchoMoveOutcome::Failed;
 
-	APawn* MyPawn = GetPawn();
-	
-	if (!MyPawn) return nullptr;
+	const FATR_EchoRuntimeState* State = CachedSubsystem->GetEchoState(CachedEchoId);
+	if (!State) return EEchoMoveOutcome::Failed;
 
+	const FATR_EchoMovementIntent& M = State->Movement;
 
-	// Only evaluate sight. Hearing never targets an actor — it is reported to the subsystem
-	// as a location-only Noise stimulus (see ReportPerceptionFacts) and drives investigation
-	// through canonical intent, not local target scoring.
-	TArray<AActor*> KnownActors;
-	AIPerception->GetKnownPerceivedActors(UAISense_Sight::StaticClass(), KnownActors);
-	if (KnownActors.IsEmpty()) return nullptr;
+	// A newer request has superseded the one this task issued — abandon this state.
+	if (M.MoveRequestSerial != Serial) return EEchoMoveOutcome::Failed;
 
-	AActor* BestActor = nullptr;
-	float   BestScore = -1.f;
+	// The matching completion has been recorded → resolve by its classified result.
+	if (M.LastCompletedMoveRequestSerial == Serial)
+		return M.bLastMoveSucceeded ? EEchoMoveOutcome::Succeeded : EEchoMoveOutcome::Failed;
 
-	for (AActor* Actor : KnownActors)
-	{
-
-		
-		if (!IsValid(Actor) || Actor == MyPawn) continue;
-
-		// Check whether we currently have line of sight or are working from memory.
-		FActorPerceptionBlueprintInfo Info;
-		AIPerception->GetActorsPerception(Actor, Info);
-
-		bool bCurrentlySensed = false;
-		for (const FAIStimulus& Stim : Info.LastSensedStimuli)
-		{
-			if (Stim.Type == UAISense::GetSenseID<UAISense_Sight>() && Stim.WasSuccessfullySensed())
-			{
-				bCurrentlySensed = true;
-				break;
-			}
-		}
-
-		// Base score: inverse squared distance (closer = higher).
-		const float DistSq = MyPawn->GetSquaredDistanceTo(Actor);
-		float Score = 1.f / (DistSq + 1.f);
-
-		// Heavily favour targets we can currently see over stale memory.
-		if (bCurrentlySensed)
-			Score *= 2.f;
-
-		// Loyalty bonus: current target needs to be significantly beaten before we switch.
-		if (Actor == CurrentTarget.Get())
-			Score *= LoyaltyBonusMultiplier;
-
-		if (Score > BestScore)
-		{
-			BestScore = Score;
-			BestActor = Actor;
-		}
-	}
-
-	return BestActor;
+	// Still the outstanding request, not yet completed.
+	return EEchoMoveOutcome::Pending;
 }

@@ -40,9 +40,8 @@ struct FATR_EchoIntentEvaluatorInstanceData
 	bool bHasValidMoveRequest = false;
 };
 
-// Reads the subsystem-owned canonical intent/move-request for the possessed Echo and
-// exposes it as bindable StateTree outputs. Replaces FATR_EchoTargetEvaluator, which only
-// surfaced a raw (possibly stale) TargetActor.
+// Reads the subsystem-owned canonical intent/move-request for the possessed Echo and exposes it
+// as bindable StateTree outputs (intent, typed move request, and a has-valid-move gate).
 //
 // Requires Context Actor = AIController in the StateTree asset (owner must be
 // AATR_EchoAIController). Pure read — never mutates subsystem state.

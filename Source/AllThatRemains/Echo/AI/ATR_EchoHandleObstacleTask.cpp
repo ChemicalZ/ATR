@@ -11,7 +11,7 @@ EStateTreeRunStatus FATR_EchoHandleObstacleTask::EnterState(FStateTreeExecutionC
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_HandleObstacleTask_EnterState);
 
-	const FInstanceDataType& Data = Context.GetInstanceData(*this);
+	FInstanceDataType& Data = Context.GetInstanceData(*this);
 	AATR_EchoAIController* AIC = Cast<AATR_EchoAIController>(Context.GetOwner());
 	if (!AIC) return EStateTreeRunStatus::Failed;
 
@@ -29,12 +29,15 @@ EStateTreeRunStatus FATR_EchoHandleObstacleTask::EnterState(FStateTreeExecutionC
 		}
 	}
 
-	// Placeholder fallback: execute the sidestep/repath the subsystem produced. If there is no
-	// valid fallback move, fail gracefully so the StateTree returns to search/idle.
+	// Execute the sidestep/repath fallback the subsystem produced. If there is no valid fallback
+	// move, fail so the StateTree returns to search/idle.
 	if (!Data.bHasValidMoveRequest || Data.MoveRequest.Type == EATR_EchoMoveTargetType::None)
 		return EStateTreeRunStatus::Failed;
 
-	switch (AIC->IssueMoveRequest(Data.MoveRequest))
+	const EPathFollowingRequestResult::Type Code = AIC->IssueMoveRequest(Data.MoveRequest);
+	Data.WaitMoveSerial = static_cast<int32>(AIC->GetLastIssuedMoveSerial());
+
+	switch (Code)
 	{
 		case EPathFollowingRequestResult::AlreadyAtGoal: return EStateTreeRunStatus::Succeeded;
 		case EPathFollowingRequestResult::Failed:        return EStateTreeRunStatus::Failed;
@@ -46,19 +49,19 @@ EStateTreeRunStatus FATR_EchoHandleObstacleTask::Tick(FStateTreeExecutionContext
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_HandleObstacleTask_Tick);
 
-	const AAIController* AIC = Cast<AAIController>(Context.GetOwner());
+	const FInstanceDataType& Data = Context.GetInstanceData(*this);
+	const AATR_EchoAIController* AIC = Cast<AATR_EchoAIController>(Context.GetOwner());
 	if (!AIC) return EStateTreeRunStatus::Failed;
 
-	switch (AIC->GetMoveStatus())
+	// Resolve from the classified result of the sidestep/repath, keyed by the issued serial.
+	// Either outcome hands control back to the tree via transitions (success → resume pursuit/
+	// search; failure → fall back to search/idle); it is never inferred from path-Idle alone.
+	switch (AIC->GetMoveOutcomeForSerial(static_cast<uint32>(Data.WaitMoveSerial)))
 	{
-		case EPathFollowingStatus::Moving:
-		case EPathFollowingStatus::Waiting:
-		case EPathFollowingStatus::Paused:
-			return EStateTreeRunStatus::Running;
-
-		case EPathFollowingStatus::Idle:
-		default:
-			return EStateTreeRunStatus::Succeeded; // resolved-or-not, hand control back to the tree
+		case AATR_EchoAIController::EEchoMoveOutcome::Succeeded: return EStateTreeRunStatus::Succeeded;
+		case AATR_EchoAIController::EEchoMoveOutcome::Failed:    return EStateTreeRunStatus::Failed;
+		case AATR_EchoAIController::EEchoMoveOutcome::Pending:
+		default:                                                return EStateTreeRunStatus::Running;
 	}
 }
 

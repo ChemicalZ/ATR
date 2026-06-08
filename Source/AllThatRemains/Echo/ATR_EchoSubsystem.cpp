@@ -7,7 +7,10 @@
 #include "AI/ATR_EchoAIController.h"
 #include "AI/ATR_EchoAILog.h"
 #include "ATR_EchoSettings.h"
+#include "Data/ATR_EchoSearchPatternDataAsset.h"
+#include "Data/ATR_EchoObstacleBehaviorDataAsset.h"
 #include "Engine/World.h"
+#include "NavigationSystem.h"
 #include "Async/ParallelFor.h"
 #include "Logging/StructuredLog.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
@@ -179,7 +182,7 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	DirtyStates.SetNumZeroed(InitializeCount);
 	IndexToActor.SetNumZeroed(InitializeCount); // all nullptr
 
-	// Canonical runtime state (Phase 1) — parallel to the SoA arrays above.
+	// Canonical runtime state — parallel to the SoA arrays above.
 	// EchoIds default to INDEX_NONE for unused rows; RuntimeStates default-construct.
 	EchoIds.Init(INDEX_NONE, InitializeCount);
 	RuntimeStates.SetNum(InitializeCount);
@@ -203,6 +206,29 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	MaxMidReplicationJobsPerFrame  = Settings->MaxMidReplicationJobsPerFrame;
 	MaxFarReplicationJobsPerFrame  = Settings->MaxFarReplicationJobsPerFrame;
 
+	// Cache the settings CDO (program-lifetime object) so behavior code reads tuning directly.
+	// Hot tuning values used in the existing intent/agitation paths are mirrored to members
+	// below to keep their use sites unchanged.
+	CachedSettings = Settings;
+
+	// Awareness / intent decays + thresholds (mirrors of Echo|Awareness, Echo|Sight, Echo|Search).
+	ConfidenceDecayPerSec        = Settings->ConfidenceDecayPerSecond;
+	UrgencyDecayPerSec           = Settings->UrgencyDecayPerSecond;
+	AgitationDecayPerSec         = Settings->EchoPersonalAgitationDecayPerSecond;
+	LostSightMemoryThreshold     = Settings->LostSightMemoryThreshold;
+	HeardInvestigateUrgency      = Settings->HeardInvestigateUrgency;
+	HeardMemorySeconds           = Settings->HeardMemorySeconds;
+	AgitationJoinThreshold       = Settings->AgitationJoinThreshold;
+	ReachLocationRadius          = Settings->ReachLocationRadius;
+	SightProjectionSeconds       = Settings->LastSeenProjectionSeconds;
+	MaxSightProjectionDistance   = Settings->MaxLastSeenProjectionDistance;
+	ObstacleHandleTimeoutSeconds = Settings->ObstacleHandleTimeoutSeconds;
+
+	// Horde agitation field (mirrors of Echo|Agitation).
+	AgitationCellSize          = Settings->AgitationCellSize;
+	AgitationFieldDecayPerSec  = Settings->AgitationFieldDecayPerSecond;
+	HordeCuriosityThreshold    = Settings->HordeCuriosityThreshold;
+
 	PromotedIndices.Reserve(PoolSize);
 	LocalEntityScratch.Reserve(256);
 	LastLocalEntityScratch.Reserve(512);
@@ -220,6 +246,10 @@ void UATR_EchoSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	ActiveEchoClass = Settings->ActiveEchoClass.LoadSynchronous();
 	ControllerClass = Settings->ControllerClass.LoadSynchronous();
 
+	// Resolve default behavior DataAssets once. Null soft refs leave the built-in defaults active.
+	ResolvedDefaultSearchPattern    = Settings->DefaultSearchPattern.LoadSynchronous();
+	ResolvedDefaultObstacleBehavior = Settings->DefaultObstacleBehavior.LoadSynchronous();
+
 	SpatialGrid.Initialize(
 		FVector2D(-WorldHalfExtent, -WorldHalfExtent),
 		FVector2D( WorldHalfExtent,  WorldHalfExtent),
@@ -232,7 +262,7 @@ void UATR_EchoSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		CoarseGridCellSize
 	);
 
-	// Server and standalone own the Manager. Clients receive it via replication (Phase 3).
+	// Server and standalone own the Manager. Clients receive it via replication.
 	if (InWorld.GetNetMode() != NM_Client)
 	{
 		FActorSpawnParameters Params;
@@ -306,6 +336,25 @@ void UATR_EchoSubsystem::Tick(float DeltaTime)
 		RunPromotionPass();
 		DecayAgitationField(DeltaTime);
 		RunIntentPass(DeltaTime);
+
+		// Lower-tier simulation — budgeted individual (LowDetail) + cell-level (Abstract). Both run
+		// off accumulators at their configured Hz so cost stays bounded regardless of horde size.
+		LowDetailAccumulator += DeltaTime;
+		const float LowDetailInterval = 1.f / FMath::Max(0.1f, CachedSettings ? CachedSettings->LowDetailUpdateHz : 8.f);
+		if (LowDetailAccumulator >= LowDetailInterval)
+		{
+			RunLowDetailPass(LowDetailAccumulator);
+			LowDetailAccumulator = 0.f;
+		}
+
+		AbstractAccumulator += DeltaTime;
+		const float AbstractInterval = 1.f / FMath::Max(0.1f, CachedSettings ? CachedSettings->AbstractUpdateHz : 1.f);
+		if (AbstractAccumulator >= AbstractInterval)
+		{
+			RunAbstractPass(AbstractAccumulator);
+			DecayAbstractCells(AbstractAccumulator);
+			AbstractAccumulator = 0.f;
+		}
 	}
 
 	// ── Client ────────────────────────────────────────────────────────────────
@@ -628,7 +677,7 @@ void UATR_EchoSubsystem::RemoveEcho(int32 Index)
 	--ActiveEntities; // decrement last — helpers above need the valid range
 }
 
-// ─── Canonical Runtime State (Phase 1) ───────────────────────────────────────
+// ─── Canonical Runtime State ───────────────────────────────────────
 
 FATR_EchoRuntimeState* UATR_EchoSubsystem::GetMutableEchoState(int32 EchoId)
 {
@@ -701,9 +750,9 @@ void UATR_EchoSubsystem::UnregisterActiveEcho(int32 EchoId)
 	UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("UnregisterActiveEcho — EchoId %d"), EchoId);
 }
 
-// ─── Perception Fact Reporting (Phase 2) ─────────────────────────────────────
+// ─── Perception Fact Reporting ───────────────────────────────────────────────
 
-void UATR_EchoSubsystem::ReportEchoSawActor(int32 EchoId, AActor* Actor, const FVector& Location, const FVector& Velocity, float TimeSeconds)
+void UATR_EchoSubsystem::ReportEchoSawActor(int32 EchoId, AActor* Actor, const FVector& Location, const FVector& ObservedVelocity, float TimeSeconds)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_ReportSawActor);
 
@@ -711,24 +760,35 @@ void UATR_EchoSubsystem::ReportEchoSawActor(int32 EchoId, AActor* Actor, const F
 	if (!State || !IsValid(Actor)) return;
 
 	FATR_EchoAwarenessState& A = State->Awareness;
+
+	// Observed velocity is sampled only while the target is actually visible (the controller
+	// derives it from a visible position delta, not the actor's movement component). Smooth it
+	// into stored velocity; snap on first observation / when prior is zero so we don't lerp from
+	// a stale zero. This is the only place LastSeenVelocity is written.
+	const float Alpha = CachedSettings ? CachedSettings->LastSeenVelocitySmoothingAlpha : 0.5f;
+	const bool  bWasVisible = (A.ConfirmedVisibleActor.Get() == Actor) && !A.LastSeenVelocity.IsNearlyZero();
+	A.LastSeenVelocity = bWasVisible
+		? FMath::Lerp(A.LastSeenVelocity, ObservedVelocity, Alpha)
+		: ObservedVelocity;
+
 	A.Mode                  = EATR_AwarenessMode::SawTarget;
 	A.ConfirmedVisibleActor = Actor;
 	A.bHasCurrentLineOfSight = true;
 	A.LastSeenLocation      = Location;
-	A.LastSeenVelocity      = Velocity;
 	A.LastSeenTime          = TimeSeconds;
-	A.Confidence            = 1.f;            // fresh sight = full confidence
+	A.Confidence            = CachedSettings ? CachedSettings->ReacquireSightConfidence : 1.f;
 	A.Urgency               = FMath::Max(A.Urgency, 1.f);
 
 	// Indirect spread: a seeing Echo agitates its neighborhood and biases pressure toward the
 	// action — but deposits only a scalar + direction, never the target actor. Neighbors get
 	// curious/pulled; distant edge Echoes get nothing and can peel away.
-	AddWorldAgitation(State->Location, 0.6f, (Location - State->Location));
+	const float SightAgitation = CachedSettings ? CachedSettings->SightAgitationAmount : 0.6f;
+	AddWorldAgitation(State->Location, SightAgitation, (Location - State->Location));
 
 	State->LastUpdateTime = TimeSeconds;
 }
 
-void UATR_EchoSubsystem::ReportEchoLostSight(int32 EchoId, AActor* Actor, const FVector& LastKnownLocation, const FVector& LastKnownVelocity, float TimeSeconds)
+void UATR_EchoSubsystem::ReportEchoLostSight(int32 EchoId, AActor* Actor, float TimeSeconds)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_ReportLostSight);
 
@@ -742,13 +802,14 @@ void UATR_EchoSubsystem::ReportEchoLostSight(int32 EchoId, AActor* Actor, const 
 	const bool bWasConfirmedActor = (A.ConfirmedVisibleActor.Get() == Actor) || !A.ConfirmedVisibleActor.IsValid();
 	if (!bWasConfirmedActor) return;
 
-	A.Mode                  = EATR_AwarenessMode::LostSightSearch;
-	A.ConfirmedVisibleActor = nullptr;
+	// No-cheat boundary: clear current line of sight and transition into memory/search using
+	// ONLY data already captured while the target was visible. LastSeenLocation / LastSeenVelocity
+	// are deliberately NOT overwritten here — the subsystem already owns the last observed values.
+	A.Mode                   = EATR_AwarenessMode::LostSightSearch;
+	A.ConfirmedVisibleActor  = nullptr;
 	A.bHasCurrentLineOfSight = false;
-	A.LastSeenLocation      = LastKnownLocation;
-	A.LastSeenVelocity      = LastKnownVelocity;
-	A.LastSeenTime          = TimeSeconds;
-	// Confidence/urgency intentionally preserved here — they decay in Phase 3 intent update.
+	A.LastSeenTime           = TimeSeconds;
+	// Confidence/urgency intentionally preserved here — they decay in the intent update.
 
 	State->LastUpdateTime = TimeSeconds;
 }
@@ -774,11 +835,13 @@ void UATR_EchoSubsystem::ReportEchoHeardLocation(int32 EchoId, const FVector& Lo
 	}
 
 	const float Loud = FMath::Clamp(Strength, 0.f, 1.f);
-	A.Urgency = FMath::Max(A.Urgency, Loud);
+	const float UrgencyScale   = CachedSettings ? CachedSettings->NoiseStrengthToUrgencyScale   : 1.0f;
+	const float AgitationScale  = CachedSettings ? CachedSettings->NoiseStrengthToAgitationScale : 0.25f;
+	A.Urgency = FMath::Max(A.Urgency, FMath::Clamp(Loud * UrgencyScale, 0.f, 1.f));
 
-	// Mild agitation contribution — even weak noise nudges horde pressure (Phase 8). Strong
-	// noise raises urgency enough to investigate; weak noise mostly just agitates/orients.
-	State->Agitation = FMath::Min(1.f, State->Agitation + Loud * 0.25f);
+	// Mild agitation contribution — even weak noise nudges horde pressure. Strong noise raises
+	// urgency enough to investigate; weak noise mostly just agitates/orients.
+	State->Agitation = FMath::Min(1.f, State->Agitation + Loud * AgitationScale);
 
 	State->LastUpdateTime = TimeSeconds;
 }
@@ -811,12 +874,99 @@ void UATR_EchoSubsystem::ReportEchoStimulus(int32 EchoId, const FATR_StimulusEve
 
 		case EATR_StimulusType::Blood:
 		case EATR_StimulusType::EchoAgitation:
-			// Agitation contribution — fully modeled in Phase 8. Bump local agitation now.
+			// Direct agitation contribution from blood/echo-agitation stimuli.
 			State->Agitation = FMath::Min(State->Agitation + FMath::Max(Event.Strength, 0.f), 1.f);
 			break;
 	}
 
 	State->LastUpdateTime = Event.TimeSeconds;
+}
+
+// ─── World-Level Stimulus API ────────────────────────────────────────────────
+
+void UATR_EchoSubsystem::EmitWorldStimulus(const FATR_StimulusEvent& Event)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_EmitWorldStimulus);
+
+	// Server-authoritative — clients never inject world stimuli into Echo awareness.
+	const UWorld* W = GetWorld();
+	if (!W || W->GetNetMode() == NM_Client) return;
+
+	const float Now = W->GetTimeSeconds();
+
+	// Validate / clamp. Strength/Radius are non-negative; missing time stamps to now.
+	FATR_StimulusEvent E = Event;
+	E.Strength = FMath::Max(0.f, E.Strength);
+	E.Radius   = FMath::Max(0.f, E.Radius);
+	if (E.TimeSeconds <= 0.f) E.TimeSeconds = Now;
+	if (E.Strength <= 0.f) return;
+
+	const float Radius = (E.Radius > 0.f)
+		? E.Radius
+		: (CachedSettings ? CachedSettings->LowDetailStimulusQueryRadius : 3000.f);
+	const float HearRange = FMath::Max(1.f, Radius);
+
+	// Agitation deposit amount by type (smell/blood drive agitation but not heard knowledge).
+	float AgitAmount = E.Strength;
+	if (CachedSettings)
+	{
+		switch (E.Type)
+		{
+			case EATR_StimulusType::Combat:
+				AgitAmount = CachedSettings->CombatAgitationAmount; break;
+			case EATR_StimulusType::Noise:
+			case EATR_StimulusType::DoorImpact:
+			case EATR_StimulusType::WindowImpact:
+			case EATR_StimulusType::Scripted:
+				AgitAmount = E.Strength * CachedSettings->NoiseAgitationAmountScale; break;
+			default: break;
+		}
+	}
+	AddWorldAgitation(E.Location, AgitAmount, E.Direction);
+
+	// Feed Abstract cell pressure at the source so the far population can react without actors.
+	{
+		FATR_AbstractCell& Cell = AbstractCells.FindOrAdd(AbstractCellKey(E.Location));
+		Cell.Agitation = FMath::Min(1.f, Cell.Agitation + AgitAmount);
+		if (E.Type == EATR_StimulusType::Smell || E.Type == EATR_StimulusType::Blood)
+			Cell.SmellMemory = FMath::Min(1.f, Cell.SmellMemory + E.Strength);
+		else
+			Cell.NoiseMemory = FMath::Min(1.f, Cell.NoiseMemory + E.Strength);
+		Cell.PressureDirection += FVector2D(E.Direction.X, E.Direction.Y).GetSafeNormal() * AgitAmount;
+		Cell.LastUpdatedTime = Now;
+	}
+
+	// Fan location-only awareness to nearby Echoes (active + low-detail) via the coarse grid so
+	// cost is proportional to nearby population. Distance falloff scales strength. This raises
+	// urgency/agitation on affected Echoes, which is what raises their promotion priority. No
+	// branch ever records a target actor — only location/field knowledge.
+	const float SmellAgitScale = CachedSettings ? CachedSettings->NoiseStrengthToAgitationScale : 0.25f;
+	CoarseGrid.ForEachEntityInRadius(FVector2f(E.Location.X, E.Location.Y), HearRange,
+		TArrayView<const FVector3f>(Positions.GetData(), ActiveEntities),
+		[&](int32 Index)
+		{
+			FATR_EchoRuntimeState* State = GetMutableEchoStateByIndex(Index);
+			if (!State) return;
+
+			const float Dist    = FVector::Dist(FVector(GetEchoQueryPosition(Index)), E.Location);
+			const float Falloff = FMath::Clamp(1.f - Dist / HearRange, 0.f, 1.f);
+			if (Falloff <= 0.f) return;
+			const float Strength = E.Strength * Falloff;
+
+			switch (E.Type)
+			{
+				case EATR_StimulusType::Smell:
+				case EATR_StimulusType::Blood:
+					State->Awareness.LastSmelledLocation = E.Location;
+					State->Awareness.LastSmelledTime     = E.TimeSeconds;
+					State->Agitation = FMath::Min(1.f, State->Agitation + Strength * SmellAgitScale);
+					break;
+				default:
+					// Location-only heard knowledge; never sets a target actor.
+					ReportEchoHeardLocation(GetEchoIdForIndex(Index), E.Location, Strength, E.TimeSeconds);
+					break;
+			}
+		});
 }
 
 void UATR_EchoSubsystem::ReportEchoMoveResult(int32 EchoId, bool bSuccess, EATR_MoveFailureReason Reason,
@@ -832,8 +982,12 @@ void UATR_EchoSubsystem::ReportEchoMoveResult(int32 EchoId, bool bSuccess, EATR_
 	M.bLastMoveSucceeded = bSuccess;
 	M.LastFailure        = bSuccess ? EATR_MoveFailureReason::None : Reason;
 	M.LastResultTime     = TimeSeconds;
+	// Tie this completion to the most recently issued request so a StateTree task waiting on that
+	// serial resolves now. The controller's HandleMoveCompleted already rejects superseded
+	// FAIRequestIDs, so this never stamps a result for a request that was replaced mid-flight.
+	M.LastCompletedMoveRequestSerial = M.MoveRequestSerial;
 
-	// Seed the obstacle hook for blocked/unreachable failures so HandleObstacle (Phase 9)
+	// Seed the obstacle hook for blocked/unreachable failures so HandleObstacle
 	// has a classified record to act on. Successful/aborted moves clear it.
 	FATR_EchoObstacleIntent& O = State->Obstacle;
 	const bool bIsObstacleFailure =
@@ -863,10 +1017,13 @@ void UATR_EchoSubsystem::ReportEchoMoveResult(int32 EchoId, bool bSuccess, EATR_
 		EchoId, bSuccess ? TEXT("success") : TEXT("FAIL"), static_cast<int32>(Reason));
 }
 
-// ─── Horde Agitation Field (Phase 8) ─────────────────────────────────────────
+// ─── Horde Agitation Field ─────────────────────────────────────────
 
 void UATR_EchoSubsystem::AddWorldAgitation(const FVector& Location, float Amount, const FVector& Direction)
 {
+	// No-cheat invariant: the field carries only a scalar magnitude and a blended direction.
+	// It never stores or transmits a target actor or an exact player location, so horde behavior
+	// emerges from pressure rather than a shared hive-mind target.
 	if (Amount <= 0.f) return;
 	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_AddWorldAgitation);
 
@@ -921,10 +1078,38 @@ void UATR_EchoSubsystem::SampleAgitationField(const FVector& Location, float& Ou
 	OutDirection = AccumDir.GetSafeNormal2D();
 }
 
-// ─── Intent Selection (Phase 3) + Lost-Sight Search (Phase 6) ────────────────
+// ─── Intent Selection + Lost-Sight Search ────────────────────────────────────
 
 namespace
 {
+	// Built-in standard directional fan: {forward, side} multipliers of the search radius.
+	// Index 0 is the projected-direction probe. Used when no search-pattern DataAsset is set.
+	static const FVector2D GBuiltInSearchPattern[] = {
+		FVector2D(1.0,  0.0),
+		FVector2D(0.7,  0.6),
+		FVector2D(0.7, -0.6),
+		FVector2D(1.4,  1.0),
+		FVector2D(1.4, -1.0),
+	};
+
+	// Tuning + context threaded into the search functions so nothing is hardcoded and the
+	// navigation system is reachable for point projection.
+	struct FEchoSearchContext
+	{
+		const UWorld* World = nullptr;
+		const TArray<FVector2D>* Offsets = nullptr; // null → built-in fan
+		float ReachRadius            = 120.f;
+		float ProjectionSeconds      = 2.f;
+		float MaxProjectionDistance  = 800.f;
+		float DefaultRadius          = 600.f;
+		float MaxSearchDurationSeconds = 12.f;
+		float RandomAngleDegrees     = 20.f;
+		float NavProjectionRadius    = 500.f;
+
+		int32 NumSteps() const { return Offsets ? Offsets->Num() : UE_ARRAY_COUNT(GBuiltInSearchPattern); }
+		FVector2D Step(int32 i) const { return Offsets ? (*Offsets)[i] : GBuiltInSearchPattern[i]; }
+	};
+
 	// Deterministic per-Echo [0,1) hash. Stable across frames (keyed by EchoId), so each
 	// Echo searches with its own consistent variation instead of identical robotic paths.
 	float EchoHash01(int32 EchoId, uint32 Salt)
@@ -934,11 +1119,30 @@ namespace
 		return static_cast<float>(H & 0x00FFFFFFu) / static_cast<float>(0x01000000u);
 	}
 
+	// Project a raw world point onto the navmesh. Returns false if there is no navigation system
+	// or no navmesh within the projection radius. Out is left equal to In on failure.
+	bool ProjectSearchPointToNav(const UWorld* World, const FVector& In, float Radius, FVector& Out)
+	{
+		Out = In;
+		if (!World) return false;
+		const UNavigationSystemV1* Nav = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World);
+		if (!Nav) return false;
+
+		FNavLocation Projected;
+		if (Nav->ProjectPointToNavigation(In, Projected, FVector(Radius, Radius, Radius)))
+		{
+			Out = Projected.Location;
+			return true;
+		}
+		return false;
+	}
+
 	// Begin a fresh lost-sight search anchored at the last-seen location, biased along the
 	// target's last-known travel direction with per-Echo angular/radius/duration variation.
 	// The search radius is derived from a CLAMPED velocity projection so prediction can never
-	// be supernatural (ProjectionSeconds * speed, capped at MaxProjectionDistance).
-	void BeginEchoSearch(FATR_EchoRuntimeState& State, float Now, float ProjectionSeconds, float MaxProjectionDistance)
+	// be supernatural (ProjectionSeconds * speed, capped at MaxProjectionDistance, floored at
+	// the configured default radius). All base values come from settings via the context.
+	void BeginEchoSearch(FATR_EchoRuntimeState& State, float Now, const FEchoSearchContext& Ctx)
 	{
 		FATR_EchoAwarenessState& A = State.Awareness;
 		FATR_EchoSearchState&    S = State.Search;
@@ -947,98 +1151,107 @@ namespace
 		if (Dir.IsNearlyZero()) Dir = State.FacingDirection.GetSafeNormal2D();
 		if (Dir.IsNearlyZero()) Dir = FVector::ForwardVector;
 
-		// Per-Echo angular jitter (+/- 20deg) so a group fans out instead of stacking.
-		const float JitterDeg = (EchoHash01(State.EchoId, 1) - 0.5f) * 40.f;
+		// Per-Echo angular jitter (± half the configured angle) so a group fans out.
+		const float JitterDeg = (EchoHash01(State.EchoId, 1) - 0.5f) * Ctx.RandomAngleDegrees;
 		Dir = Dir.RotateAngleAxis(JitterDeg, FVector::UpVector);
 
-		const float Lead = FMath::Clamp(A.LastSeenVelocity.Size2D() * ProjectionSeconds, 300.f, MaxProjectionDistance);
+		const float Lead = FMath::Clamp(A.LastSeenVelocity.Size2D() * Ctx.ProjectionSeconds, 0.f, Ctx.MaxProjectionDistance);
+		const float BaseRadius = FMath::Max(Lead, Ctx.DefaultRadius);
 
 		S.bSearchActive    = true;
 		S.Origin           = A.LastSeenLocation;
 		S.PrimaryDirection = Dir;
 		S.SearchStepIndex  = 0;
 		S.StartedTime      = Now;
-		// Aggressive echoes sweep wider and persist longer.
-		S.SearchRadius      = Lead * (0.8f + 0.6f * EchoHash01(State.EchoId, 2) + 0.3f * State.Aggression);
-		S.MaxSearchDuration = 12.f * (0.7f + 0.6f * EchoHash01(State.EchoId, 3) + 0.3f * State.Aggression);
+		// Aggressive echoes sweep wider and persist longer (per-Echo variation around the base).
+		S.SearchRadius      = BaseRadius * (0.8f + 0.6f * EchoHash01(State.EchoId, 2) + 0.3f * State.Aggression);
+		S.MaxSearchDuration = Ctx.MaxSearchDurationSeconds * (0.7f + 0.6f * EchoHash01(State.EchoId, 3) + 0.3f * State.Aggression);
 	}
 
-	// Compute the world point for the current search step. Returns false once the fan
-	// pattern is exhausted. Pattern mirrors the design doc (forward probe, then widening
-	// left/right fan), scaled by the Echo's varied SearchRadius.
-	bool ComputeEchoSearchPoint(const FATR_EchoRuntimeState& State, FVector& OutPoint)
+	// Raw (un-projected) world point for a given fan step. False if the step is out of range.
+	bool ComputeRawSearchPoint(const FATR_EchoRuntimeState& State, const FEchoSearchContext& Ctx, int32 StepIndex, FVector& OutPoint)
 	{
-		// {forward, side} multipliers of SearchRadius. Index 0 = projected direction.
-		static const FVector2f Pattern[] = {
-			FVector2f(1.0f,  0.0f),
-			FVector2f(0.7f,  0.6f),
-			FVector2f(0.7f, -0.6f),
-			FVector2f(1.4f,  1.0f),
-			FVector2f(1.4f, -1.0f),
-		};
-		const int32 N = UE_ARRAY_COUNT(Pattern);
+		if (StepIndex < 0 || StepIndex >= Ctx.NumSteps()) return false;
 
 		const FATR_EchoSearchState& S = State.Search;
-		if (S.SearchStepIndex < 0 || S.SearchStepIndex >= N) return false;
-
 		const FVector Fwd   = S.PrimaryDirection.GetSafeNormal2D();
 		const FVector Right = FVector::CrossProduct(FVector::UpVector, Fwd).GetSafeNormal();
-		const FVector2f P   = Pattern[S.SearchStepIndex];
+		const FVector2D P   = Ctx.Step(StepIndex);
 
 		OutPoint = S.Origin + Fwd * (P.X * S.SearchRadius) + Right * (P.Y * S.SearchRadius);
 		return true;
 	}
 
-	// Drive the lost-sight memory → projected → fan progression. Returns true and fills
-	// OutIntent/OutMove while a search step is active; returns false (and zeroes confidence)
-	// once the search is exhausted or times out, letting lower-priority drivers take over.
-	bool AdvanceLostSightSearch(FATR_EchoRuntimeState& State, float Now, float ReachRadius,
-	                            float ProjectionSeconds, float MaxProjectionDistance,
+	// Drive the lost-sight memory → projected → fan progression. Every emitted move target is
+	// nav-projected before becoming a move; steps that cannot project are skipped, and once no
+	// projectable step remains (or the search times out) the search ends and confidence is zeroed
+	// so lower-priority drivers take over. Returns true and fills OutIntent/OutMove while active.
+	bool AdvanceLostSightSearch(FATR_EchoRuntimeState& State, float Now, const FEchoSearchContext& Ctx,
 	                            EATR_EchoIntent& OutIntent, FATR_EchoMoveRequest& OutMove)
 	{
 		FATR_EchoAwarenessState& A = State.Awareness;
 		FATR_EchoSearchState&    S = State.Search;
 
-		// First, walk to the last-seen location before any directional search begins.
-		if (!S.bSearchActive)
-		{
-			if (FVector::Dist(State.Location, A.LastSeenLocation) > ReachRadius)
-			{
-				OutIntent            = EATR_EchoIntent::ChaseLastSeenLocation;
-				OutMove.Type         = EATR_EchoMoveTargetType::Location;
-				OutMove.Location     = A.LastSeenLocation;
-				OutMove.AcceptanceRadius = ReachRadius;
-				return true;
-			}
-			BeginEchoSearch(State, Now, ProjectionSeconds, MaxProjectionDistance);
-		}
-
-		const bool bExpired = (Now - S.StartedTime) > S.MaxSearchDuration;
-
-		FVector Point;
-		bool bHaveStep = ComputeEchoSearchPoint(State, Point);
-
-		// Advance to the next fan point once the current one is reached.
-		if (!bExpired && bHaveStep && FVector::Dist(State.Location, Point) <= ReachRadius)
-		{
-			++S.SearchStepIndex;
-			bHaveStep = ComputeEchoSearchPoint(State, Point);
-		}
-
-		if (bExpired || !bHaveStep)
+		auto EndSearch = [&]()
 		{
 			S.bSearchActive = false;
 			A.Confidence    = 0.f;                       // exhausted — fall through to idle/wander/horde
 			A.Mode          = EATR_AwarenessMode::None;
+			A.ProjectedSearchLocation = FVector::ZeroVector;
 			return false;
+		};
+
+		// First, walk to the last-seen location before any directional search begins. The last-seen
+		// location was a real observed point; if it cannot project we still accept it as the goal.
+		if (!S.bSearchActive)
+		{
+			if (FVector::Dist(State.Location, A.LastSeenLocation) > Ctx.ReachRadius)
+			{
+				FVector Goal;
+				ProjectSearchPointToNav(Ctx.World, A.LastSeenLocation, Ctx.NavProjectionRadius, Goal);
+				OutIntent            = EATR_EchoIntent::ChaseLastSeenLocation;
+				OutMove.Type         = EATR_EchoMoveTargetType::Location;
+				OutMove.Location     = Goal;
+				OutMove.AcceptanceRadius = Ctx.ReachRadius;
+				return true;
+			}
+			BeginEchoSearch(State, Now, Ctx);
 		}
 
-		A.ProjectedSearchLocation = Point;
+		if ((Now - S.StartedTime) > S.MaxSearchDuration)
+			return EndSearch();
+
+		// Advance past the current step once we've reached the point we were actually sent to.
+		if (!A.ProjectedSearchLocation.IsZero() &&
+			FVector::Dist(State.Location, A.ProjectedSearchLocation) <= Ctx.ReachRadius)
+		{
+			++S.SearchStepIndex;
+		}
+
+		// Find the next step whose point projects onto the navmesh; skip the rest.
+		FVector Projected;
+		bool bHave = false;
+		while (S.SearchStepIndex < Ctx.NumSteps())
+		{
+			FVector Raw;
+			if (ComputeRawSearchPoint(State, Ctx, S.SearchStepIndex, Raw) &&
+				ProjectSearchPointToNav(Ctx.World, Raw, Ctx.NavProjectionRadius, Projected))
+			{
+				bHave = true;
+				break;
+			}
+			++S.SearchStepIndex; // unprojectable — try the next fan point
+		}
+
+		if (!bHave)
+			return EndSearch();
+
+		A.ProjectedSearchLocation = Projected;
 		OutIntent            = (S.SearchStepIndex == 0) ? EATR_EchoIntent::SearchProjectedDirection
 		                                                : EATR_EchoIntent::FanSearchArea;
 		OutMove.Type         = EATR_EchoMoveTargetType::Location;
-		OutMove.Location     = Point;
-		OutMove.AcceptanceRadius = ReachRadius;
+		OutMove.Location     = Projected;
+		OutMove.AcceptanceRadius = Ctx.ReachRadius;
 		return true;
 	}
 }
@@ -1052,7 +1265,7 @@ void UATR_EchoSubsystem::RunIntentPass(float DeltaTime)
 	const float Now = W->GetTimeSeconds();
 
 	// Active (promoted) echoes drive the StateTree, so they need fresh intent every tick.
-	// Lower-tier simulated echoes are folded into this pass in Phase 11.
+	// Lower-tier simulated echoes are folded into this pass by the lower-tier simulation.
 	for (int32 Idx : PromotedIndices)
 	{
 		if (RuntimeStates.IsValidIndex(Idx))
@@ -1108,22 +1321,49 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 
 	// Run the lost-sight search machine (unless blocked). It may set NewIntent/Move (active
 	// search) or exhaust and zero confidence so lower-priority drivers take over this same tick.
+	// All search tuning is settings-driven and every emitted point is nav-projected.
 	bool bSearchProducedIntent = false;
 	if (!bObstacleFresh && !bSeeing && A.Confidence > LostSightMemoryThreshold)
-		bSearchProducedIntent = AdvanceLostSightSearch(State, Now, ReachLocationRadius,
-			SightProjectionSeconds, MaxSightProjectionDistance, NewIntent, Move);
+	{
+		FEchoSearchContext Ctx;
+		Ctx.World                 = GetWorld();
+		Ctx.ReachRadius           = ReachLocationRadius;
+		Ctx.ProjectionSeconds     = SightProjectionSeconds;
+		Ctx.MaxProjectionDistance = MaxSightProjectionDistance;
+		if (CachedSettings)
+		{
+			Ctx.DefaultRadius            = CachedSettings->SearchDefaultRadius;
+			Ctx.MaxSearchDurationSeconds = CachedSettings->SearchMaxDurationSeconds;
+			Ctx.RandomAngleDegrees       = CachedSettings->SearchRandomAngleDegrees;
+			Ctx.NavProjectionRadius      = CachedSettings->SearchPointNavProjectionRadius;
+		}
+		if (ResolvedDefaultSearchPattern && ResolvedDefaultSearchPattern->SearchOffsets.Num() > 0)
+			Ctx.Offsets = &ResolvedDefaultSearchPattern->SearchOffsets;
+
+		bSearchProducedIntent = AdvanceLostSightSearch(State, Now, Ctx, NewIntent, Move);
+	}
 
 	if (bObstacleFresh)
 	{
-		// Placeholder obstacle response: sidestep around the obstacle (per-Echo side choice)
-		// while nudging forward. Real door/window/fence breaking attaches here later.
+		// Obstacle handling currently requests a sidestep/repath (per-Echo side choice) while
+		// nudging forward. Door/window/fence interactions attach through FATR_EchoObstacleIntent
+		// and UATR_EchoObstacleBehaviorDataAsset without changing this intent/task seam. The
+		// sidestep target is nav-projected so the fallback never paths off-mesh.
 		const FVector ToObs = (O.ObstacleLocation - State.Location).GetSafeNormal2D();
 		const FVector Side  = FVector::CrossProduct(FVector::UpVector, ToObs).GetSafeNormal();
 		const float   Sign  = (EchoHash01(State.EchoId, 7) < 0.5f) ? 1.f : -1.f;
 
+		const float Sidestep   = CachedSettings ? CachedSettings->ObstacleSidestepDistance     : 300.f;
+		const float FwdNudge   = CachedSettings ? CachedSettings->ObstacleForwardNudgeDistance : 100.f;
+		const float NavRadius  = CachedSettings ? CachedSettings->SearchPointNavProjectionRadius : 500.f;
+
+		FVector Raw = State.Location + Side * (Sign * Sidestep) + ToObs * FwdNudge;
+		FVector Projected;
+		ProjectSearchPointToNav(GetWorld(), Raw, NavRadius, Projected); // Projected == Raw on failure
+
 		NewIntent           = EATR_EchoIntent::HandleObstacle;
 		Move.Type           = EATR_EchoMoveTargetType::Location;
-		Move.Location       = State.Location + Side * (Sign * 300.f) + ToObs * 100.f;
+		Move.Location       = Projected;
 		Move.AcceptanceRadius = ReachLocationRadius;
 		A.Mode              = EATR_AwarenessMode::ObstacleBlocked;
 	}
@@ -1160,9 +1400,10 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 	{
 		// Strong indirect pressure with a clear direction → migrate toward the hotspot.
 		// Direction-only: this Echo never learns the seer's actual target.
+		const float PressureDist = CachedSettings ? CachedSettings->HordePressureMoveDistance : 800.f;
 		NewIntent           = EATR_EchoIntent::JoinHordePressure;
 		Move.Type           = EATR_EchoMoveTargetType::Location;
-		Move.Location       = State.Location + A.HordePressureDirection * 800.f;
+		Move.Location       = State.Location + A.HordePressureDirection * PressureDist;
 		Move.AcceptanceRadius = ReachLocationRadius;
 		A.Mode              = EATR_AwarenessMode::HordeAgitated;
 	}
@@ -1202,6 +1443,213 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 	}
 }
 
+// ─── Lower-Tier Simulation ───────────────────────────────────────────────────
+
+void UATR_EchoSubsystem::RunLowDetailPass(float DeltaTime)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_RunLowDetailPass);
+	if (ActiveEntities <= 0) return;
+
+	const int32 Num = LocalEntityScratch.Num();
+	if (Num == 0) return;
+
+	const float Now    = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+	const int32 Budget = CachedSettings ? CachedSettings->LowDetailMaxUpdatesPerTick : 256;
+
+	// LowDetail simulates the non-active Echoes NEAR players (the local set rebuilt this frame).
+	// Far Echoes are handled by the cell-level Abstract pass. Round-robin a budget window over the
+	// local set so each is serviced within a few ticks; active (promoted) echoes are skipped — they
+	// run the full intent pass + StateTree.
+	int32 Processed = 0;
+	int32 Scanned   = 0;
+	while (Processed < Budget && Scanned < Num)
+	{
+		if (LowDetailCursor >= Num) LowDetailCursor = 0;
+		const int32 Index = LocalEntityScratch[LowDetailCursor];
+		++LowDetailCursor;
+		++Scanned;
+
+		if (IndexToActor.IsValidIndex(Index) && IndexToActor[Index]) continue;
+
+		UpdateLowDetailEcho(Index, Now, DeltaTime);
+		++Processed;
+	}
+}
+
+void UATR_EchoSubsystem::UpdateLowDetailEcho(int32 Index, float Now, float DeltaTime)
+{
+	FATR_EchoRuntimeState* StatePtr = GetMutableEchoStateByIndex(Index);
+	if (!StatePtr) return;
+	FATR_EchoRuntimeState& State = *StatePtr;
+
+	// Sync transform from the SoA row (no promoted actor at this tier).
+	State.Location = FVector(Positions[Index]);
+	State.Velocity = FVector(Velocities[Index]);
+
+	// Use real elapsed time for this Echo so decays are correct regardless of round-robin cadence.
+	const float Dt = (State.LastUpdateTime >= 0.f)
+		? FMath::Clamp(Now - State.LastUpdateTime, 0.f, 1.f)
+		: DeltaTime;
+
+	FATR_EchoAwarenessState& A = State.Awareness;
+	A.Confidence    = FMath::Max(0.f, A.Confidence    - ConfidenceDecayPerSec * Dt);
+	A.Urgency       = FMath::Max(0.f, A.Urgency       - UrgencyDecayPerSec    * Dt);
+	State.Agitation = FMath::Max(0.f, State.Agitation - AgitationDecayPerSec  * Dt);
+
+	float   FieldAgit = 0.f;
+	FVector FieldDir  = FVector::ZeroVector;
+	SampleAgitationField(State.Location, FieldAgit, FieldDir);
+	const float EffAgit = FMath::Max(State.Agitation, FieldAgit);
+	A.HordePressureDirection = FieldDir;
+
+	const float InvSpeed    = CachedSettings ? CachedSettings->LowDetailInvestigateSpeed : 150.f;
+	const float SearchSpeed = CachedSettings ? CachedSettings->LowDetailSearchSpeed      : 120.f;
+	const float WanderSpeed = CachedSettings ? CachedSettings->LowDetailWanderSpeed      : 60.f;
+
+	FVector         DesiredDir = FVector::ZeroVector;
+	float           Speed      = 0.f;
+	EATR_EchoIntent NewIntent  = EATR_EchoIntent::Idle;
+
+	// Continue a demoted/ongoing search via the shared nav-projected search machine — produces a
+	// target location only; LowDetail steers toward it instead of issuing an active MoveTo.
+	if (A.Confidence > LostSightMemoryThreshold)
+	{
+		FEchoSearchContext Ctx;
+		Ctx.World                 = GetWorld();
+		Ctx.ReachRadius           = ReachLocationRadius;
+		Ctx.ProjectionSeconds     = SightProjectionSeconds;
+		Ctx.MaxProjectionDistance = MaxSightProjectionDistance;
+		if (CachedSettings)
+		{
+			Ctx.DefaultRadius            = CachedSettings->LowDetailSearchRadius;
+			Ctx.MaxSearchDurationSeconds = CachedSettings->LowDetailSearchDurationSeconds;
+			Ctx.RandomAngleDegrees       = CachedSettings->SearchRandomAngleDegrees;
+			Ctx.NavProjectionRadius      = CachedSettings->SearchPointNavProjectionRadius;
+		}
+		if (ResolvedDefaultSearchPattern && ResolvedDefaultSearchPattern->SearchOffsets.Num() > 0)
+			Ctx.Offsets = &ResolvedDefaultSearchPattern->SearchOffsets;
+
+		EATR_EchoIntent      OutIntent = EATR_EchoIntent::Idle;
+		FATR_EchoMoveRequest OutMove;
+		if (AdvanceLostSightSearch(State, Now, Ctx, OutIntent, OutMove) && OutMove.Type == EATR_EchoMoveTargetType::Location)
+		{
+			DesiredDir = (OutMove.Location - State.Location).GetSafeNormal2D();
+			Speed      = SearchSpeed;
+			NewIntent  = OutIntent;
+		}
+	}
+
+	const bool bHeardRecent = (A.LastHeardTime >= 0.f) && (Now - A.LastHeardTime <= HeardMemorySeconds);
+	if (Speed <= 0.f && bHeardRecent && A.Urgency >= HeardInvestigateUrgency)
+	{
+		DesiredDir = (A.LastHeardLocation - State.Location).GetSafeNormal2D();
+		Speed      = InvSpeed;
+		NewIntent  = EATR_EchoIntent::InvestigateLocation;
+		A.Mode     = EATR_AwarenessMode::HeardLocation;
+	}
+	if (Speed <= 0.f && EffAgit >= AgitationJoinThreshold && !FieldDir.IsNearlyZero())
+	{
+		DesiredDir = FieldDir.GetSafeNormal2D();
+		Speed      = InvSpeed;
+		NewIntent  = EATR_EchoIntent::JoinHordePressure;
+		A.Mode     = EATR_AwarenessMode::HordeAgitated;
+	}
+	else if (Speed <= 0.f && EffAgit >= HordeCuriosityThreshold && !FieldDir.IsNearlyZero())
+	{
+		DesiredDir = FieldDir.GetSafeNormal2D();
+		Speed      = WanderSpeed;
+		NewIntent  = EATR_EchoIntent::Wander;
+		A.Mode     = EATR_AwarenessMode::HordeAgitated;
+	}
+
+	State.Intent = NewIntent;
+
+	// Only drive velocity when this Echo actually knows/feels something; otherwise leave it to the
+	// steering/ambient pass so LowDetail is purely additive and never fights close-range steering.
+	if (Speed > 0.f && !DesiredDir.IsNearlyZero())
+	{
+		const FVector3f Vel = FVector3f(DesiredDir * Speed);
+		Velocities[Index] = Vel;
+		Yaws[Index]       = FMath::RadiansToDegrees(FMath::Atan2(DesiredDir.Y, DesiredDir.X));
+		MarkEchoDirty(Index, EEchoDirtyFlags::Transform);
+	}
+
+	State.LastUpdateTime = Now;
+}
+
+void UATR_EchoSubsystem::RunAbstractPass(float DeltaTime)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_RunAbstractPass);
+	if (ActiveEntities <= 0) return;
+
+	const float Now           = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+	const float MigrationRate = CachedSettings ? CachedSettings->AbstractCellMigrationRate : 0.05f;
+	const float DriftSpeed    = CachedSettings ? CachedSettings->LowDetailWanderSpeed       : 60.f;
+
+	// Recompute population each pass; pressure/memory persist and decay in DecayAbstractCells.
+	for (auto& Pair : AbstractCells) Pair.Value.Population = 0;
+
+	// Cheap full sweep at AbstractUpdateHz (≈1 Hz): aggregate population/pressure per cell and
+	// migrate a rotating fraction of each agitated cell toward its pressure. Active echoes are
+	// handled by the intent pass; everything else gets at least this cell-level reaction.
+	const uint32 TimeSalt = static_cast<uint32>(Now);
+	for (int32 Index = 0; Index < ActiveEntities; ++Index)
+	{
+		if (IndexToActor.IsValidIndex(Index) && IndexToActor[Index]) continue; // active tier
+
+		// Skip Echoes in the local set — those are simulated individually by the LowDetail pass.
+		// The Abstract tier owns only the far population.
+		if (LocalVisitStamp.IsValidIndex(Index) && LocalVisitStamp[Index] == LocalVisitEpoch) continue;
+
+		const FVector Pos = FVector(Positions[Index]);
+		FATR_AbstractCell& Cell = AbstractCells.FindOrAdd(AbstractCellKey(Pos));
+		++Cell.Population;
+
+		float   FieldAgit = 0.f;
+		FVector FieldDir  = FVector::ZeroVector;
+		SampleAgitationField(Pos, FieldAgit, FieldDir);
+		if (FieldAgit > Cell.Agitation) Cell.Agitation = FieldAgit;
+		if (!FieldDir.IsNearlyZero())   Cell.PressureDirection = FVector2D(FieldDir.X, FieldDir.Y);
+		Cell.LastUpdatedTime = Now;
+
+		// Migrate ~MigrationRate of the cell toward pressure. Selection rotates over time (salt) so
+		// it isn't always the same Echoes, yet stays RNG-free for replay stability.
+		if (Cell.Agitation >= HordeCuriosityThreshold && !FieldDir.IsNearlyZero())
+		{
+			if (EchoHash01(GetEchoIdForIndex(Index), TimeSalt) < MigrationRate)
+			{
+				const FVector3f Dir = FVector3f(FieldDir.GetSafeNormal2D());
+				Velocities[Index] = Dir * DriftSpeed;
+				Yaws[Index]       = FMath::RadiansToDegrees(FMath::Atan2(Dir.Y, Dir.X));
+				MarkEchoDirty(Index, EEchoDirtyFlags::Transform);
+			}
+		}
+	}
+}
+
+void UATR_EchoSubsystem::DecayAbstractCells(float DeltaTime)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_DecayAbstractCells);
+
+	const float Decay = (CachedSettings ? CachedSettings->AgitationFieldDecayPerSecond : 0.25f) * DeltaTime;
+
+	for (auto It = AbstractCells.CreateIterator(); It; ++It)
+	{
+		FATR_AbstractCell& C = It.Value();
+		C.Agitation         = FMath::Max(0.f, C.Agitation   - Decay);
+		C.NoiseMemory       = FMath::Max(0.f, C.NoiseMemory - Decay);
+		C.SmellMemory       = FMath::Max(0.f, C.SmellMemory - Decay);
+		C.PressureDirection *= FMath::Max(0.f, 1.f - Decay);
+
+		// Prune fully-decayed, empty cells so the map stays proportional to active hotspots.
+		if (C.Population == 0 && C.Agitation <= KINDA_SMALL_NUMBER
+			&& C.NoiseMemory <= KINDA_SMALL_NUMBER && C.SmellMemory <= KINDA_SMALL_NUMBER)
+		{
+			It.RemoveCurrent();
+		}
+	}
+}
+
 bool UATR_EchoSubsystem::PromoteToActive(int32 SoAIndex, AATR_ActiveEcho* Actor)
 {
 	if (!ensureAlways(Actor && SoAIndex >= 0 && SoAIndex < ActiveEntities)) return false;
@@ -1224,6 +1672,14 @@ void UATR_EchoSubsystem::DemoteToHorde(AATR_ActiveEcho* Actor)
 
 	const int32 NewCell = CoarseGrid.GetCellId(FVector2f(Positions[Idx].X, Positions[Idx].Y));
 	MoveEntityCoarseCell(Idx, NewCell);
+
+	// Stamp the demotion time for the recently-demoted promotion penalty. Awareness/search state
+	// is intentionally left intact so the demoted Echo continues its search at the LowDetail tier.
+	if (FATR_EchoRuntimeState* State = GetMutableEchoStateByIndex(Idx))
+	{
+		State->LastDemotedTime = GetWorld() ? GetWorld()->GetTimeSeconds() : -1.f;
+		State->Tier            = EATR_EchoSimulationTier::LowDetail;
+	}
 
 	IndexToActor[Idx]   = nullptr;
 	PromotionTimes[Idx] = 0.f;
@@ -1293,6 +1749,88 @@ void UATR_EchoSubsystem::DemoteEcho(AATR_ActiveEcho* Actor)
 	EchoPool.Add(Actor);
 }
 
+// ─── Promotion scoring + demotion guards ─────────────────────────────────────
+
+float UATR_EchoSubsystem::ComputePromotionScore(int32 Index, const FVector3f& PlayerPos, const FVector3f& PlayerForward, float Now) const
+{
+	const FVector3f P    = GetEchoQueryPosition(Index);
+	const FVector3f D    = P - PlayerPos;
+	const float     Dist = FMath::Sqrt(D.X * D.X + D.Y * D.Y);
+
+	// Distance priority: closer = higher (less negative). Bonuses add on top.
+	float Score = -Dist;
+
+	const UATR_EchoSettings* S = CachedSettings;
+	if (!S) return Score;
+
+	if (Dist <= MustPromoteRadius) Score += S->MustPromoteScoreBonus;
+
+	if (RuntimeStates.IsValidIndex(Index))
+	{
+		const FATR_EchoRuntimeState& RS = RuntimeStates[Index];
+		Score += RS.Awareness.Urgency    * S->PromotionUrgencyBoost;
+		Score += RS.Awareness.Confidence * S->PromotionConfidenceBoost;
+		Score += FMath::Max(0.f, RS.Agitation) * S->PromotionAgitationBoost;
+
+		if (RS.LastDemotedTime >= 0.f && S->RecentlyDemotedSeconds > 0.f)
+		{
+			const float Since = Now - RS.LastDemotedTime;
+			if (Since >= 0.f && Since < S->RecentlyDemotedSeconds)
+				Score -= S->RecentlyDemotedPenalty * (1.f - Since / S->RecentlyDemotedSeconds);
+		}
+	}
+
+	// Player-facing relevance: an Echo in the player's forward hemisphere is worth more.
+	if (!PlayerForward.IsNearlyZero() && Dist > KINDA_SMALL_NUMBER)
+	{
+		const FVector3f Dir    = D / Dist;
+		const float     Facing = FVector3f::DotProduct(PlayerForward.GetSafeNormal(), Dir);
+		if (Facing > 0.f) Score += Facing * S->PromotionPlayerFacingBoost;
+	}
+
+	return Score;
+}
+
+bool UATR_EchoSubsystem::IsDemotionBlocked(int32 Index, float Now) const
+{
+	const FATR_EchoRuntimeState* RS = RuntimeStates.IsValidIndex(Index) ? &RuntimeStates[Index] : nullptr;
+	if (!RS) return false;
+
+	const UATR_EchoSettings* S = CachedSettings;
+
+	// Visible chase — keep the full actor while it actually sees its target.
+	if ((!S || S->bBlockDemotionDuringVisibleChase) &&
+		RS->Awareness.bHasCurrentLineOfSight && RS->Awareness.ConfirmedVisibleActor.IsValid())
+		return true;
+
+	if (S)
+	{
+		if (RS->Awareness.Confidence >= S->DemotionConfidenceBlockThreshold) return true;
+		if (RS->Awareness.Urgency    >= S->DemotionUrgencyBlockThreshold)    return true;
+
+		// Fresh lost-sight search (chase-last-seen / projected / fan).
+		if (S->bBlockDemotionDuringFreshSearch)
+		{
+			const bool bSearchIntent =
+				RS->Intent == EATR_EchoIntent::ChaseLastSeenLocation    ||
+				RS->Intent == EATR_EchoIntent::SearchProjectedDirection ||
+				RS->Intent == EATR_EchoIntent::FanSearchArea;
+			if (bSearchIntent && RS->Search.bSearchActive &&
+				(Now - RS->Search.StartedTime) <= S->DemotionSearchBlockSeconds)
+				return true;
+		}
+
+		// Fresh obstacle handling.
+		if (S->bBlockDemotionDuringObstacleHandling &&
+			RS->Intent == EATR_EchoIntent::HandleObstacle &&
+			RS->Obstacle.bHasObstacle &&
+			(Now - RS->Obstacle.LastObstacleTime) <= ObstacleHandleTimeoutSeconds)
+			return true;
+	}
+
+	return false;
+}
+
 // ─── RunPromotionPass ─────────────────────────────────────────────────────────
 
 void UATR_EchoSubsystem::RunPromotionPass()
@@ -1318,40 +1856,39 @@ void UATR_EchoSubsystem::RunPromotionPass()
 		APlayerController* PC = It->Get();
 		if (!PC || !PC->GetPawn()) continue;
 
-		const FVector3f PP = FVector3f(PC->GetPawn()->GetActorLocation());
+		const FVector3f PP  = FVector3f(PC->GetPawn()->GetActorLocation());
+		const FVector3f PFwd = FVector3f(PC->GetPawn()->GetActorForwardVector());
 		Candidates.Reset();
 		SpatialGrid.QueryRadius(PP, PromoteRadius,
 			TArrayView<const FVector3f>(Positions.GetData(), ActiveEntities),
 			Candidates);
 
-		// Closest entities first — inner-ring (MustPromoteRadius) entities sort to top
-		// naturally and consume pool slots before outer-ring ones.
-		Candidates.Sort([&PP, this](int32 A, int32 B)
+		// Highest promotion score first — score blends distance with urgency/confidence/agitation/
+		// facing and the must-promote bonus, so an engaged Echo just outside the nearest ring can
+		// still outrank a closer but idle one. Inner-ring echoes still sort to the top via the bonus.
+		Candidates.Sort([&PP, &PFwd, Now, this](int32 A, int32 B)
 		{
-			const FVector3f DA = GetEchoQueryPosition(A) - PP;
-			const FVector3f DB = GetEchoQueryPosition(B) - PP;
-			return (DA.X*DA.X + DA.Y*DA.Y) < (DB.X*DB.X + DB.Y*DB.Y);
+			return ComputePromotionScore(A, PP, PFwd, Now) > ComputePromotionScore(B, PP, PFwd, Now);
 		});
 
-		// Sorted farthest-first list of promoted actors — built lazily when pool empties.
-		// Lets us swap farthest actor out so a closer candidate can take its slot.
-		TArray<TPair<float, int32>> FarPromoted;
-		bool  bFarListBuilt = false;
-		int32 FarListIdx    = 0;
+		// Lowest-score-first list of currently promoted actors — built lazily when the pool empties.
+		// Lets a higher-scoring candidate evict the weakest promoted Echo (not merely the farthest).
+		TArray<TPair<float, int32>> WeakPromoted;
+		bool  bWeakListBuilt = false;
+		int32 WeakListIdx    = 0;
 
-		auto BuildFarList = [&]()
+		auto BuildWeakList = [&]()
 		{
-			if (bFarListBuilt) return;
-			bFarListBuilt = true;
+			if (bWeakListBuilt) return;
+			bWeakListBuilt = true;
 			for (const int32 j : PromotedIndices)
 			{
 				if (!IndexToActor[j]) continue; // paranoia guard
-				const FVector3f D = GetEchoQueryPosition(j) - PP;
-				FarPromoted.Add({ D.X*D.X + D.Y*D.Y, j });
+				WeakPromoted.Add({ ComputePromotionScore(j, PP, PFwd, Now), j });
 			}
-			FarPromoted.Sort([](const TPair<float,int32>& A, const TPair<float,int32>& B)
+			WeakPromoted.Sort([](const TPair<float,int32>& A, const TPair<float,int32>& B)
 			{
-				return A.Key > B.Key; // farthest first
+				return A.Key < B.Key; // weakest (lowest score) first
 			});
 		};
 
@@ -1361,28 +1898,28 @@ void UATR_EchoSubsystem::RunPromotionPass()
 
 			if (EchoPool.IsEmpty() || ControllerPool.IsEmpty())
 			{
-				// Pool exhausted — try to evict the farthest promoted actor that is
-				// farther from the player than this candidate. Bypasses MinTimeInTierSeconds
-				// so closest echoes are always preferred; bBlockDemotion is still respected.
-				BuildFarList();
+				// Pool exhausted — evict the weakest promoted Echo if this candidate outscores it.
+				// Respects engagement guards (IsDemotionBlocked / bBlockDemotion); the hard pool cap
+				// is never exceeded, so the fixed population still caps simultaneous full actors.
+				BuildWeakList();
 
-				const FVector3f DC       = Positions[i] - PP;
-				const float     CandDSq  = DC.X*DC.X + DC.Y*DC.Y;
-				bool            bSwapped = false;
+				const float CandScore = ComputePromotionScore(i, PP, PFwd, Now);
+				bool        bSwapped  = false;
 
-				while (FarListIdx < FarPromoted.Num())
+				while (WeakListIdx < WeakPromoted.Num())
 				{
-					const float     FarDSq  = FarPromoted[FarListIdx].Key;
-					const int32     FarIdx  = FarPromoted[FarListIdx].Value;
-					++FarListIdx;
+					const float Weakest    = WeakPromoted[WeakListIdx].Key;
+					const int32 WeakIdx    = WeakPromoted[WeakListIdx].Value;
+					++WeakListIdx;
 
-					// Farthest promoted is now closer than this candidate — no beneficial swap possible.
-					if (FarDSq <= CandDSq) break;
+					// Weakest promoted now outscores this candidate — no beneficial swap remains.
+					if (Weakest >= CandScore) break;
 
-					AATR_ActiveEcho* FarActor = IndexToActor[FarIdx];
-					if (!FarActor || FarActor->bBlockDemotion) continue; // already gone or locked
+					AATR_ActiveEcho* WeakActor = IndexToActor[WeakIdx];
+					if (!WeakActor || WeakActor->bBlockDemotion) continue; // gone or locked
+					if (IsDemotionBlocked(WeakIdx, Now)) continue;          // actively engaged
 
-					DemoteEcho(FarActor);
+					DemoteEcho(WeakActor);
 					bSwapped = true;
 					break;
 				}
@@ -1410,13 +1947,9 @@ void UATR_EchoSubsystem::RunPromotionPass()
 		// StateTree interruptibility guard
 		if (Actor->bBlockDemotion) continue;
 
-		// Urgency guard (Phase 11): don't yank an Echo that currently sees its target — keep
-		// the full actor while it is actively chasing, even near the demotion ring.
-		if (const FATR_EchoRuntimeState* RS = GetMutableEchoStateByIndex(i))
-		{
-			if (RS->Awareness.bHasCurrentLineOfSight)
-				continue;
-		}
+		// Engagement guards: keep the full actor while it sees its target, has high confidence/
+		// urgency, is in a fresh search, or is handling a fresh obstacle (all settings-driven).
+		if (IsDemotionBlocked(i, Now)) continue;
 
 		// Demotion requires entity to be beyond DemoteRadius from ALL players
 		bool bAnyClose = false;
@@ -1472,7 +2005,7 @@ void UATR_EchoSubsystem::RunSteeringPass()
 
 		if (BestPlayerIndex == INDEX_NONE)
 		{
-			// No player within MustPromoteRadius → low-detail horde migration (Phase 11).
+			// No player within MustPromoteRadius → low-detail horde migration.
 			// Sample the indirect agitation field and drift toward pressure. This is how
 			// far/non-active echoes react to gunshots, combat, and seeing-echoes without any
 			// AIController/perception — cell-level pressure becomes population movement.

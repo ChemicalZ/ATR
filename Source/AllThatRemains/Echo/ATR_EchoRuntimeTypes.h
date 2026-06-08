@@ -17,9 +17,8 @@ class AATR_EchoAIController;
 // AIController / StateTree are execution adapters that read intent/move-requests
 // out of this state and report perception/movement facts back into it.
 //
-// Phase 1 introduces the storage only — population of awareness/intent/search is
-// wired up in later phases. Names mirror the design document; values are tuned
-// elsewhere (Project Settings), not here.
+// Names mirror the design document; behavior-critical values are tuned in Project Settings
+// (UATR_EchoSettings) or DataAssets, never hardcoded here.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // How much simulation fidelity an Echo currently receives. Drives whether it has
@@ -211,6 +210,13 @@ struct FATR_EchoMovementIntent
 	bool  bMoveInProgress  = false;
 	bool  bLastMoveSucceeded = false;
 	float LastResultTime   = -1.f;
+
+	// Monotonic per-Echo serial of the most recently ISSUED move request, and the serial of the
+	// most recently COMPLETED one. A StateTree move/obstacle task records the serial it issued and
+	// resolves Succeeded/Failed only when LastCompletedMoveRequestSerial matches — so a stale path
+	// result can never resolve a newer state, and going path-Idle is not by itself "success".
+	uint32 MoveRequestSerial          = 0;
+	uint32 LastCompletedMoveRequestSerial = 0;
 };
 
 // One cell of the indirect horde-agitation field. Agitation spreads as a scalar pressure
@@ -221,6 +227,20 @@ struct FATR_AgitationCell
 	float   Agitation         = 0.f;
 	FVector WeightedDirection  = FVector::ZeroVector; // accumulated direction*amount; normalize on read
 	float   LastUpdatedTime    = -1.f;
+};
+
+// One coarse cell of the Abstract simulation tier. Tracks aggregate population state instead of
+// individual movement, so far-away hordes can react to stimuli and migrate as a population without
+// per-frame pathing. Pressure/memory decay over time and can seed LowDetail state when a player or
+// relevancy enters the cell. Never stores a target actor or exact player location.
+struct FATR_AbstractCell
+{
+	int32     Population        = 0;
+	float     Agitation         = 0.f;
+	FVector2D PressureDirection  = FVector2D::ZeroVector;
+	float     NoiseMemory        = 0.f;
+	float     SmellMemory        = 0.f;
+	float     LastUpdatedTime    = -1.f;
 };
 
 // Obstacle hook record. Breaking is deferred, but the classified failure + location
@@ -260,6 +280,11 @@ struct FATR_EchoRuntimeState
 	float Aggression    = 0.5f;
 	float Agitation     = 0.f;
 	float LastUpdateTime = -1.f;
+
+	// Time of the Echo's most recent demotion (GetTimeSeconds), or -1 if never demoted. Feeds the
+	// recently-demoted penalty in score-based promotion so a just-demoted Echo isn't re-promoted
+	// immediately. Survives in RuntimeStates across the demotion (state is not reset on demote).
+	float LastDemotedTime = -1.f;
 
 	// Active-layer bridge — valid only while Tier == Active. Weak so a pooled/destroyed
 	// controller or pawn auto-nulls without dangling.
