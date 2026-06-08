@@ -58,6 +58,10 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Echo|AI", meta = (ClampMin = 1.f, ForceUnits = "cm"))
 	float HearingRange = 3000.f;
 
+	// Forward trace length used to identify what physically blocked a move (Phase 9).
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Echo|AI", meta = (ClampMin = 0.f, ForceUnits = "cm"))
+	float ObstacleTraceDistance = 200.f;
+
 	// Returns the current best target selected by perception scoring. Used by StateTree evaluators.
 	// TRANSITIONAL (Phases 2–4): superseded by subsystem intent; removed in final cleanup.
 	AActor* GetCurrentTarget() const { return CurrentTarget.Get(); }
@@ -109,6 +113,10 @@ private:
 
 	// Forward a classified move result to the subsystem for the possessed Echo.
 	void ReportMoveResultToSubsystem(bool bSuccess, EATR_MoveFailureReason Reason, float TimeSeconds, AActor* BlockingActor);
+
+	// Identify what blocked the pawn via a short forward trace and classify it by actor tag
+	// (door/window/fence) — generic dynamic block otherwise. OutBlocker may be null.
+	EATR_MoveFailureReason ClassifyBlockingObstacle(AActor*& OutBlocker) const;
 
 	// Resolved once at OnPossess from the possessed AATR_ActiveEcho's SoA row.
 	// Stable for the Echo's lifetime (EchoId never changes; SoA index can).

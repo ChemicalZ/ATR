@@ -496,6 +496,7 @@ public:
 	float ReachLocationRadius          = 120.f; // "arrived" tolerance for memory/search points
 	float SightProjectionSeconds       = 2.0f;  // lead time for projected-direction search
 	float MaxSightProjectionDistance   = 800.f; // clamp so prediction can't be supernatural
+	float ObstacleHandleTimeoutSeconds = 2.0f;  // how long a fresh block forces HandleObstacle
 
 	// Frame-scope scratch for local entity indices; allocation persists across ticks.
 	TArray<int32> LocalEntityScratch;

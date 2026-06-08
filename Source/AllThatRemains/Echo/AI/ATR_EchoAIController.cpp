@@ -274,18 +274,57 @@ void AATR_EchoAIController::HandleMoveCompleted(FAIRequestID RequestID, EPathFol
 	bool                   bSuccess = false;
 	EATR_MoveFailureReason Reason   = EATR_MoveFailureReason::None;
 
+	AActor* Blocker = nullptr;
+
 	switch (Result)
 	{
 		case EPathFollowingResult::Success: bSuccess = true; break;
-		// Exact obstacle (door/window/fence) is refined in Phase 9; generic for now.
-		case EPathFollowingResult::Blocked: Reason = EATR_MoveFailureReason::BlockedByDynamicActor; break;
-		case EPathFollowingResult::OffPath: Reason = EATR_MoveFailureReason::TargetUnreachable;     break;
-		case EPathFollowingResult::Aborted: Reason = EATR_MoveFailureReason::AbortedByNewIntent;    break;
-		case EPathFollowingResult::Invalid: Reason = EATR_MoveFailureReason::InvalidTarget;         break;
-		default:                            Reason = EATR_MoveFailureReason::NoPath;                break;
+		// Blocked → trace forward to identify and classify the obstacle (door/window/fence).
+		case EPathFollowingResult::Blocked: Reason = ClassifyBlockingObstacle(Blocker);         break;
+		case EPathFollowingResult::OffPath: Reason = EATR_MoveFailureReason::TargetUnreachable;  break;
+		case EPathFollowingResult::Aborted: Reason = EATR_MoveFailureReason::AbortedByNewIntent; break;
+		case EPathFollowingResult::Invalid: Reason = EATR_MoveFailureReason::InvalidTarget;      break;
+		default:                            Reason = EATR_MoveFailureReason::NoPath;             break;
 	}
 
-	ReportMoveResultToSubsystem(bSuccess, Reason, Now, nullptr);
+	if (!bSuccess)
+	{
+		UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("Move blocked — EchoId %d reason %d blocker %s"),
+			CachedEchoId, static_cast<int32>(Reason), Blocker ? *Blocker->GetName() : TEXT("none"));
+	}
+
+	ReportMoveResultToSubsystem(bSuccess, Reason, Now, Blocker);
+}
+
+EATR_MoveFailureReason AATR_EchoAIController::ClassifyBlockingObstacle(AActor*& OutBlocker) const
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_ClassifyBlockingObstacle);
+
+	// Tag contract — designers tag breakable obstacle actors so the AI can classify them
+	// without hard class dependencies. Unknown blockers fall back to a generic dynamic block.
+	static const FName TagDoor  (TEXT("Echo.Obstacle.Door"));
+	static const FName TagWindow(TEXT("Echo.Obstacle.Window"));
+	static const FName TagFence (TEXT("Echo.Obstacle.Fence"));
+
+	OutBlocker = nullptr;
+
+	const APawn* P = GetPawn();
+	const UWorld* W = GetWorld();
+	if (!P || !W) return EATR_MoveFailureReason::BlockedByDynamicActor;
+
+	const FVector Start = P->GetActorLocation();
+	const FVector End   = Start + P->GetActorForwardVector() * ObstacleTraceDistance;
+
+	FHitResult Hit;
+	FCollisionQueryParams Params(TEXT("EchoObstacleTrace"), /*bTraceComplex=*/false, P);
+	if (!W->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params) || !Hit.GetActor())
+		return EATR_MoveFailureReason::BlockedByDynamicActor;
+
+	OutBlocker = Hit.GetActor();
+	if (OutBlocker->ActorHasTag(TagDoor))   return EATR_MoveFailureReason::BlockedByDoor;
+	if (OutBlocker->ActorHasTag(TagWindow)) return EATR_MoveFailureReason::BlockedByWindow;
+	if (OutBlocker->ActorHasTag(TagFence))  return EATR_MoveFailureReason::BlockedByFence;
+	return EATR_MoveFailureReason::BlockedByDynamicActor;
 }
 
 void AATR_EchoAIController::ReportMoveResultToSubsystem(bool bSuccess, EATR_MoveFailureReason Reason, float TimeSeconds, AActor* BlockingActor)

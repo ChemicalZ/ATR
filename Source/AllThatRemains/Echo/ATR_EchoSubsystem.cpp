@@ -1075,14 +1075,34 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 	const bool bHeardRecent = (A.LastHeardTime >= 0.f) && (Now - A.LastHeardTime <= HeardMemorySeconds);
 	const bool bSeeing      = A.bHasCurrentLineOfSight && A.ConfirmedVisibleActor.IsValid();
 
-	// Run the lost-sight search machine first. It may set NewIntent/Move (active search) or
-	// exhaust and zero confidence so lower-priority drivers below take over this same tick.
+	// A fresh physical block takes priority over everything — we cannot make progress until it
+	// is resolved. The placeholder fallback sidesteps around the obstacle; real break behavior
+	// hangs off the same HandleObstacle intent later.
+	const FATR_EchoObstacleIntent& O = State.Obstacle;
+	const bool bObstacleFresh = O.bHasObstacle && (Now - O.LastObstacleTime) <= ObstacleHandleTimeoutSeconds;
+
+	// Run the lost-sight search machine (unless blocked). It may set NewIntent/Move (active
+	// search) or exhaust and zero confidence so lower-priority drivers take over this same tick.
 	bool bSearchProducedIntent = false;
-	if (!bSeeing && A.Confidence > LostSightMemoryThreshold)
+	if (!bObstacleFresh && !bSeeing && A.Confidence > LostSightMemoryThreshold)
 		bSearchProducedIntent = AdvanceLostSightSearch(State, Now, ReachLocationRadius,
 			SightProjectionSeconds, MaxSightProjectionDistance, NewIntent, Move);
 
-	if (bSeeing)
+	if (bObstacleFresh)
+	{
+		// Placeholder obstacle response: sidestep around the obstacle (per-Echo side choice)
+		// while nudging forward. Real door/window/fence breaking attaches here later.
+		const FVector ToObs = (O.ObstacleLocation - State.Location).GetSafeNormal2D();
+		const FVector Side  = FVector::CrossProduct(FVector::UpVector, ToObs).GetSafeNormal();
+		const float   Sign  = (EchoHash01(State.EchoId, 7) < 0.5f) ? 1.f : -1.f;
+
+		NewIntent           = EATR_EchoIntent::HandleObstacle;
+		Move.Type           = EATR_EchoMoveTargetType::Location;
+		Move.Location       = State.Location + Side * (Sign * 300.f) + ToObs * 100.f;
+		Move.AcceptanceRadius = ReachLocationRadius;
+		A.Mode              = EATR_AwarenessMode::ObstacleBlocked;
+	}
+	else if (bSeeing)
 	{
 		// Confirmed visible → chase the actor itself.
 		NewIntent           = EATR_EchoIntent::ChaseVisibleActor;
