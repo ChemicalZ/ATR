@@ -292,6 +292,15 @@ public:
 	void RegisterActiveEcho(int32 EchoId, AATR_EchoAIController* Controller, APawn* Pawn);
 	void UnregisterActiveEcho(int32 EchoId);
 
+	// --- Perception fact reporting (Phase 2) ---
+	// The active AIController calls these to feed canonical awareness. They only WRITE
+	// awareness state; intent selection that consumes it lands in Phase 3. Hearing is
+	// strictly location-only — it never records an actor as a behavioral target.
+	void ReportEchoSawActor(int32 EchoId, AActor* Actor, const FVector& Location, const FVector& Velocity, float TimeSeconds);
+	void ReportEchoLostSight(int32 EchoId, AActor* Actor, const FVector& LastKnownLocation, const FVector& LastKnownVelocity, float TimeSeconds);
+	void ReportEchoHeardLocation(int32 EchoId, const FVector& Location, float Strength, float TimeSeconds);
+	void ReportEchoStimulus(int32 EchoId, const FATR_StimulusEvent& Event);
+
 	// --- Public API ---
 
 	int32 AddEcho(FVector3f Position);

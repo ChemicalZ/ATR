@@ -674,6 +674,112 @@ void UATR_EchoSubsystem::UnregisterActiveEcho(int32 EchoId)
 	UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("UnregisterActiveEcho — EchoId %d"), EchoId);
 }
 
+// ─── Perception Fact Reporting (Phase 2) ─────────────────────────────────────
+
+void UATR_EchoSubsystem::ReportEchoSawActor(int32 EchoId, AActor* Actor, const FVector& Location, const FVector& Velocity, float TimeSeconds)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_ReportSawActor);
+
+	FATR_EchoRuntimeState* State = GetMutableEchoState(EchoId);
+	if (!State || !IsValid(Actor)) return;
+
+	FATR_EchoAwarenessState& A = State->Awareness;
+	A.Mode                  = EATR_AwarenessMode::SawTarget;
+	A.ConfirmedVisibleActor = Actor;
+	A.bHasCurrentLineOfSight = true;
+	A.LastSeenLocation      = Location;
+	A.LastSeenVelocity      = Velocity;
+	A.LastSeenTime          = TimeSeconds;
+	A.Confidence            = 1.f;            // fresh sight = full confidence
+	A.Urgency               = FMath::Max(A.Urgency, 1.f);
+
+	State->LastUpdateTime = TimeSeconds;
+}
+
+void UATR_EchoSubsystem::ReportEchoLostSight(int32 EchoId, AActor* Actor, const FVector& LastKnownLocation, const FVector& LastKnownVelocity, float TimeSeconds)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_ReportLostSight);
+
+	FATR_EchoRuntimeState* State = GetMutableEchoState(EchoId);
+	if (!State) return;
+
+	FATR_EchoAwarenessState& A = State->Awareness;
+
+	// Only the actor we were actually confirming should clear line-of-sight. A lost-sight
+	// report for some other perceived actor must not wipe a live confirmation.
+	const bool bWasConfirmedActor = (A.ConfirmedVisibleActor.Get() == Actor) || !A.ConfirmedVisibleActor.IsValid();
+	if (!bWasConfirmedActor) return;
+
+	A.Mode                  = EATR_AwarenessMode::LostSightSearch;
+	A.ConfirmedVisibleActor = nullptr;
+	A.bHasCurrentLineOfSight = false;
+	A.LastSeenLocation      = LastKnownLocation;
+	A.LastSeenVelocity      = LastKnownVelocity;
+	A.LastSeenTime          = TimeSeconds;
+	// Confidence/urgency intentionally preserved here — they decay in Phase 3 intent update.
+
+	State->LastUpdateTime = TimeSeconds;
+}
+
+void UATR_EchoSubsystem::ReportEchoHeardLocation(int32 EchoId, const FVector& Location, float Strength, float TimeSeconds)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_ReportHeardLocation);
+
+	FATR_EchoRuntimeState* State = GetMutableEchoState(EchoId);
+	if (!State) return;
+
+	FATR_EchoAwarenessState& A = State->Awareness;
+	A.LastHeardLocation = Location;
+	A.LastHeardTime     = TimeSeconds;
+
+	// Hearing never sets ConfirmedVisibleActor and never upgrades over a live sight.
+	// It only takes over when we have no stronger awareness driver.
+	if (A.Mode == EATR_AwarenessMode::None
+		|| A.Mode == EATR_AwarenessMode::HeardLocation
+		|| A.Mode == EATR_AwarenessMode::HordeAgitated)
+	{
+		A.Mode = EATR_AwarenessMode::HeardLocation;
+	}
+
+	A.Urgency = FMath::Max(A.Urgency, FMath::Clamp(Strength, 0.f, 1.f));
+
+	State->LastUpdateTime = TimeSeconds;
+}
+
+void UATR_EchoSubsystem::ReportEchoStimulus(int32 EchoId, const FATR_StimulusEvent& Event)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_ReportStimulus);
+
+	FATR_EchoRuntimeState* State = GetMutableEchoState(EchoId);
+	if (!State) return;
+
+	// Route by stimulus type. All routes are location-based; SourceActor_DebugOnly is
+	// never consulted for behavior. Richer routing (smell trails, blood) lands in later phases.
+	switch (Event.Type)
+	{
+		case EATR_StimulusType::Noise:
+		case EATR_StimulusType::DoorImpact:
+		case EATR_StimulusType::WindowImpact:
+		case EATR_StimulusType::Combat:
+		case EATR_StimulusType::Scripted:
+			ReportEchoHeardLocation(EchoId, Event.Location, Event.Strength, Event.TimeSeconds);
+			break;
+
+		case EATR_StimulusType::Smell:
+			State->Awareness.LastSmelledLocation = Event.Location;
+			State->Awareness.LastSmelledTime     = Event.TimeSeconds;
+			break;
+
+		case EATR_StimulusType::Blood:
+		case EATR_StimulusType::EchoAgitation:
+			// Agitation contribution — fully modeled in Phase 8. Bump local agitation now.
+			State->Agitation = FMath::Min(State->Agitation + FMath::Max(Event.Strength, 0.f), 1.f);
+			break;
+	}
+
+	State->LastUpdateTime = Event.TimeSeconds;
+}
+
 bool UATR_EchoSubsystem::PromoteToActive(int32 SoAIndex, AATR_ActiveEcho* Actor)
 {
 	if (!ensureAlways(Actor && SoAIndex >= 0 && SoAIndex < ActiveEntities)) return false;
