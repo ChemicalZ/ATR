@@ -5,6 +5,7 @@
 #include "ATR_EchoReplicationComponent.h"
 #include "ATR_ActiveEcho.h"
 #include "AI/ATR_EchoAIController.h"
+#include "AI/ATR_EchoAILog.h"
 #include "ATR_EchoSettings.h"
 #include "Engine/World.h"
 #include "Async/ParallelFor.h"
@@ -177,6 +178,13 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	Yaws.SetNumZeroed(InitializeCount);
 	DirtyStates.SetNumZeroed(InitializeCount);
 	IndexToActor.SetNumZeroed(InitializeCount); // all nullptr
+
+	// Canonical runtime state (Phase 1) — parallel to the SoA arrays above.
+	// EchoIds default to INDEX_NONE for unused rows; RuntimeStates default-construct.
+	EchoIds.Init(INDEX_NONE, InitializeCount);
+	RuntimeStates.SetNum(InitializeCount);
+	EchoIdToIndex.Reserve(InitializeCount);
+	NextEchoId = 1;
 	CoarseCellIds.Init(INDEX_NONE, InitializeCount);
 	CoarseSlotInCell.Init(INDEX_NONE, InitializeCount);
 	ClientRelevantEchoMask.Init(false, InitializeCount);
@@ -503,6 +511,14 @@ int32 UATR_EchoSubsystem::AddEcho(FVector3f Position)
 	CoarseSlotInCell[Idx] = INDEX_NONE;
 	LocalVisitStamp[Idx]  = 0;
 
+	// Assign a fresh stable EchoId and seed canonical runtime state for this row.
+	const int32 NewEchoId = NextEchoId++;
+	EchoIds[Idx] = NewEchoId;
+	RuntimeStates[Idx].ResetForReuse(NewEchoId);
+	RuntimeStates[Idx].Location = FVector(Position);
+	RuntimeStates[Idx].Tier     = EATR_EchoSimulationTier::Abstract;
+	EchoIdToIndex.Add(NewEchoId, Idx);
+
 	if (CoarseGrid.IsInitialized())
 		RegisterEntityToCoarseGrid(Idx);
 
@@ -523,6 +539,9 @@ void UATR_EchoSubsystem::RemoveEcho(int32 Index)
 
 	// Remove entity from coarse grid before its slot is reused.
 	UnregisterEntityFromCoarseGrid(Index);
+
+	// Capture the stable EchoId being removed before any swap overwrites the row.
+	const int32 RemovedEchoId = EchoIds.IsValidIndex(Index) ? EchoIds[Index] : INDEX_NONE;
 
 	const int32 Last = ActiveEntities - 1; // capture before decrement
 
@@ -561,6 +580,15 @@ void UATR_EchoSubsystem::RemoveEcho(int32 Index)
 		CoarseSlotInCell[Index] = OldLastCoarseSlot;
 		LocalVisitStamp[Index]  = LocalVisitStamp[Last];
 
+		// Move canonical identity + runtime state from Last into the vacated row and
+		// repoint the moved EchoId at its new SoA index.
+		EchoIds[Index]       = EchoIds[Last];
+		RuntimeStates[Index] = MoveTemp(RuntimeStates[Last]);
+		if (EchoIds[Index] != INDEX_NONE)
+			EchoIdToIndex[EchoIds[Index]] = Index;
+		EchoIds[Last] = INDEX_NONE;
+		RuntimeStates[Last] = FATR_EchoRuntimeState{};
+
 		// Patch the coarse bucket: the slot still holds Last; relabel it to Index.
 		if (OldLastCoarseCell != INDEX_NONE)
 			CoarseGrid.ReplaceEntityAtSlot(OldLastCoarseCell, OldLastCoarseSlot, Last, Index);
@@ -583,8 +611,67 @@ void UATR_EchoSubsystem::RemoveEcho(int32 Index)
 				PromotedIndices[PIIdx] = Index;
 		}
 	}
+	else
+	{
+		// Removing the tail row outright — clear its canonical identity/state.
+		EchoIds[Index]      = INDEX_NONE;
+		RuntimeStates[Index] = FATR_EchoRuntimeState{};
+	}
+
+	// Drop the removed EchoId from the lookup map. Done after the swap so the moved
+	// entity's (different) id has already been repointed above.
+	if (RemovedEchoId != INDEX_NONE)
+		EchoIdToIndex.Remove(RemovedEchoId);
 
 	--ActiveEntities; // decrement last — helpers above need the valid range
+}
+
+// ─── Canonical Runtime State (Phase 1) ───────────────────────────────────────
+
+FATR_EchoRuntimeState* UATR_EchoSubsystem::GetMutableEchoState(int32 EchoId)
+{
+	const int32 Index = GetIndexForEchoId(EchoId);
+	return RuntimeStates.IsValidIndex(Index) ? &RuntimeStates[Index] : nullptr;
+}
+
+const FATR_EchoRuntimeState* UATR_EchoSubsystem::GetEchoState(int32 EchoId) const
+{
+	const int32 Index = GetIndexForEchoId(EchoId);
+	return RuntimeStates.IsValidIndex(Index) ? &RuntimeStates[Index] : nullptr;
+}
+
+void UATR_EchoSubsystem::RegisterActiveEcho(int32 EchoId, AATR_EchoAIController* Controller, APawn* Pawn)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_RegisterActiveEcho);
+
+	FATR_EchoRuntimeState* State = GetMutableEchoState(EchoId);
+	if (!ensureAlways(State))
+	{
+		UE_LOG(LogATR_EchoAI, Warning, TEXT("RegisterActiveEcho — no runtime state for EchoId %d"), EchoId);
+		return;
+	}
+
+	State->Tier             = EATR_EchoSimulationTier::Active;
+	State->ActiveController  = Controller;
+	State->ActivePawn        = Pawn;
+
+	UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("RegisterActiveEcho — EchoId %d → %s"),
+		EchoId, Controller ? *Controller->GetName() : TEXT("null"));
+}
+
+void UATR_EchoSubsystem::UnregisterActiveEcho(int32 EchoId)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_UnregisterActiveEcho);
+
+	FATR_EchoRuntimeState* State = GetMutableEchoState(EchoId);
+	if (!State) return; // already gone (e.g. echo destroyed) — nothing to sever
+
+	// Keep canonical awareness/intent/search; only drop the active bridge + tier.
+	State->Tier            = EATR_EchoSimulationTier::LowDetail;
+	State->ActiveController = nullptr;
+	State->ActivePawn       = nullptr;
+
+	UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("UnregisterActiveEcho — EchoId %d"), EchoId);
 }
 
 bool UATR_EchoSubsystem::PromoteToActive(int32 SoAIndex, AATR_ActiveEcho* Actor)
@@ -635,6 +722,11 @@ AATR_ActiveEcho* UATR_EchoSubsystem::PromoteEcho(int32 SoAIndex)
 	}
 
 	PromotedIndices.Add(SoAIndex);
+
+	// Wire the canonical-state bridge and flip tier to Active before the controller wakes,
+	// so OnPossess (and later-phase intent reads) can resolve this Echo's runtime state.
+	RegisterActiveEcho(GetEchoIdForIndex(SoAIndex), Controller, Actor);
+
 	Actor->InitFromSoA(this, SoAIndex);  // teleport to SoA position + seed velocity first
 	Controller->Possess(Actor);          // OnPossess → AI wakes at correct world position
 	return Actor;
@@ -648,7 +740,14 @@ void UATR_EchoSubsystem::DemoteEcho(AATR_ActiveEcho* Actor)
 	if (!ensureAlways(SoAIndex >= 0 && SoAIndex < ActiveEntities)) return;
 	if (!ensureAlways(IndexToActor[SoAIndex] == Actor)) return;
 
+	// Resolve the stable EchoId before DemoteToHorde clears SourceIndex.
+	const int32 EchoId = GetEchoIdForIndex(SoAIndex);
+
 	AATR_EchoAIController* Controller = Cast<AATR_EchoAIController>(Actor->GetController());
+
+	// Sever the canonical-state bridge and drop tier back to LowDetail. Canonical
+	// awareness/intent/search remain in RuntimeStates so memory survives demotion.
+	UnregisterActiveEcho(EchoId);
 
 	DemoteToHorde(Actor);  // WriteBackToSoA + coarse grid update + clear IndexToActor + SourceIndex
 

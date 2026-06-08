@@ -73,5 +73,8 @@ private:
 	AActor* SelectBestTarget() const;
 
 	// Last selected target. Weak so destroyed actors clear automatically.
+	// TRANSITIONAL (Phase 1): this is controller-owned canonical target state. It will be
+	// superseded by subsystem-owned FATR_EchoRuntimeState awareness/intent in Phases 2–4
+	// and removed in the final cleanup pass. Do not build new behavior on it.
 	TWeakObjectPtr<AActor> CurrentTarget;
 };

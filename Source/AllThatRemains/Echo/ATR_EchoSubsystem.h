@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Containers/BitArray.h"
 #include "Subsystems/WorldSubsystem.h"
+#include "ATR_EchoRuntimeTypes.h"
 #include "ATR_EchoSubsystem.generated.h"
 
 class UATR_EchoReplicationComponent;
@@ -247,6 +248,49 @@ public:
 	TArray<float>         Yaws;           // degrees [0, 360) — facing direction per entity
 	TArray<FEchoDirtyState> DirtyStates;
 	int32             ActiveEntities = 0;
+
+	// --- Canonical runtime state (Phase 1) ---
+	// Stable identity layer. The SoA index is NOT stable (RemoveEcho swap-removes and
+	// relabels rows), so canonical intelligence is keyed by a monotonic EchoId instead.
+	//
+	//   EchoIds[i]        : stable EchoId of the entity currently at SoA row i.
+	//   RuntimeStates[i]  : canonical state of the entity at SoA row i (moves with the row).
+	//   EchoIdToIndex     : EchoId → current SoA row, for O(1) lookup by id.
+	//
+	// EchoIds/RuntimeStates are parallel to Positions and are moved alongside it during
+	// AddEcho / RemoveEcho swap-remove. EchoId 0 is reserved as invalid.
+	TArray<int32>                 EchoIds;
+	TArray<FATR_EchoRuntimeState> RuntimeStates;
+	TMap<int32, int32>            EchoIdToIndex;
+	int32                         NextEchoId = 1;
+
+	// EchoId ⇄ SoA index helpers. Return INDEX_NONE / nullptr on a stale or unknown id.
+	int32 GetEchoIdForIndex(int32 Index) const
+	{
+		return EchoIds.IsValidIndex(Index) ? EchoIds[Index] : INDEX_NONE;
+	}
+	int32 GetIndexForEchoId(int32 EchoId) const
+	{
+		const int32* Found = EchoIdToIndex.Find(EchoId);
+		return Found ? *Found : INDEX_NONE;
+	}
+
+	// Canonical state access by stable EchoId. Mutable variant for the active layer to
+	// write facts/intent; const variant for read-only consumers. nullptr if id is stale.
+	FATR_EchoRuntimeState*       GetMutableEchoState(int32 EchoId);
+	const FATR_EchoRuntimeState* GetEchoState(int32 EchoId) const;
+
+	// Fast index-based accessors for hot subsystem-internal paths that already hold a row.
+	FATR_EchoRuntimeState*       GetMutableEchoStateByIndex(int32 Index)
+	{
+		return RuntimeStates.IsValidIndex(Index) ? &RuntimeStates[Index] : nullptr;
+	}
+
+	// Active-layer registration. Called on promotion/demotion to wire (or sever) the
+	// controller/pawn bridge and flip the simulation tier. Does not change behavior in
+	// Phase 1 — it only records the bridge and tier.
+	void RegisterActiveEcho(int32 EchoId, AATR_EchoAIController* Controller, APawn* Pawn);
+	void UnregisterActiveEcho(int32 EchoId);
 
 	// --- Public API ---
 
