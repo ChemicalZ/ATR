@@ -1405,6 +1405,14 @@ void UATR_EchoSubsystem::RunPromotionPass()
 		// StateTree interruptibility guard
 		if (Actor->bBlockDemotion) continue;
 
+		// Urgency guard (Phase 11): don't yank an Echo that currently sees its target — keep
+		// the full actor while it is actively chasing, even near the demotion ring.
+		if (const FATR_EchoRuntimeState* RS = GetMutableEchoStateByIndex(i))
+		{
+			if (RS->Awareness.bHasCurrentLineOfSight)
+				continue;
+		}
+
 		// Demotion requires entity to be beyond DemoteRadius from ALL players
 		bool bAnyClose = false;
 		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
@@ -1457,7 +1465,25 @@ void UATR_EchoSubsystem::RunSteeringPass()
 			if (DistSq <= BestSq) { BestSq = DistSq; BestPlayerIndex = PlayerIndex; }
 		}
 
-		if (BestPlayerIndex == INDEX_NONE) return;
+		if (BestPlayerIndex == INDEX_NONE)
+		{
+			// No player within MustPromoteRadius → low-detail horde migration (Phase 11).
+			// Sample the indirect agitation field and drift toward pressure. This is how
+			// far/non-active echoes react to gunshots, combat, and seeing-echoes without any
+			// AIController/perception — cell-level pressure becomes population movement.
+			float   FieldAgit = 0.f;
+			FVector FieldDir   = FVector::ZeroVector;
+			SampleAgitationField(FVector(Positions[EntityIndex]), FieldAgit, FieldDir);
+
+			if (FieldAgit >= HordeCuriosityThreshold && !FieldDir.IsNearlyZero())
+			{
+				const FVector3f Dir = FVector3f(FieldDir.GetSafeNormal2D());
+				Velocities[EntityIndex] = Dir * (HordeWalkSpeed * FMath::Clamp(FieldAgit, 0.f, 1.f));
+				Yaws[EntityIndex]       = FMath::RadiansToDegrees(FMath::Atan2(Dir.Y, Dir.X));
+				MarkEchoDirty(EntityIndex, EEchoDirtyFlags::Transform);
+			}
+			return;
+		}
 
 		FVector3f Dir = PlayerPositions[BestPlayerIndex] - Positions[EntityIndex];
 		Dir.Z = 0.f;
