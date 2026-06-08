@@ -825,7 +825,127 @@ void UATR_EchoSubsystem::ReportEchoMoveResult(int32 EchoId, bool bSuccess, EATR_
 		EchoId, bSuccess ? TEXT("success") : TEXT("FAIL"), static_cast<int32>(Reason));
 }
 
-// ─── Intent Selection (Phase 3) ──────────────────────────────────────────────
+// ─── Intent Selection (Phase 3) + Lost-Sight Search (Phase 6) ────────────────
+
+namespace
+{
+	// Deterministic per-Echo [0,1) hash. Stable across frames (keyed by EchoId), so each
+	// Echo searches with its own consistent variation instead of identical robotic paths.
+	float EchoHash01(int32 EchoId, uint32 Salt)
+	{
+		uint32 H = static_cast<uint32>(EchoId) * 2654435761u + Salt * 40503u;
+		H ^= H >> 13; H *= 0x85ebca6bu; H ^= H >> 16;
+		return static_cast<float>(H & 0x00FFFFFFu) / static_cast<float>(0x01000000u);
+	}
+
+	// Begin a fresh lost-sight search anchored at the last-seen location, biased along the
+	// target's last-known travel direction with per-Echo angular/radius/duration variation.
+	// The search radius is derived from a CLAMPED velocity projection so prediction can never
+	// be supernatural (ProjectionSeconds * speed, capped at MaxProjectionDistance).
+	void BeginEchoSearch(FATR_EchoRuntimeState& State, float Now, float ProjectionSeconds, float MaxProjectionDistance)
+	{
+		FATR_EchoAwarenessState& A = State.Awareness;
+		FATR_EchoSearchState&    S = State.Search;
+
+		FVector Dir = A.LastSeenVelocity.GetSafeNormal2D();
+		if (Dir.IsNearlyZero()) Dir = State.FacingDirection.GetSafeNormal2D();
+		if (Dir.IsNearlyZero()) Dir = FVector::ForwardVector;
+
+		// Per-Echo angular jitter (+/- 20deg) so a group fans out instead of stacking.
+		const float JitterDeg = (EchoHash01(State.EchoId, 1) - 0.5f) * 40.f;
+		Dir = Dir.RotateAngleAxis(JitterDeg, FVector::UpVector);
+
+		const float Lead = FMath::Clamp(A.LastSeenVelocity.Size2D() * ProjectionSeconds, 300.f, MaxProjectionDistance);
+
+		S.bSearchActive    = true;
+		S.Origin           = A.LastSeenLocation;
+		S.PrimaryDirection = Dir;
+		S.SearchStepIndex  = 0;
+		S.StartedTime      = Now;
+		// Aggressive echoes sweep wider and persist longer.
+		S.SearchRadius      = Lead * (0.8f + 0.6f * EchoHash01(State.EchoId, 2) + 0.3f * State.Aggression);
+		S.MaxSearchDuration = 12.f * (0.7f + 0.6f * EchoHash01(State.EchoId, 3) + 0.3f * State.Aggression);
+	}
+
+	// Compute the world point for the current search step. Returns false once the fan
+	// pattern is exhausted. Pattern mirrors the design doc (forward probe, then widening
+	// left/right fan), scaled by the Echo's varied SearchRadius.
+	bool ComputeEchoSearchPoint(const FATR_EchoRuntimeState& State, FVector& OutPoint)
+	{
+		// {forward, side} multipliers of SearchRadius. Index 0 = projected direction.
+		static const FVector2f Pattern[] = {
+			FVector2f(1.0f,  0.0f),
+			FVector2f(0.7f,  0.6f),
+			FVector2f(0.7f, -0.6f),
+			FVector2f(1.4f,  1.0f),
+			FVector2f(1.4f, -1.0f),
+		};
+		const int32 N = UE_ARRAY_COUNT(Pattern);
+
+		const FATR_EchoSearchState& S = State.Search;
+		if (S.SearchStepIndex < 0 || S.SearchStepIndex >= N) return false;
+
+		const FVector Fwd   = S.PrimaryDirection.GetSafeNormal2D();
+		const FVector Right = FVector::CrossProduct(FVector::UpVector, Fwd).GetSafeNormal();
+		const FVector2f P   = Pattern[S.SearchStepIndex];
+
+		OutPoint = S.Origin + Fwd * (P.X * S.SearchRadius) + Right * (P.Y * S.SearchRadius);
+		return true;
+	}
+
+	// Drive the lost-sight memory → projected → fan progression. Returns true and fills
+	// OutIntent/OutMove while a search step is active; returns false (and zeroes confidence)
+	// once the search is exhausted or times out, letting lower-priority drivers take over.
+	bool AdvanceLostSightSearch(FATR_EchoRuntimeState& State, float Now, float ReachRadius,
+	                            float ProjectionSeconds, float MaxProjectionDistance,
+	                            EATR_EchoIntent& OutIntent, FATR_EchoMoveRequest& OutMove)
+	{
+		FATR_EchoAwarenessState& A = State.Awareness;
+		FATR_EchoSearchState&    S = State.Search;
+
+		// First, walk to the last-seen location before any directional search begins.
+		if (!S.bSearchActive)
+		{
+			if (FVector::Dist(State.Location, A.LastSeenLocation) > ReachRadius)
+			{
+				OutIntent            = EATR_EchoIntent::ChaseLastSeenLocation;
+				OutMove.Type         = EATR_EchoMoveTargetType::Location;
+				OutMove.Location     = A.LastSeenLocation;
+				OutMove.AcceptanceRadius = ReachRadius;
+				return true;
+			}
+			BeginEchoSearch(State, Now, ProjectionSeconds, MaxProjectionDistance);
+		}
+
+		const bool bExpired = (Now - S.StartedTime) > S.MaxSearchDuration;
+
+		FVector Point;
+		bool bHaveStep = ComputeEchoSearchPoint(State, Point);
+
+		// Advance to the next fan point once the current one is reached.
+		if (!bExpired && bHaveStep && FVector::Dist(State.Location, Point) <= ReachRadius)
+		{
+			++S.SearchStepIndex;
+			bHaveStep = ComputeEchoSearchPoint(State, Point);
+		}
+
+		if (bExpired || !bHaveStep)
+		{
+			S.bSearchActive = false;
+			A.Confidence    = 0.f;                       // exhausted — fall through to idle/wander/horde
+			A.Mode          = EATR_AwarenessMode::None;
+			return false;
+		}
+
+		A.ProjectedSearchLocation = Point;
+		OutIntent            = (S.SearchStepIndex == 0) ? EATR_EchoIntent::SearchProjectedDirection
+		                                                : EATR_EchoIntent::FanSearchArea;
+		OutMove.Type         = EATR_EchoMoveTargetType::Location;
+		OutMove.Location     = Point;
+		OutMove.AcceptanceRadius = ReachRadius;
+		return true;
+	}
+}
 
 void UATR_EchoSubsystem::RunIntentPass(float DeltaTime)
 {
@@ -873,8 +993,16 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 	FATR_EchoMoveRequest Move; // defaults to Type=None — no accidental origin move
 
 	const bool bHeardRecent = (A.LastHeardTime >= 0.f) && (Now - A.LastHeardTime <= HeardMemorySeconds);
+	const bool bSeeing      = A.bHasCurrentLineOfSight && A.ConfirmedVisibleActor.IsValid();
 
-	if (A.bHasCurrentLineOfSight && A.ConfirmedVisibleActor.IsValid())
+	// Run the lost-sight search machine first. It may set NewIntent/Move (active search) or
+	// exhaust and zero confidence so lower-priority drivers below take over this same tick.
+	bool bSearchProducedIntent = false;
+	if (!bSeeing && A.Confidence > LostSightMemoryThreshold)
+		bSearchProducedIntent = AdvanceLostSightSearch(State, Now, ReachLocationRadius,
+			SightProjectionSeconds, MaxSightProjectionDistance, NewIntent, Move);
+
+	if (bSeeing)
 	{
 		// Confirmed visible → chase the actor itself.
 		NewIntent           = EATR_EchoIntent::ChaseVisibleActor;
@@ -883,44 +1011,9 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 		Move.AcceptanceRadius = ReachLocationRadius;
 		S.bSearchActive     = false; // reacquired — abandon any search
 	}
-	else if (A.Confidence > LostSightMemoryThreshold)
+	else if (bSearchProducedIntent)
 	{
-		// Lost sight, memory still warm → memory/search progression.
-		const float DistLastSeen = FVector::Dist(State.Location, A.LastSeenLocation);
-		if (!S.bSearchActive && DistLastSeen > ReachLocationRadius)
-		{
-			NewIntent           = EATR_EchoIntent::ChaseLastSeenLocation;
-			Move.Type           = EATR_EchoMoveTargetType::Location;
-			Move.Location       = A.LastSeenLocation;
-			Move.AcceptanceRadius = ReachLocationRadius;
-		}
-		else
-		{
-			// Arrived at last-seen (or already searching) → projected-direction / fan search.
-			if (!S.bSearchActive)
-			{
-				S.bSearchActive = true;
-				S.Origin        = A.LastSeenLocation;
-				FVector Dir     = A.LastSeenVelocity.GetSafeNormal2D();
-				if (Dir.IsNearlyZero()) Dir = State.FacingDirection.GetSafeNormal2D();
-				if (Dir.IsNearlyZero()) Dir = FVector::ForwardVector;
-				S.PrimaryDirection = Dir;
-				S.StartedTime      = Now;
-				S.SearchStepIndex  = 0;
-			}
-
-			// Phase 3 uses a single clamped projected point. Phase 6 replaces this with the
-			// stepped fan-search generator and per-Echo variation.
-			const float Lead = FMath::Min(A.LastSeenVelocity.Size() * SightProjectionSeconds, MaxSightProjectionDistance);
-			const FVector Projected = S.Origin + S.PrimaryDirection * FMath::Max(Lead, S.SearchRadius);
-			A.ProjectedSearchLocation = Projected;
-
-			NewIntent           = (S.SearchStepIndex == 0) ? EATR_EchoIntent::SearchProjectedDirection
-			                                               : EATR_EchoIntent::FanSearchArea;
-			Move.Type           = EATR_EchoMoveTargetType::Location;
-			Move.Location       = Projected;
-			Move.AcceptanceRadius = ReachLocationRadius;
-		}
+		// NewIntent / Move already populated by AdvanceLostSightSearch.
 	}
 	else if (bHeardRecent)
 	{
