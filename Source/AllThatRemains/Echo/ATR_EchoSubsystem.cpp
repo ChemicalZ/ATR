@@ -229,6 +229,19 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	AgitationFieldDecayPerSec  = Settings->AgitationFieldDecayPerSecond;
 	HordeCuriosityThreshold    = Settings->HordeCuriosityThreshold;
 
+	// Field diffusion + gradient shaping (mirrors of Echo|Agitation).
+	bEnableAgitationDiffusion   = Settings->bEnableAgitationDiffusion;
+	AgitationDiffusionRate      = Settings->AgitationDiffusionRate;
+	AgitationGradientWeight     = Settings->AgitationGradientWeight;
+	HordeDirectionJitterDegrees = Settings->HordeDirectionJitterDegrees;
+
+	// Crowd shaping (mirrors of Echo|HordeShaping).
+	bEnableHordeSeparation      = Settings->bEnableHordeSeparation;
+	HordeSeparationRadius       = Settings->HordeSeparationRadius;
+	HordeSeparationStrength     = Settings->HordeSeparationStrength;
+	HordeApproachJitterDegrees  = Settings->HordeApproachJitterDegrees;
+	HordeSeparationMaxNeighbors = Settings->HordeSeparationMaxNeighbors;
+
 	PromotedIndices.Reserve(PoolSize);
 	LocalEntityScratch.Reserve(256);
 	LastLocalEntityScratch.Reserve(512);
@@ -334,6 +347,7 @@ void UATR_EchoSubsystem::Tick(float DeltaTime)
 		RebuildFineGrid();
 		RunSteeringPass();
 		RunPromotionPass();
+		DiffuseAgitationField(DeltaTime);
 		DecayAgitationField(DeltaTime);
 		RunIntentPass(DeltaTime);
 
@@ -1035,6 +1049,62 @@ void UATR_EchoSubsystem::AddWorldAgitation(const FVector& Location, float Amount
 	Cell.LastUpdatedTime   = Now;
 }
 
+void UATR_EchoSubsystem::DiffuseAgitationField(float DeltaTime)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_DiffuseAgitationField);
+
+	if (!bEnableAgitationDiffusion || AgitationDiffusionRate <= 0.f || AgitationField.IsEmpty())
+		return;
+
+	// Per-tick spread fraction. Scaled by DeltaTime for framerate independence and clamped well
+	// below the explicit-diffusion stability limit. Each agitated cell donates this fraction of its
+	// pressure to its 8 neighbours (mass-conserving), so a deposit smears into a smooth multi-cell
+	// gradient over a second or two instead of staying a single hard-edged stamp.
+	const float Spread = FMath::Clamp(AgitationDiffusionRate * DeltaTime, 0.f, 0.6f);
+	if (Spread <= KINDA_SMALL_NUMBER) return;
+
+	// 8-neighbour offsets — Moore neighbourhood is more isotropic than 4-neighbour, which helps
+	// break the axis-aligned (grid-line) look.
+	static const FIntPoint Neighbours[8] = {
+		{ 1, 0}, {-1, 0}, {0, 1}, {0,-1}, {1, 1}, {1,-1}, {-1, 1}, {-1,-1}
+	};
+
+	// Gather net deltas first so the pass is order-independent (no half-updated reads).
+	struct FDelta { float Agit = 0.f; FVector Dir = FVector::ZeroVector; };
+	TMap<FIntPoint, FDelta> Deltas;
+	Deltas.Reserve(AgitationField.Num() * 2);
+
+	for (const TPair<FIntPoint, FATR_AgitationCell>& Pair : AgitationField)
+	{
+		const FATR_AgitationCell& Cell = Pair.Value;
+		if (Cell.Agitation <= KINDA_SMALL_NUMBER) continue;
+
+		const float   OutAgit = Cell.Agitation * Spread;
+		const FVector OutDir  = Cell.WeightedDirection * Spread;
+		const float   PerNbrA = OutAgit / 8.f;
+		const FVector PerNbrD = OutDir  / 8.f;
+
+		FDelta& Self = Deltas.FindOrAdd(Pair.Key);
+		Self.Agit -= OutAgit;
+		Self.Dir  -= OutDir;
+
+		for (const FIntPoint& N : Neighbours)
+		{
+			FDelta& D = Deltas.FindOrAdd(FIntPoint(Pair.Key.X + N.X, Pair.Key.Y + N.Y));
+			D.Agit += PerNbrA;
+			D.Dir  += PerNbrD;
+		}
+	}
+
+	// Apply. Neighbours that did not exist are created here; fully-empty ones get pruned in decay.
+	for (const TPair<FIntPoint, FDelta>& D : Deltas)
+	{
+		FATR_AgitationCell& Cell = AgitationField.FindOrAdd(D.Key);
+		Cell.Agitation        = FMath::Clamp(Cell.Agitation + D.Value.Agit, 0.f, 1.f);
+		Cell.WeightedDirection += D.Value.Dir;
+	}
+}
+
 void UATR_EchoSubsystem::DecayAgitationField(float DeltaTime)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_DecayAgitationField);
@@ -1059,23 +1129,59 @@ void UATR_EchoSubsystem::SampleAgitationField(const FVector& Location, float& Ou
 
 	if (AgitationField.IsEmpty()) return;
 
-	// Blend the 3x3 neighborhood so pressure spreads smoothly across cell borders. The center
-	// cell dominates; neighbors contribute toward the edge so groups drift toward hotspots.
-	const FIntPoint Center = AgitationCellKey(Location);
-	FVector AccumDir = FVector::ZeroVector;
+	const float CS = FMath::Max(1.f, AgitationCellSize);
 
-	for (int32 dy = -1; dy <= 1; ++dy)
-	for (int32 dx = -1; dx <= 1; ++dx)
+	// Bilinearly interpolate the scalar field at an arbitrary world point. Sampling in cell-CENTRE
+	// space (offset by 0.5 cells) means a continuous, non-quantised value — no hard cell edges.
+	auto ScalarAt = [this, CS](double WX, double WY) -> float
 	{
-		const FATR_AgitationCell* Cell = AgitationField.Find(FIntPoint(Center.X + dx, Center.Y + dy));
-		if (!Cell || Cell->Agitation <= 0.f) continue;
+		const double Cx = WX / CS - 0.5;
+		const double Cy = WY / CS - 0.5;
+		const int32 X0 = FMath::FloorToInt(Cx);
+		const int32 Y0 = FMath::FloorToInt(Cy);
+		const float Tx = (float)(Cx - X0);
+		const float Ty = (float)(Cy - Y0);
 
-		const float Weight = (dx == 0 && dy == 0) ? 1.f : 0.5f;
-		OutAgitation = FMath::Max(OutAgitation, Cell->Agitation * Weight);
-		AccumDir    += Cell->WeightedDirection * Weight;
-	}
+		auto A = [this](int32 GX, int32 GY) -> float
+		{
+			const FATR_AgitationCell* C = AgitationField.Find(FIntPoint(GX, GY));
+			return C ? C->Agitation : 0.f;
+		};
 
-	OutDirection = AccumDir.GetSafeNormal2D();
+		const float A00 = A(X0,   Y0);
+		const float A10 = A(X0+1, Y0);
+		const float A01 = A(X0,   Y0+1);
+		const float A11 = A(X0+1, Y0+1);
+		const float Bottom = FMath::Lerp(A00, A10, Tx);
+		const float Top    = FMath::Lerp(A01, A11, Tx);
+		return FMath::Lerp(Bottom, Top, Ty);
+	};
+
+	OutAgitation = ScalarAt(Location.X, Location.Y);
+
+	// Gradient of the smooth scalar field via central differences (points toward higher pressure,
+	// i.e. up the slope toward the hotspot). This is the primary movement direction.
+	const float R = ScalarAt(Location.X + CS, Location.Y);
+	const float L = ScalarAt(Location.X - CS, Location.Y);
+	const float U = ScalarAt(Location.X, Location.Y + CS);
+	const float D = ScalarAt(Location.X, Location.Y - CS);
+	const FVector Gradient = FVector(R - L, U - D, 0.0).GetSafeNormal2D();
+
+	// Deposited direction (the "which way did the threat go" hint), sampled from the centre cell.
+	const FVector Deposited = [this, &Location]() -> FVector
+	{
+		const FATR_AgitationCell* C = AgitationField.Find(AgitationCellKey(Location));
+		return C ? C->WeightedDirection.GetSafeNormal2D() : FVector::ZeroVector;
+	}();
+
+	// Blend gradient (toward hotspot) with deposited direction. Falls back gracefully when either
+	// is zero so a lone deposit still produces a usable direction before diffusion fills in.
+	const float W = FMath::Clamp(AgitationGradientWeight, 0.f, 1.f);
+	FVector Blended = Gradient * W + Deposited * (1.f - W);
+	if (Blended.IsNearlyZero())
+		Blended = Gradient.IsNearlyZero() ? Deposited : Gradient;
+
+	OutDirection = Blended.GetSafeNormal2D();
 }
 
 // ─── Intent Selection + Lost-Sight Search ────────────────────────────────────
@@ -1968,6 +2074,16 @@ void UATR_EchoSubsystem::RunPromotionPass()
 
 // ─── RunSteeringPass ──────────────────────────────────────────────────────────
 
+namespace
+{
+	// Rotate a 2D vector by an angle (radians).
+	FORCEINLINE FVector2f ATR_RotateVec2(const FVector2f& V, float AngleRad)
+	{
+		const float C = FMath::Cos(AngleRad), S = FMath::Sin(AngleRad);
+		return FVector2f(V.X * C - V.Y * S, V.X * S + V.Y * C);
+	}
+}
+
 void UATR_EchoSubsystem::RunSteeringPass()
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_RunSteeringPass);
@@ -1986,52 +2102,111 @@ void UATR_EchoSubsystem::RunSteeringPass()
 
 	const float MustPromoteSq = MustPromoteRadius * MustPromoteRadius;
 
-	// Single pass over all local entities — each entity steers toward its nearest player within
-	// MustPromoteRadius. Avoids last-player-wins when multiple players' zones overlap.
-	ParallelFor(LocalEntityScratch.Num(), [this, &PlayerPositions, MustPromoteSq](int32 LocalIdx)
+	// Crowd-shaping params, read-only inside the parallel body.
+	const bool  bSep        = bEnableHordeSeparation && HordeSeparationRadius > 1.f && SpatialGrid.IsInitialized();
+	const float SepR        = HordeSeparationRadius;
+	const float SepR2       = SepR * SepR;
+	const float SepStrength = HordeSeparationStrength;
+	const int32 SepMaxN     = FMath::Max(1, HordeSeparationMaxNeighbors);
+	const float ApproachJit = FMath::DegreesToRadians(HordeApproachJitterDegrees);
+	const float FlowJit     = FMath::DegreesToRadians(HordeDirectionJitterDegrees);
+
+	// Single pass over all local entities — each steers toward its nearest player within
+	// MustPromoteRadius (with jitter + separation so they don't pack into a perfect ring), or
+	// drifts on the diffused agitation field otherwise.
+	ParallelFor(LocalEntityScratch.Num(), [&](int32 LocalIdx)
 	{
 		const int32 EntityIndex = LocalEntityScratch[LocalIdx];
 		if (IndexToActor[EntityIndex]) return;
 
+		const FVector3f Pi = Positions[EntityIndex];
+
+		// Short-range separation: sum of away-from-neighbour * (1 - dist/R) over nearby echoes.
+		// Allocation-free — walks the fine-grid cells overlapping the separation box.
+		FVector2f Sep(0.f, 0.f);
+		if (bSep)
+		{
+			int32 Count = 0;
+			const FVector2D Mn(Pi.X - SepR, Pi.Y - SepR);
+			const FVector2D Mx(Pi.X + SepR, Pi.Y + SepR);
+			SpatialGrid.ForEachInBounds(Mn, Mx, [&](int32 j)
+			{
+				if (j == EntityIndex || Count >= SepMaxN) return;
+				const FVector3f& Pj = Positions[j];
+				const float dx = Pi.X - Pj.X, dy = Pi.Y - Pj.Y;
+				const float d2 = dx * dx + dy * dy;
+				if (d2 > KINDA_SMALL_NUMBER && d2 < SepR2)
+				{
+					const float inv     = FMath::InvSqrt(d2);
+					const float falloff = 1.f - (d2 * inv) / SepR; // 1 - dist/R
+					Sep.X += dx * inv * falloff;
+					Sep.Y += dy * inv * falloff;
+					++Count;
+				}
+			});
+		}
+
+		const int32 EchoId = GetEchoIdForIndex(EntityIndex);
+
 		float BestSq          = MustPromoteSq;
 		int32 BestPlayerIndex = INDEX_NONE;
-
 		for (int32 PlayerIndex = 0; PlayerIndex < PlayerPositions.Num(); ++PlayerIndex)
 		{
-			const FVector3f Delta  = PlayerPositions[PlayerIndex] - Positions[EntityIndex];
+			const FVector3f Delta  = PlayerPositions[PlayerIndex] - Pi;
 			const float     DistSq = Delta.X * Delta.X + Delta.Y * Delta.Y;
 			if (DistSq <= BestSq) { BestSq = DistSq; BestPlayerIndex = PlayerIndex; }
 		}
 
 		if (BestPlayerIndex == INDEX_NONE)
 		{
-			// No player within MustPromoteRadius → low-detail horde migration.
-			// Sample the indirect agitation field and drift toward pressure. This is how
-			// far/non-active echoes react to gunshots, combat, and seeing-echoes without any
-			// AIController/perception — cell-level pressure becomes population movement.
+			// No player within MustPromoteRadius → drift on the (now smooth, diffused) field.
 			float   FieldAgit = 0.f;
-			FVector FieldDir   = FVector::ZeroVector;
-			SampleAgitationField(FVector(Positions[EntityIndex]), FieldAgit, FieldDir);
+			FVector FieldDir  = FVector::ZeroVector;
+			SampleAgitationField(FVector(Pi), FieldAgit, FieldDir);
 
-			if (FieldAgit >= HordeCuriosityThreshold && !FieldDir.IsNearlyZero())
+			const bool bHasFlow = (FieldAgit >= HordeCuriosityThreshold && !FieldDir.IsNearlyZero());
+			if (!bHasFlow && Sep.IsNearlyZero()) return; // genuinely idle → leave velocity as-is
+
+			FVector2f Steer(0.f, 0.f);
+			float Speed = 0.f;
+			if (bHasFlow)
 			{
-				const FVector3f Dir = FVector3f(FieldDir.GetSafeNormal2D());
-				Velocities[EntityIndex] = Dir * (HordeWalkSpeed * FMath::Clamp(FieldAgit, 0.f, 1.f));
-				Yaws[EntityIndex]       = FMath::RadiansToDegrees(FMath::Atan2(Dir.Y, Dir.X));
-				MarkEchoDirty(EntityIndex, EEchoDirtyFlags::Transform);
+				FVector2f Flow(FieldDir.X, FieldDir.Y);
+				Flow.Normalize();
+				if (FlowJit > 0.f)
+					Flow = ATR_RotateVec2(Flow, (EchoHash01(EchoId, 0xF10Du) * 2.f - 1.f) * FlowJit);
+				Steer += Flow;
+				Speed = HordeWalkSpeed * FMath::Clamp(FieldAgit, 0.f, 1.f);
 			}
+			Steer += Sep * SepStrength;
+			if (Steer.IsNearlyZero()) return;
+			Steer.Normalize();
+			if (Speed <= 0.f) Speed = HordeWalkSpeed * 0.35f; // gentle de-clumping when only separating
+
+			Velocities[EntityIndex] = FVector3f(Steer.X, Steer.Y, 0.f) * Speed;
+			Yaws[EntityIndex]       = FMath::RadiansToDegrees(FMath::Atan2(Steer.Y, Steer.X));
+			MarkEchoDirty(EntityIndex, EEchoDirtyFlags::Transform);
 			return;
 		}
 
-		FVector3f Dir = PlayerPositions[BestPlayerIndex] - Positions[EntityIndex];
-		Dir.Z = 0.f;
-
-		if (BestSq > KINDA_SMALL_NUMBER)
+		// A player is within MustPromoteRadius → seek, but with per-Echo jitter + separation so the
+		// crowd forms an organic mass instead of a perfect ring on the player's exact point.
+		FVector2f Seek(PlayerPositions[BestPlayerIndex].X - Pi.X, PlayerPositions[BestPlayerIndex].Y - Pi.Y);
+		if (Seek.IsNearlyZero() && Sep.IsNearlyZero()) return;
+		if (!Seek.IsNearlyZero())
 		{
-			Velocities[EntityIndex] = Dir * FMath::InvSqrt(BestSq) * HordeWalkSpeed;
-			Yaws[EntityIndex]       = FMath::RadiansToDegrees(FMath::Atan2(Dir.Y, Dir.X));
-			MarkEchoDirty(EntityIndex, EEchoDirtyFlags::Transform);
+			Seek.Normalize();
+			if (ApproachJit > 0.f)
+				Seek = ATR_RotateVec2(Seek, (EchoHash01(EchoId, 0x5EE6u) * 2.f - 1.f) * ApproachJit);
 		}
+
+		FVector2f Steer = Seek + Sep * SepStrength;
+		if (Steer.IsNearlyZero()) return;
+		Steer.Normalize();
+
+		Velocities[EntityIndex] = FVector3f(Steer.X, Steer.Y, 0.f) * HordeWalkSpeed;
+		Yaws[EntityIndex]       = FMath::RadiansToDegrees(FMath::Atan2(Steer.Y, Steer.X));
+		MarkEchoDirty(EntityIndex, EEchoDirtyFlags::Transform);
 	});
 }
 

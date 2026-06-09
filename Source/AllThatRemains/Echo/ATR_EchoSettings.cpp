@@ -112,6 +112,17 @@ void UATR_EchoSettings::ValidateAndClamp()
 	HordePressureMoveDistance            = FMath::Max(0.f, HordePressureMoveDistance);
 	HordePressureDirectionSmoothingAlpha = FMath::Clamp(HordePressureDirectionSmoothingAlpha, 0.f, 1.f);
 
+	// Field diffusion + gradient shaping
+	AgitationDiffusionRate      = FMath::Clamp(AgitationDiffusionRate, 0.f, 20.f);
+	AgitationGradientWeight     = FMath::Clamp(AgitationGradientWeight, 0.f, 1.f);
+	HordeDirectionJitterDegrees = FMath::Clamp(HordeDirectionJitterDegrees, 0.f, 180.f);
+
+	// Crowd shaping (separation + approach jitter)
+	HordeSeparationRadius       = FMath::Max(0.f, HordeSeparationRadius);
+	HordeSeparationStrength     = FMath::Clamp(HordeSeparationStrength, 0.f, 4.f);
+	HordeApproachJitterDegrees  = FMath::Clamp(HordeApproachJitterDegrees, 0.f, 180.f);
+	HordeSeparationMaxNeighbors = FMath::Clamp(HordeSeparationMaxNeighbors, 1, 64);
+
 	// Lower-tier simulation
 	LowDetailUpdateHz                = FMath::Clamp(LowDetailUpdateHz, 0.1f, 60.f);
 	AbstractUpdateHz                 = FMath::Clamp(AbstractUpdateHz, 0.1f, 60.f);

@@ -517,15 +517,36 @@ public:
 	float AgitationFieldDecayPerSec = 0.25f; // how fast deposited pressure fades
 	float HordeCuriosityThreshold   = 0.20f; // >= → TurnTowardStimulus (curious)
 
+	// Field-shaping mirrors (Echo|Agitation). Diffusion spreads pressure across cells so a smooth
+	// gradient forms; gradient-weighted sampling + per-Echo jitter break the grid-aligned/lockstep
+	// patterns. Mirrored from settings in Initialize.
+	bool  bEnableAgitationDiffusion   = true;
+	float AgitationDiffusionRate      = 3.0f;  // per-second spread fraction
+	float AgitationGradientWeight     = 0.75f; // 0 = deposited dir, 1 = pure scalar gradient
+	float HordeDirectionJitterDegrees = 25.f;  // per-Echo jitter on field-driven movement
+
+	// Crowd-shaping mirrors (Echo|HordeShaping). Separation + approach jitter so echoes form an
+	// organic mass instead of a perfect ring on the player's exact location.
+	bool  bEnableHordeSeparation     = true;
+	float HordeSeparationRadius      = 160.f;
+	float HordeSeparationStrength    = 0.85f;
+	float HordeApproachJitterDegrees = 20.f;
+	int32 HordeSeparationMaxNeighbors = 12;
+
 	// Deposit agitation at a world location with an optional pressure direction. Public so
 	// gameplay (gunshots, sprint noise, combat, scripted events) can drive the horde field.
 	void AddWorldAgitation(const FVector& Location, float Amount, const FVector& Direction);
 
+	// Spread agitation (and its weighted direction) into neighbouring cells so pressure forms a
+	// smooth multi-cell gradient instead of staying in the deposit cell. Runs once per server tick.
+	void DiffuseAgitationField(float DeltaTime);
+
 	// Decay + prune the agitation field. Runs once per server tick.
 	void DecayAgitationField(float DeltaTime);
 
-	// Sample the 3x3 neighborhood around a world location. Returns the blended agitation and
-	// a normalized pressure direction (zero if no meaningful pressure). Pure read.
+	// Sample the field at a world location with bilinear interpolation. Returns the interpolated
+	// agitation and a smooth movement direction that follows the pressure gradient (toward the
+	// hotspot), blended with the deposited direction by AgitationGradientWeight. Pure read.
 	void SampleAgitationField(const FVector& Location, float& OutAgitation, FVector& OutDirection) const;
 
 	FORCEINLINE FIntPoint AgitationCellKey(const FVector& Location) const

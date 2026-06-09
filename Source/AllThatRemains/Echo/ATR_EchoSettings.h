@@ -525,6 +525,50 @@ public:
 		ToolTip="Smoothing for an Echo's horde pressure direction. 1 = snap; lower = smoother turns."))
 	float HordePressureDirectionSmoothingAlpha = 0.5f;
 
+	// Field diffusion + gradient shaping. Spread pressure across cells and steer by the smooth
+	// pressure gradient (toward hotspots) instead of the raw deposited direction, so hordes react
+	// from a distance and movement isn't snapped to cell/grid lines.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(
+		ToolTip="Spread agitation into neighbouring cells every tick so pressure forms a smooth gradient instead of staying in the deposit cell. Turn OFF to see the old grid-locked behaviour."))
+	bool bEnableAgitationDiffusion = true;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="20.0",
+		ToolTip="How fast agitation propagates outward, in cells-worth of exchange per second. Higher = pressure reaches far echoes sooner and the 'doesn't leave the grid' look disappears. 0 disables spread."))
+	float AgitationDiffusionRate = 3.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Blend between steering up the smooth pressure gradient toward the hotspot (1.0) and the raw deposited direction (0.0). Higher = smoother, less grid-aligned horde flow."))
+	float AgitationGradientWeight = 0.75f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="180.0", ForceUnits="deg",
+		ToolTip="Per-Echo random angular jitter added to field-driven movement so a group fans out instead of marching in lockstep along identical directions. 0 = no jitter (sharper patterns)."))
+	float HordeDirectionJitterDegrees = 25.f;
+
+	// ── Echo|HordeShaping ──────────────────────────────────────────────────────
+	// Boids-style separation + approach jitter so echoes form an organic mass rather than a
+	// perfect circle packed onto the player's exact location.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(
+		ToolTip="Enable short-range separation so nearby echoes push apart instead of converging on one point. Turn OFF to see the old perfect-ring packing."))
+	bool bEnableHordeSeparation = true;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Echoes within this distance of each other push apart. Roughly one to two body widths works well."))
+	float HordeSeparationRadius = 160.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ClampMax="4.0",
+		ToolTip="Strength of separation relative to the seek/flow direction. Higher = looser, more spread-out crowd; too high becomes jittery and stops them closing in."))
+	float HordeSeparationStrength = 0.85f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ClampMax="180.0", ForceUnits="deg",
+		ToolTip="Per-Echo random angular jitter on the direct player-seek direction so close echoes approach from spread angles instead of forming a perfect circle."))
+	float HordeApproachJitterDegrees = 20.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="1", ClampMax="64",
+		ToolTip="Maximum neighbours considered when computing an echo's separation (performance cap)."))
+	int32 HordeSeparationMaxNeighbors = 12;
+
 	// ── Echo|LowerTierSimulation ───────────────────────────────────────────────
 	// Budgets and speeds for LowDetail individual simulation and Abstract cell simulation.
 
