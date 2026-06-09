@@ -219,14 +219,14 @@ struct FATR_EchoMovementIntent
 	uint32 LastCompletedMoveRequestSerial = 0;
 };
 
-// One cell of the indirect horde-agitation field. Agitation spreads as a scalar pressure
-// plus a weighted direction — Echoes sample it to become curious / investigate / join a
-// horde WITHOUT ever receiving another Echo's exact target actor.
-struct FATR_AgitationCell
+// One cell of the horde MOMENTUM field. Built from echoes actually moving: Momentum is the
+// local horde's movement vector and Strength is its magnitude. Nearby echoes align to it, so
+// movement self-reinforces into a horde WITHOUT any echo sharing another's exact target.
+struct FATR_MomentumCell
 {
-	float   Agitation         = 0.f;
-	FVector WeightedDirection  = FVector::ZeroVector; // accumulated direction*amount; normalize on read
-	float   LastUpdatedTime    = -1.f;
+	float   Strength          = 0.f;          // magnitude of Momentum (mirrored for thresholds/heat)
+	FVector Momentum          = FVector::ZeroVector; // local horde movement vector (XY)
+	float   LastUpdatedTime   = -1.f;
 };
 
 // One coarse cell of the Abstract simulation tier. Tracks aggregate population state instead of

@@ -60,6 +60,26 @@ public:
 	UPROPERTY(BlueprintReadWrite, Category = "Echo")
 	bool bBlockDemotion = false;
 
+	// --- Combat hooks ---
+	// Called by the melee StateTree task (FATR_EchoMeleeTask). BlueprintNativeEvent so designers can
+	// override the real effect (anim montage, attach, damage, root-motion pull). The native defaults
+	// are intentionally minimal so the grab→bite→pull flow works before art/gameplay is wired.
+
+	// Attempt to grab Target. Return true if the grab "takes" (the task then holds the grab, bites,
+	// and pulls). Default: succeeds. Override to gate on facing/animation/anti-spam.
+	UFUNCTION(BlueprintNativeEvent, Category = "Echo|Combat")
+	bool TryGrabTarget(AActor* Target);
+
+	// Attempt a bite on Target (already grabbed, within bite range). Return true if it landed.
+	// Default: succeeds. Override to apply damage / play the bite montage.
+	UFUNCTION(BlueprintNativeEvent, Category = "Echo|Combat")
+	bool TryBiteTarget(AActor* Target);
+
+	// Pull Target toward this echo while grabbed. Default: no-op. Override to apply your pull /
+	// root motion / physics constraint. Strength comes from Echo|Combat.MeleePullStrength.
+	UFUNCTION(BlueprintNativeEvent, Category = "Echo|Combat")
+	void PullTarget(AActor* Target, float Strength);
+
 	// --- Lifecycle ---
 
 	// Put actor in dormant pool state: hidden, collision off, AI off, CMC stopped.

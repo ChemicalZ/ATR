@@ -247,15 +247,15 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 		}
 	}
 
-	// ── Agitation field (fine) ──
+	// ── Momentum field (fine) ──
 	if (bShowAgitation)
 	{
-		const float CS = FMath::Max(1.f, Sub->AgitationCellSize);
-		for (const TPair<FIntPoint, FATR_AgitationCell>& Pair : Sub->AgitationField)
+		const float CS = FMath::Max(1.f, Sub->MomentumCellSize);
+		for (const TPair<FIntPoint, FATR_MomentumCell>& Pair : Sub->MomentumField)
 		{
 			const FIntPoint K = Pair.Key;
-			const FATR_AgitationCell& Cell = Pair.Value;
-			const float A = FMath::Clamp(Cell.Agitation, 0.f, 1.f);
+			const FATR_MomentumCell& Cell = Pair.Value;
+			const float A = FMath::Clamp(Cell.Strength, 0.f, 1.f);
 			if (A <= 0.001f) continue;
 
 			const FVector2D Mn(K.X * CS, K.Y * CS);
@@ -273,7 +273,7 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 				// deposited direction — so the arrows match how the horde moves.
 				const FVector2D CW = (Mn + Mx) * 0.5;
 				float FlowAgit = 0.f; FVector FlowDir = FVector::ZeroVector;
-				Sub->SampleAgitationField(FVector(CW.X, CW.Y, 0.0), FlowAgit, FlowDir);
+				Sub->SampleMomentumField(FVector(CW.X, CW.Y, 0.0), FlowAgit, FlowDir);
 				if (!FlowDir.IsNearlyZero())
 				{
 					const FVector2D CSc = WorldToScreen(CW, LS);
@@ -289,7 +289,7 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 	// flow echoes actually follow — including diffused regions with no deposit of their own.
 	if (bShowFlowField)
 	{
-		const float CS = FMath::Max(1.f, Sub->AgitationCellSize);
+		const float CS = FMath::Max(1.f, Sub->MomentumCellSize);
 		float Step = FMath::Max(CS, 28.f / FMath::Max(PixelsPerCm, 1e-5f)); // >= 1 cell, >= ~28px apart
 		int32 NX = FMath::CeilToInt((VisMax.X - VisMin.X) / Step) + 1;
 		int32 NY = FMath::CeilToInt((VisMax.Y - VisMin.Y) / Step) + 1;
@@ -308,7 +308,7 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 		for (float WX = StartX; WX <= VisMax.X; WX += Step)
 		{
 			float Agit = 0.f; FVector Dir = FVector::ZeroVector;
-			Sub->SampleAgitationField(FVector(WX, WY, 0.0), Agit, Dir);
+			Sub->SampleMomentumField(FVector(WX, WY, 0.0), Agit, Dir);
 			if (Agit <= 0.02f || Dir.IsNearlyZero()) continue;
 
 			const FVector2D S = WorldToScreen(FVector2D(WX, WY), LS);
@@ -437,8 +437,8 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 	{
 		const float CmPerPixel = (PixelsPerCm > KINDA_SMALL_NUMBER) ? 1.f / PixelsPerCm : 0.f;
 		Text(LText, FVector2D(10, LS.Y - 24),
-			FString::Printf(TEXT("Zoom: 1px = %.0f cm   |   Echoes drawn: %d / %d   |   Agitation cells: %d   |   Abstract cells: %d   |   Wheel = zoom, Drag = pan"),
-				CmPerPixel, DrawnEchoes, Sub->ActiveEntities, Sub->AgitationField.Num(), Sub->AbstractCells.Num()),
+			FString::Printf(TEXT("Zoom: 1px = %.0f cm   |   Echoes drawn: %d / %d   |   Momentum cells: %d   |   Abstract cells: %d   |   Wheel = zoom, Drag = pan"),
+				CmPerPixel, DrawnEchoes, Sub->ActiveEntities, Sub->MomentumField.Num(), Sub->AbstractCells.Num()),
 			Font10, FLinearColor(0.85f, 0.85f, 0.9f));
 	}
 
@@ -485,12 +485,12 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 			for (int32 k = 0; k < Segs; ++k)
 				Box(LText, FVector2D(Cx + k * Sw, Cy + 2.f), FVector2D(Sw + 1.f, SwatchSize), HeatColor((float)k / (Segs - 1)));
 			Cy += Row;
-			Text(LText, FVector2D(Cx, Cy), TEXT("pressure:  low  ->  high"), Font8, FLinearColor(0.88f, 0.88f, 0.94f));
+			Text(LText, FVector2D(Cx, Cy), TEXT("momentum:  weak  ->  strong"), Font8, FLinearColor(0.88f, 0.88f, 0.94f));
 			Cy += Row;
 		}
 
 		if (bShowArrows || bShowFlowField)
-			Swatch(FLinearColor(0.5f, 1.0f, 1.0f), TEXT("flow: gradient echoes follow"));
+			Swatch(FLinearColor(0.5f, 1.0f, 1.0f), TEXT("flow: horde momentum"));
 
 		if (bShowTargetLines)
 		{

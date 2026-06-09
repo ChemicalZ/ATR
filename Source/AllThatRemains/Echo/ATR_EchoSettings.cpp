@@ -100,21 +100,18 @@ void UATR_EchoSettings::ValidateAndClamp()
 	MaxSearchSteps                 = FMath::Max(1, MaxSearchSteps);
 
 	// Agitation — curiosity threshold must not exceed join threshold
-	AgitationCellSize                    = FMath::Max(1.f, AgitationCellSize);
+	MomentumCellSize                    = FMath::Max(1.f, MomentumCellSize);
 	AgitationFieldDecayPerSecond         = FMath::Max(0.f, AgitationFieldDecayPerSecond);
 	EchoPersonalAgitationDecayPerSecond  = FMath::Max(0.f, EchoPersonalAgitationDecayPerSecond);
 	HordeCuriosityThreshold              = FMath::Clamp(HordeCuriosityThreshold, 0.f, 1.f);
 	AgitationJoinThreshold               = FMath::Clamp(AgitationJoinThreshold, HordeCuriosityThreshold, 1.f);
-	SightAgitationAmount                 = FMath::Clamp(SightAgitationAmount, 0.f, 1.f);
 	NoiseAgitationAmountScale            = FMath::Max(0.f, NoiseAgitationAmountScale);
 	CombatAgitationAmount                = FMath::Clamp(CombatAgitationAmount, 0.f, 1.f);
-	EchoAgitationSpreadRadius            = FMath::Max(0.f, EchoAgitationSpreadRadius);
 	HordePressureMoveDistance            = FMath::Max(0.f, HordePressureMoveDistance);
 	HordePressureDirectionSmoothingAlpha = FMath::Clamp(HordePressureDirectionSmoothingAlpha, 0.f, 1.f);
 
-	// Field diffusion + gradient shaping
-	AgitationDiffusionRate      = FMath::Clamp(AgitationDiffusionRate, 0.f, 20.f);
-	AgitationGradientWeight     = FMath::Clamp(AgitationGradientWeight, 0.f, 1.f);
+	// Field diffusion + jitter shaping
+	MomentumDiffusionRate      = FMath::Clamp(MomentumDiffusionRate, 0.f, 20.f);
 	HordeDirectionJitterDegrees = FMath::Clamp(HordeDirectionJitterDegrees, 0.f, 180.f);
 
 	// Crowd shaping (separation + approach jitter)
@@ -122,6 +119,26 @@ void UATR_EchoSettings::ValidateAndClamp()
 	HordeSeparationStrength     = FMath::Clamp(HordeSeparationStrength, 0.f, 4.f);
 	HordeApproachJitterDegrees  = FMath::Clamp(HordeApproachJitterDegrees, 0.f, 180.f);
 	HordeSeparationMaxNeighbors = FMath::Clamp(HordeSeparationMaxNeighbors, 1, 64);
+
+	// Detachment
+	DetachEdgeNeighborCount  = FMath::Clamp(DetachEdgeNeighborCount, 0, 32);
+	DetachBackDot            = FMath::Clamp(DetachBackDot, -1.f, 1.f);
+	DetachChanceEdgePerSec   = FMath::Clamp(DetachChanceEdgePerSec, 0.f, 5.f);
+	DetachChanceBackPerSec   = FMath::Clamp(DetachChanceBackPerSec, 0.f, 5.f);
+	DetachChanceRandomPerSec = FMath::Clamp(DetachChanceRandomPerSec, 0.f, 5.f);
+	DetachDriftSpeed         = FMath::Max(0.f, DetachDriftSpeed);
+
+	// Horde momentum
+	MomentumBuildRate            = FMath::Clamp(MomentumBuildRate, 0.f, 10.f);
+	MomentumDecayPerSecond       = FMath::Clamp(MomentumDecayPerSecond, 0.f, 10.f);
+	MomentumPersistence          = FMath::Clamp(MomentumPersistence, 0.f, 1.f);
+	MomentumMoverSpeedThreshold  = FMath::Max(0.f, MomentumMoverSpeedThreshold);
+	MomentumRefMoverCount        = FMath::Clamp(MomentumRefMoverCount, 1.f, 200.f);
+	MomentumAlignThreshold       = FMath::Clamp(MomentumAlignThreshold, 0.f, 1.f);
+	MomentumMaxStrength          = FMath::Clamp(MomentumMaxStrength, 0.1f, 4.f);
+	SoundImpulseRadius           = FMath::Max(0.f, SoundImpulseRadius);
+	SoundImpulseSpeed            = FMath::Max(0.f, SoundImpulseSpeed);
+	SoundImpulseStrengthScale    = FMath::Clamp(SoundImpulseStrengthScale, 0.f, 4.f);
 
 	// Lower-tier simulation
 	LowDetailUpdateHz                = FMath::Clamp(LowDetailUpdateHz, 0.1f, 60.f);
@@ -147,6 +164,16 @@ void UATR_EchoSettings::ValidateAndClamp()
 	ObstacleSidestepDistance     = FMath::Max(0.f, ObstacleSidestepDistance);
 	ObstacleForwardNudgeDistance = FMath::Max(0.f, ObstacleForwardNudgeDistance);
 	ObstacleRetryCooldownSeconds = FMath::Max(0.f, ObstacleRetryCooldownSeconds);
+
+	// Combat — bite within grab range; release multiplier >= 1
+	MeleeAttackRange       = FMath::Max(0.f, MeleeAttackRange);
+	GrabRange              = FMath::Max(0.f, GrabRange);
+	GrabCooldownSeconds    = FMath::Max(0.f, GrabCooldownSeconds);
+	GrabReleaseMultiplier  = FMath::Max(1.f, GrabReleaseMultiplier);
+	BiteRange              = FMath::Clamp(BiteRange, 0.f, GrabRange);
+	BiteCooldownSeconds    = FMath::Max(0.f, BiteCooldownSeconds);
+	MeleePullStrength      = FMath::Max(0.f, MeleePullStrength);
+	OrientTurnRateDegPerSec = FMath::Max(0.f, OrientTurnRateDegPerSec);
 
 	// Demotion
 	DemotionConfidenceBlockThreshold = FMath::Clamp(DemotionConfidenceBlockThreshold, 0.f, 1.f);

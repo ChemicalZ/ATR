@@ -63,16 +63,16 @@ void SATR_EchoDebugMapWidget::Construct(const FArguments& InArgs)
 	static const FSlateColorBrush PanelBrush(FLinearColor(0.06f, 0.06f, 0.08f, 0.96f));
 
 	const FString AgitationTip =
-		TEXT("Fine agitation field (the cells that drive JoinHordePressure / curiosity).\n")
-		TEXT("Fill heat = pressure: blue = low, green/yellow = building, red = high.\n")
-		TEXT("White arrows = weighted pressure direction echoes drift toward.");
+		TEXT("Horde momentum field (built from echoes MOVING, not from sight).\n")
+		TEXT("Heat = momentum strength: blue = weak, green/yellow = building, red = strong.\n")
+		TEXT("Cyan arrows = the direction the local horde is flowing.");
 	const FString AbstractTip =
 		TEXT("Coarse Abstract-tier cells (far population simulation).\n")
 		TEXT("Outlined cells with 'Pop N' = population; faint fill heat = cell agitation.\n")
 		TEXT("Green arrows = migration pressure direction.");
 	const FString IntentTip   = TEXT("Color each echo dot by its current EATR_EchoIntent (see legend).");
-	const FString ArrowsTip   = TEXT("Per-cell flow arrows: the gradient direction echoes actually follow (sampled from the diffused field), plus abstract-cell pressure arrows.");
-	const FString FlowTip      = TEXT("Dense flow field: samples the field gradient on a regular grid so you can see the smooth horde flow everywhere, including diffused areas with no deposit of their own.");
+	const FString ArrowsTip   = TEXT("Per-cell momentum arrows: the direction the local horde is moving (what nearby echoes align to), plus abstract-cell migration arrows.");
+	const FString FlowTip      = TEXT("Dense momentum field: samples horde momentum on a regular grid so you can see the whole flow, including cells momentum has spread into via diffusion.");
 	const FString MoveTip     = TEXT("Show each echo's current movement-direction arrow (from velocity).");
 	const FString TargetTip   = TEXT("Draw a line from each echo to its move target.\nRed = currently sees the player; orange = remembered/heard location.");
 	const FString PlayersTip  = TEXT("Draw players as cyan triangles pointing in their facing direction.");
@@ -100,7 +100,7 @@ void SATR_EchoDebugMapWidget::Construct(const FArguments& InArgs)
 
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)[ MakeToggle(TEXT("Echoes"),    &SATR_EchoDebugMapView::bShowEchoes) ]
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)[ MakeToggle(TEXT("Intent"),    &SATR_EchoDebugMapView::bShowIntentColors, IntentTip) ]
-				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)[ MakeToggle(TEXT("Agitation"), &SATR_EchoDebugMapView::bShowAgitation, AgitationTip) ]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)[ MakeToggle(TEXT("Momentum"), &SATR_EchoDebugMapView::bShowAgitation, AgitationTip) ]
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)[ MakeToggle(TEXT("Abstract"),  &SATR_EchoDebugMapView::bShowAbstractCells, AbstractTip) ]
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)[ MakeToggle(TEXT("Arrows"),    &SATR_EchoDebugMapView::bShowArrows, ArrowsTip) ]
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)[ MakeToggle(TEXT("Flow"),      &SATR_EchoDebugMapView::bShowFlowField, FlowTip) ]

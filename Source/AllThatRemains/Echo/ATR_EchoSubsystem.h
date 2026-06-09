@@ -457,8 +457,12 @@ public:
 	UPROPERTY()
 	TArray<TObjectPtr<AATR_EchoAIController>> ControllerPool;
 
-	void RunSteeringPass();
+	void RunSteeringPass(float DeltaTime);
 	void RunPromotionPass();
+
+	// Build the momentum field from this tick's movement: aligned movers in a cell raise its momentum
+	// (more movers + better alignment = stronger). Runs before steering so echoes align to fresh data.
+	void BuildMomentumFromMovement(float DeltaTime);
 
 	// --- Intent selection ---
 	// Chooses each relevant Echo's high-level EATR_EchoIntent + move request from its
@@ -511,18 +515,15 @@ public:
 	//
 	// Keyed by quantized (x,y) cell so it needs no world-size precomputation. Only agitated
 	// cells consume memory; cells are pruned once they decay to nothing.
-	TMap<FIntPoint, FATR_AgitationCell> AgitationField;
+	TMap<FIntPoint, FATR_MomentumCell> MomentumField;
 
-	float AgitationCellSize        = 2000.f; // cm per agitation cell
-	float AgitationFieldDecayPerSec = 0.25f; // how fast deposited pressure fades
+	float MomentumCellSize        = 2000.f; // cm per momentum cell
 	float HordeCuriosityThreshold   = 0.20f; // >= → TurnTowardStimulus (curious)
 
-	// Field-shaping mirrors (Echo|Agitation). Diffusion spreads pressure across cells so a smooth
-	// gradient forms; gradient-weighted sampling + per-Echo jitter break the grid-aligned/lockstep
-	// patterns. Mirrored from settings in Initialize.
-	bool  bEnableAgitationDiffusion   = true;
-	float AgitationDiffusionRate      = 3.0f;  // per-second spread fraction
-	float AgitationGradientWeight     = 0.75f; // 0 = deposited dir, 1 = pure scalar gradient
+	// Field-shaping mirrors (Echo|Agitation). Diffusion spreads momentum across cells; per-Echo
+	// jitter breaks lockstep movement. Mirrored from settings in Initialize.
+	bool  bEnableMomentumDiffusion   = true;
+	float MomentumDiffusionRate      = 3.0f;  // per-second spread fraction
 	float HordeDirectionJitterDegrees = 25.f;  // per-Echo jitter on field-driven movement
 
 	// Crowd-shaping mirrors (Echo|HordeShaping). Separation + approach jitter so echoes form an
@@ -533,27 +534,47 @@ public:
 	float HordeApproachJitterDegrees = 20.f;
 	int32 HordeSeparationMaxNeighbors = 12;
 
-	// Deposit agitation at a world location with an optional pressure direction. Public so
-	// gameplay (gunshots, sprint noise, combat, scripted events) can drive the horde field.
-	void AddWorldAgitation(const FVector& Location, float Amount, const FVector& Direction);
+	// Detachment mirrors (Echo|HordeShaping). Echoes peel off a horde from edges, tail, and a
+	// random trickle so hordes erode and break up over time.
+	bool  bEnableHordeDetachment   = true;
+	int32 DetachEdgeNeighborCount  = 3;
+	float DetachBackDot            = 0.25f;
+	float DetachChanceEdgePerSec   = 0.5f;
+	float DetachChanceBackPerSec   = 0.6f;
+	float DetachChanceRandomPerSec = 0.05f;
+	float DetachDriftSpeed         = 70.f;
 
-	// Spread agitation (and its weighted direction) into neighbouring cells so pressure forms a
-	// smooth multi-cell gradient instead of staying in the deposit cell. Runs once per server tick.
-	void DiffuseAgitationField(float DeltaTime);
+	// Movement-momentum model mirrors (Echo|HordeMomentum). NOTE: the MomentumField/FATR_MomentumCell
+	// below is REPURPOSED as the momentum field — Momentum holds the cell's momentum vector
+	// and Agitation holds its magnitude (strength). Built from movement, not from sight.
+	bool  bEnableHordeMomentum       = true;
+	float MomentumBuildRate          = 1.5f;
+	float MomentumDecayPerSecond     = 0.5f;
+	float MomentumPersistence        = 0.7f;
+	float MomentumMoverSpeedThreshold = 30.f;
+	float MomentumRefMoverCount      = 12.f;
+	float MomentumAlignThreshold     = 0.12f;
+	float MomentumMaxStrength        = 1.0f;
+	float SoundImpulseRadius         = 4000.f;
+	float SoundImpulseSpeed          = 150.f;
+	float SoundImpulseStrengthScale  = 1.0f;
 
-	// Decay + prune the agitation field. Runs once per server tick.
-	void DecayAgitationField(float DeltaTime);
+	// Spread the momentum field into neighbouring cells so it forms a smooth multi-cell gradient
+	// instead of staying in one cell. Runs once per server tick.
+	void DiffuseMomentumField(float DeltaTime);
 
-	// Sample the field at a world location with bilinear interpolation. Returns the interpolated
-	// agitation and a smooth movement direction that follows the pressure gradient (toward the
-	// hotspot), blended with the deposited direction by AgitationGradientWeight. Pure read.
-	void SampleAgitationField(const FVector& Location, float& OutAgitation, FVector& OutDirection) const;
+	// Decay + prune the momentum field (strong hordes persist longer). Runs once per server tick.
+	void DecayMomentumField(float DeltaTime);
 
-	FORCEINLINE FIntPoint AgitationCellKey(const FVector& Location) const
+	// Sample the momentum field at a world location with bilinear interpolation. Returns the
+	// interpolated momentum strength and the direction the local horde is flowing. Pure read.
+	void SampleMomentumField(const FVector& Location, float& OutAgitation, FVector& OutDirection) const;
+
+	FORCEINLINE FIntPoint MomentumCellKey(const FVector& Location) const
 	{
 		return FIntPoint(
-			FMath::FloorToInt(static_cast<float>(Location.X) / AgitationCellSize),
-			FMath::FloorToInt(static_cast<float>(Location.Y) / AgitationCellSize));
+			FMath::FloorToInt(static_cast<float>(Location.X) / MomentumCellSize),
+			FMath::FloorToInt(static_cast<float>(Location.Y) / MomentumCellSize));
 	}
 
 	// Cached settings CDO (program-lifetime object). Behavior code reads tuning from here so

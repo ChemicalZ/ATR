@@ -164,3 +164,25 @@ void AATR_ActiveEcho::WriteBackToSoA(UATR_EchoSubsystem* Sub) const
 	if (const UCharacterMovementComponent* CMC = GetCharacterMovement())
 		Sub->Velocities[SourceIndex] = FVector3f(CMC->Velocity);
 }
+
+// --- Combat hooks (native defaults; override in Blueprint for real effects) ---
+
+bool AATR_ActiveEcho::TryGrabTarget_Implementation(AActor* Target)
+{
+	// Default: the grab "takes" as long as there's a valid target. Override to gate on facing,
+	// animation windows, or anti-spam and to attach/begin the grab montage.
+	return IsValid(Target);
+}
+
+bool AATR_ActiveEcho::TryBiteTarget_Implementation(AActor* Target)
+{
+	// Default: the bite lands. Override to apply damage / play the bite montage.
+	return IsValid(Target);
+}
+
+void AATR_ActiveEcho::PullTarget_Implementation(AActor* /*Target*/, float /*Strength*/)
+{
+	// Default: no-op. Override to pull the target in (root motion, physics constraint, or a
+	// movement nudge). Left empty so the default melee flow never moves the player unexpectedly.
+}
+

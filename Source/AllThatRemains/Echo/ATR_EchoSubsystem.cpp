@@ -224,15 +224,13 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	MaxSightProjectionDistance   = Settings->MaxLastSeenProjectionDistance;
 	ObstacleHandleTimeoutSeconds = Settings->ObstacleHandleTimeoutSeconds;
 
-	// Horde agitation field (mirrors of Echo|Agitation).
-	AgitationCellSize          = Settings->AgitationCellSize;
-	AgitationFieldDecayPerSec  = Settings->AgitationFieldDecayPerSecond;
+	// Horde momentum field (mirrors of Echo|Agitation).
+	MomentumCellSize          = Settings->MomentumCellSize;
 	HordeCuriosityThreshold    = Settings->HordeCuriosityThreshold;
 
-	// Field diffusion + gradient shaping (mirrors of Echo|Agitation).
-	bEnableAgitationDiffusion   = Settings->bEnableAgitationDiffusion;
-	AgitationDiffusionRate      = Settings->AgitationDiffusionRate;
-	AgitationGradientWeight     = Settings->AgitationGradientWeight;
+	// Field diffusion + jitter shaping (mirrors of Echo|Agitation).
+	bEnableMomentumDiffusion   = Settings->bEnableMomentumDiffusion;
+	MomentumDiffusionRate      = Settings->MomentumDiffusionRate;
 	HordeDirectionJitterDegrees = Settings->HordeDirectionJitterDegrees;
 
 	// Crowd shaping (mirrors of Echo|HordeShaping).
@@ -241,6 +239,28 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	HordeSeparationStrength     = Settings->HordeSeparationStrength;
 	HordeApproachJitterDegrees  = Settings->HordeApproachJitterDegrees;
 	HordeSeparationMaxNeighbors = Settings->HordeSeparationMaxNeighbors;
+
+	// Detachment (mirrors of Echo|HordeShaping).
+	bEnableHordeDetachment   = Settings->bEnableHordeDetachment;
+	DetachEdgeNeighborCount  = Settings->DetachEdgeNeighborCount;
+	DetachBackDot            = Settings->DetachBackDot;
+	DetachChanceEdgePerSec   = Settings->DetachChanceEdgePerSec;
+	DetachChanceBackPerSec   = Settings->DetachChanceBackPerSec;
+	DetachChanceRandomPerSec = Settings->DetachChanceRandomPerSec;
+	DetachDriftSpeed         = Settings->DetachDriftSpeed;
+
+	// Movement-momentum model (mirrors of Echo|HordeMomentum).
+	bEnableHordeMomentum        = Settings->bEnableHordeMomentum;
+	MomentumBuildRate           = Settings->MomentumBuildRate;
+	MomentumDecayPerSecond      = Settings->MomentumDecayPerSecond;
+	MomentumPersistence         = Settings->MomentumPersistence;
+	MomentumMoverSpeedThreshold = Settings->MomentumMoverSpeedThreshold;
+	MomentumRefMoverCount       = Settings->MomentumRefMoverCount;
+	MomentumAlignThreshold      = Settings->MomentumAlignThreshold;
+	MomentumMaxStrength         = Settings->MomentumMaxStrength;
+	SoundImpulseRadius          = Settings->SoundImpulseRadius;
+	SoundImpulseSpeed           = Settings->SoundImpulseSpeed;
+	SoundImpulseStrengthScale   = Settings->SoundImpulseStrengthScale;
 
 	PromotedIndices.Reserve(PoolSize);
 	LocalEntityScratch.Reserve(256);
@@ -345,10 +365,11 @@ void UATR_EchoSubsystem::Tick(float DeltaTime)
 		}
 
 		RebuildFineGrid();
-		RunSteeringPass();
+		BuildMomentumFromMovement(DeltaTime); // movement → momentum field
+		DiffuseMomentumField(DeltaTime);     // spread momentum to neighbouring cells
+		DecayMomentumField(DeltaTime);       // decay momentum (strong hordes persist longer)
+		RunSteeringPass(DeltaTime);           // align to momentum + detachment
 		RunPromotionPass();
-		DiffuseAgitationField(DeltaTime);
-		DecayAgitationField(DeltaTime);
 		RunIntentPass(DeltaTime);
 
 		// Lower-tier simulation — budgeted individual (LowDetail) + cell-level (Abstract). Both run
@@ -793,11 +814,9 @@ void UATR_EchoSubsystem::ReportEchoSawActor(int32 EchoId, AActor* Actor, const F
 	A.Confidence            = CachedSettings ? CachedSettings->ReacquireSightConfidence : 1.f;
 	A.Urgency               = FMath::Max(A.Urgency, 1.f);
 
-	// Indirect spread: a seeing Echo agitates its neighborhood and biases pressure toward the
-	// action — but deposits only a scalar + direction, never the target actor. Neighbors get
-	// curious/pulled; distant edge Echoes get nothing and can peel away.
-	const float SightAgitation = CachedSettings ? CachedSettings->SightAgitationAmount : 0.6f;
-	AddWorldAgitation(State->Location, SightAgitation, (Location - State->Location));
+	// NOTE: sight no longer deposits any horde pressure. Seeing the player only makes THIS echo
+	// chase (via intent). Its chasing movement still feeds the momentum field like any mover — so a
+	// chaser can drag a horde along — but nothing here reveals the player's location to other echoes.
 
 	State->LastUpdateTime = TimeSeconds;
 }
@@ -877,8 +896,8 @@ void UATR_EchoSubsystem::ReportEchoStimulus(int32 EchoId, const FATR_StimulusEve
 		case EATR_StimulusType::Combat:
 		case EATR_StimulusType::Scripted:
 			ReportEchoHeardLocation(EchoId, Event.Location, Event.Strength, Event.TimeSeconds);
-			// Loud world events also deposit directional horde pressure at their source.
-			AddWorldAgitation(Event.Location, Event.Strength, Event.Direction);
+			// Sound no longer deposits pressure here; the world-stimulus path kicks nearby echoes
+			// into MOVEMENT toward the source, and that movement builds the momentum field.
 			break;
 
 		case EATR_StimulusType::Smell:
@@ -936,7 +955,6 @@ void UATR_EchoSubsystem::EmitWorldStimulus(const FATR_StimulusEvent& Event)
 			default: break;
 		}
 	}
-	AddWorldAgitation(E.Location, AgitAmount, E.Direction);
 
 	// Feed Abstract cell pressure at the source so the far population can react without actors.
 	{
@@ -978,6 +996,27 @@ void UATR_EchoSubsystem::EmitWorldStimulus(const FATR_StimulusEvent& Event)
 				default:
 					// Location-only heard knowledge; never sets a target actor.
 					ReportEchoHeardLocation(GetEchoIdForIndex(Index), E.Location, Strength, E.TimeSeconds);
+
+					// Sound MOVEMENT impulse: start this horde-tier echo moving toward the source. That
+					// shared movement is what builds the momentum field next tick (a loud sound that gets
+					// 30 echoes moving together seeds a strong, persistent horde). Promoted echoes are
+					// driven by their controller/StateTree, so skip them here.
+					if (bEnableHordeMomentum && Dist <= SoundImpulseRadius
+						&& IndexToActor.IsValidIndex(Index) && !IndexToActor[Index]
+						&& Velocities.IsValidIndex(Index))
+					{
+						FVector ToSound = E.Location - FVector(GetEchoQueryPosition(Index));
+						ToSound.Z = 0.f;
+						if (!ToSound.IsNearlyZero())
+						{
+							const FVector Dir = ToSound.GetSafeNormal();
+							const float   Spd = SoundImpulseSpeed
+								* FMath::Clamp(Strength * SoundImpulseStrengthScale, 0.f, 1.f);
+							Velocities[Index] = FVector3f((float)Dir.X * Spd, (float)Dir.Y * Spd, 0.f);
+							Yaws[Index]       = FMath::RadiansToDegrees(FMath::Atan2((float)Dir.Y, (float)Dir.X));
+							MarkEchoDirty(Index, EEchoDirtyFlags::Transform);
+						}
+					}
 					break;
 			}
 		});
@@ -1031,36 +1070,100 @@ void UATR_EchoSubsystem::ReportEchoMoveResult(int32 EchoId, bool bSuccess, EATR_
 		EchoId, bSuccess ? TEXT("success") : TEXT("FAIL"), static_cast<int32>(Reason));
 }
 
-// ─── Horde Agitation Field ─────────────────────────────────────────
+// ─── Horde Momentum Field ──────────────────────────────────────────
+// The MomentumField stores MOVEMENT MOMENTUM.
+//   FATR_MomentumCell::Momentum = the cell's momentum vector (direction the local horde is moving,
+//                                 magnitude = strength in [0, MomentumMaxStrength]).
+//   FATR_MomentumCell::Strength = that momentum's magnitude (mirrored for thresholds/heat).
+// Built from echoes actually moving (BuildMomentumFromMovement) — both horde-tier AND promoted
+// actors — spreads via diffusion, decays (strong hordes persist longer), and is what nearby echoes
+// align to. No-cheat invariant: nothing about the player's location enters the field, only movement.
 
-void UATR_EchoSubsystem::AddWorldAgitation(const FVector& Location, float Amount, const FVector& Direction)
+void UATR_EchoSubsystem::BuildMomentumFromMovement(float DeltaTime)
 {
-	// No-cheat invariant: the field carries only a scalar magnitude and a blended direction.
-	// It never stores or transmits a target actor or an exact player location, so horde behavior
-	// emerges from pressure rather than a shared hive-mind target.
-	if (Amount <= 0.f) return;
-	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_AddWorldAgitation);
+	if (!bEnableHordeMomentum || MomentumBuildRate <= 0.f)
+		return;
 
-	const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_BuildMomentumFromMovement);
 
-	FATR_AgitationCell& Cell = AgitationField.FindOrAdd(AgitationCellKey(Location));
-	Cell.Agitation        = FMath::Min(1.f, Cell.Agitation + Amount);
-	Cell.WeightedDirection += Direction.GetSafeNormal2D() * Amount; // accumulate; normalized on read
-	Cell.LastUpdatedTime   = Now;
+	const float Now         = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+	const float SpeedThresh2 = MomentumMoverSpeedThreshold * MomentumMoverSpeedThreshold;
+
+	// Aggregate each cell's mover directions: |average| = alignment coherence, Count = how many moved.
+	struct FAccum { FVector2D Sum = FVector2D::ZeroVector; int32 Count = 0; };
+	TMap<FIntPoint, FAccum> Accum;
+	Accum.Reserve(LocalEntityScratch.Num() + PromotedIndices.Num());
+
+	auto AddMover = [&](const FVector2D& Vel2D, const FVector& Pos)
+	{
+		const float S2 = Vel2D.X * Vel2D.X + Vel2D.Y * Vel2D.Y;
+		if (S2 < SpeedThresh2) return;
+		const float Inv = FMath::InvSqrt(S2);
+		FAccum& Ac = Accum.FindOrAdd(MomentumCellKey(Pos));
+		Ac.Sum += Vel2D * Inv;
+		Ac.Count++;
+	};
+
+	// Horde-tier movers — SoA velocity (SimTick integrates these).
+	for (const int32 Idx : LocalEntityScratch)
+	{
+		if (!Velocities.IsValidIndex(Idx) || !Positions.IsValidIndex(Idx)) continue;
+		const FVector3f& V = Velocities[Idx];
+		AddMover(FVector2D(V.X, V.Y), FVector(Positions[Idx]));
+	}
+
+	// Promoted (actor-driven) movers — 30 actors chasing the player IS momentum. SimTick does NOT
+	// integrate SoA velocity for promoted echoes, so read each pawn's real velocity directly.
+	for (const int32 Idx : PromotedIndices)
+	{
+		AATR_ActiveEcho* Actor = IndexToActor.IsValidIndex(Idx) ? IndexToActor[Idx] : nullptr;
+		if (!Actor) continue;
+		const FVector AV = Actor->GetVelocity();
+		AddMover(FVector2D(AV.X, AV.Y), Actor->GetActorLocation());
+	}
+
+	const float Build = FMath::Clamp(MomentumBuildRate * DeltaTime, 0.f, 1.f);
+	const float MaxS  = FMath::Max(0.1f, MomentumMaxStrength);
+	const float RefN  = FMath::Max(1.f, MomentumRefMoverCount);
+
+	for (const TPair<FIntPoint, FAccum>& P : Accum)
+	{
+		const FAccum& Ac = P.Value;
+		if (Ac.Count <= 0) continue;
+
+		const FVector2D Avg = Ac.Sum / (float)Ac.Count; // magnitude is the alignment coherence 0..1
+		const float Coherence = Avg.Size();
+		if (Coherence <= KINDA_SMALL_NUMBER) continue;
+
+		// Strong momentum needs BOTH alignment AND enough movers — 30 moving together >> 3 wandering.
+		const FVector2D DirN       = Avg / Coherence;
+		const float     MoverScale = FMath::Min(1.f, (float)Ac.Count / RefN);
+		const FVector2D Target     = DirN * (Coherence * MoverScale * MaxS);
+
+		FATR_MomentumCell& Cell = MomentumField.FindOrAdd(P.Key);
+		FVector2D Cur(Cell.Momentum.X, Cell.Momentum.Y);
+		FVector2D New = Cur + (Target - Cur) * Build; // EMA toward this tick's movement
+		const float Mag = New.Size();
+		if (Mag > MaxS && Mag > KINDA_SMALL_NUMBER) New *= MaxS / Mag;
+
+		Cell.Momentum = FVector(New.X, New.Y, 0.f);
+		Cell.Strength = New.Size();
+		Cell.LastUpdatedTime = Now;
+	}
 }
 
-void UATR_EchoSubsystem::DiffuseAgitationField(float DeltaTime)
+void UATR_EchoSubsystem::DiffuseMomentumField(float DeltaTime)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_DiffuseAgitationField);
 
-	if (!bEnableAgitationDiffusion || AgitationDiffusionRate <= 0.f || AgitationField.IsEmpty())
+	if (!bEnableMomentumDiffusion || MomentumDiffusionRate <= 0.f || MomentumField.IsEmpty())
 		return;
 
 	// Per-tick spread fraction. Scaled by DeltaTime for framerate independence and clamped well
 	// below the explicit-diffusion stability limit. Each agitated cell donates this fraction of its
 	// pressure to its 8 neighbours (mass-conserving), so a deposit smears into a smooth multi-cell
 	// gradient over a second or two instead of staying a single hard-edged stamp.
-	const float Spread = FMath::Clamp(AgitationDiffusionRate * DeltaTime, 0.f, 0.6f);
+	const float Spread = FMath::Clamp(MomentumDiffusionRate * DeltaTime, 0.f, 0.6f);
 	if (Spread <= KINDA_SMALL_NUMBER) return;
 
 	// 8-neighbour offsets — Moore neighbourhood is more isotropic than 4-neighbour, which helps
@@ -1069,119 +1172,92 @@ void UATR_EchoSubsystem::DiffuseAgitationField(float DeltaTime)
 		{ 1, 0}, {-1, 0}, {0, 1}, {0,-1}, {1, 1}, {1,-1}, {-1, 1}, {-1,-1}
 	};
 
-	// Gather net deltas first so the pass is order-independent (no half-updated reads).
-	struct FDelta { float Agit = 0.f; FVector Dir = FVector::ZeroVector; };
-	TMap<FIntPoint, FDelta> Deltas;
-	Deltas.Reserve(AgitationField.Num() * 2);
+	// Gather net momentum-vector deltas first so the pass is order-independent.
+	TMap<FIntPoint, FVector2D> Deltas;
+	Deltas.Reserve(MomentumField.Num() * 2);
 
-	for (const TPair<FIntPoint, FATR_AgitationCell>& Pair : AgitationField)
+	for (const TPair<FIntPoint, FATR_MomentumCell>& Pair : MomentumField)
 	{
-		const FATR_AgitationCell& Cell = Pair.Value;
-		if (Cell.Agitation <= KINDA_SMALL_NUMBER) continue;
+		const FVector2D Mom(Pair.Value.Momentum.X, Pair.Value.Momentum.Y);
+		const FVector2D Out = Mom * Spread;
+		if (Out.IsNearlyZero()) continue;
 
-		const float   OutAgit = Cell.Agitation * Spread;
-		const FVector OutDir  = Cell.WeightedDirection * Spread;
-		const float   PerNbrA = OutAgit / 8.f;
-		const FVector PerNbrD = OutDir  / 8.f;
-
-		FDelta& Self = Deltas.FindOrAdd(Pair.Key);
-		Self.Agit -= OutAgit;
-		Self.Dir  -= OutDir;
-
+		const FVector2D PerNbr = Out / 8.f;
+		Deltas.FindOrAdd(Pair.Key) -= Out;
 		for (const FIntPoint& N : Neighbours)
-		{
-			FDelta& D = Deltas.FindOrAdd(FIntPoint(Pair.Key.X + N.X, Pair.Key.Y + N.Y));
-			D.Agit += PerNbrA;
-			D.Dir  += PerNbrD;
-		}
+			Deltas.FindOrAdd(FIntPoint(Pair.Key.X + N.X, Pair.Key.Y + N.Y)) += PerNbr;
 	}
 
 	// Apply. Neighbours that did not exist are created here; fully-empty ones get pruned in decay.
-	for (const TPair<FIntPoint, FDelta>& D : Deltas)
+	const float MaxS = FMath::Max(0.1f, MomentumMaxStrength);
+	for (const TPair<FIntPoint, FVector2D>& D : Deltas)
 	{
-		FATR_AgitationCell& Cell = AgitationField.FindOrAdd(D.Key);
-		Cell.Agitation        = FMath::Clamp(Cell.Agitation + D.Value.Agit, 0.f, 1.f);
-		Cell.WeightedDirection += D.Value.Dir;
+		FATR_MomentumCell& Cell = MomentumField.FindOrAdd(D.Key);
+		FVector2D M(Cell.Momentum.X, Cell.Momentum.Y);
+		M += D.Value;
+		const float Mag = M.Size();
+		if (Mag > MaxS && Mag > KINDA_SMALL_NUMBER) M *= MaxS / Mag;
+		Cell.Momentum = FVector(M.X, M.Y, 0.f);
+		Cell.Strength = M.Size();
 	}
 }
 
-void UATR_EchoSubsystem::DecayAgitationField(float DeltaTime)
+void UATR_EchoSubsystem::DecayMomentumField(float DeltaTime)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_DecayAgitationField);
 
-	const float Decay = AgitationFieldDecayPerSec * DeltaTime;
+	// Momentum decay: strong, coherent hordes resist decay (MomentumPersistence), so a big horde
+	// takes much longer to peter out than a weak one.
+	const float Base    = MomentumDecayPerSecond * DeltaTime;
+	const float Persist = FMath::Clamp(MomentumPersistence, 0.f, 1.f);
 
-	for (auto It = AgitationField.CreateIterator(); It; ++It)
+	for (auto It = MomentumField.CreateIterator(); It; ++It)
 	{
-		FATR_AgitationCell& Cell = It.Value();
-		Cell.Agitation        = FMath::Max(0.f, Cell.Agitation - Decay);
-		Cell.WeightedDirection *= FMath::Max(0.f, 1.f - Decay); // direction fades with pressure
+		FATR_MomentumCell& Cell = It.Value();
+		FVector2D M(Cell.Momentum.X, Cell.Momentum.Y);
+		const float Str = FMath::Clamp(M.Size(), 0.f, 1.f);
+		const float Eff = FMath::Clamp(Base * (1.f - Persist * Str), 0.f, 1.f);
 
-		if (Cell.Agitation <= KINDA_SMALL_NUMBER)
-			It.RemoveCurrent(); // prune dead cells so the map stays proportional to active hotspots
+		M *= FMath::Max(0.f, 1.f - Eff);
+		Cell.Momentum = FVector(M.X, M.Y, 0.f);
+		Cell.Strength = M.Size();
+
+		if (Cell.Strength <= KINDA_SMALL_NUMBER)
+			It.RemoveCurrent(); // prune dead cells so the map stays proportional to active hordes
 	}
 }
 
-void UATR_EchoSubsystem::SampleAgitationField(const FVector& Location, float& OutAgitation, FVector& OutDirection) const
+void UATR_EchoSubsystem::SampleMomentumField(const FVector& Location, float& OutAgitation, FVector& OutDirection) const
 {
 	OutAgitation = 0.f;
 	OutDirection = FVector::ZeroVector;
 
-	if (AgitationField.IsEmpty()) return;
+	if (MomentumField.IsEmpty()) return;
 
-	const float CS = FMath::Max(1.f, AgitationCellSize);
+	const float CS = FMath::Max(1.f, MomentumCellSize);
 
-	// Bilinearly interpolate the scalar field at an arbitrary world point. Sampling in cell-CENTRE
-	// space (offset by 0.5 cells) means a continuous, non-quantised value — no hard cell edges.
-	auto ScalarAt = [this, CS](double WX, double WY) -> float
+	// Bilinearly interpolate the momentum VECTOR at an arbitrary world point (cell-centre space, so
+	// it's continuous — no hard cell edges). Direction = where the local horde flows; magnitude =
+	// strength. This is exactly the movement echoes align to, so the debug 'flow' matches reality.
+	const double Cx = Location.X / CS - 0.5;
+	const double Cy = Location.Y / CS - 0.5;
+	const int32  X0 = FMath::FloorToInt(Cx);
+	const int32  Y0 = FMath::FloorToInt(Cy);
+	const float  Tx = (float)(Cx - X0);
+	const float  Ty = (float)(Cy - Y0);
+
+	auto MomAt = [this](int32 GX, int32 GY) -> FVector2D
 	{
-		const double Cx = WX / CS - 0.5;
-		const double Cy = WY / CS - 0.5;
-		const int32 X0 = FMath::FloorToInt(Cx);
-		const int32 Y0 = FMath::FloorToInt(Cy);
-		const float Tx = (float)(Cx - X0);
-		const float Ty = (float)(Cy - Y0);
-
-		auto A = [this](int32 GX, int32 GY) -> float
-		{
-			const FATR_AgitationCell* C = AgitationField.Find(FIntPoint(GX, GY));
-			return C ? C->Agitation : 0.f;
-		};
-
-		const float A00 = A(X0,   Y0);
-		const float A10 = A(X0+1, Y0);
-		const float A01 = A(X0,   Y0+1);
-		const float A11 = A(X0+1, Y0+1);
-		const float Bottom = FMath::Lerp(A00, A10, Tx);
-		const float Top    = FMath::Lerp(A01, A11, Tx);
-		return FMath::Lerp(Bottom, Top, Ty);
+		const FATR_MomentumCell* C = MomentumField.Find(FIntPoint(GX, GY));
+		return C ? FVector2D(C->Momentum.X, C->Momentum.Y) : FVector2D::ZeroVector;
 	};
 
-	OutAgitation = ScalarAt(Location.X, Location.Y);
+	const FVector2D Bottom = FMath::Lerp(MomAt(X0, Y0),   MomAt(X0+1, Y0),   Tx);
+	const FVector2D Top    = FMath::Lerp(MomAt(X0, Y0+1), MomAt(X0+1, Y0+1), Tx);
+	const FVector2D Mom    = FMath::Lerp(Bottom, Top, Ty);
 
-	// Gradient of the smooth scalar field via central differences (points toward higher pressure,
-	// i.e. up the slope toward the hotspot). This is the primary movement direction.
-	const float R = ScalarAt(Location.X + CS, Location.Y);
-	const float L = ScalarAt(Location.X - CS, Location.Y);
-	const float U = ScalarAt(Location.X, Location.Y + CS);
-	const float D = ScalarAt(Location.X, Location.Y - CS);
-	const FVector Gradient = FVector(R - L, U - D, 0.0).GetSafeNormal2D();
-
-	// Deposited direction (the "which way did the threat go" hint), sampled from the centre cell.
-	const FVector Deposited = [this, &Location]() -> FVector
-	{
-		const FATR_AgitationCell* C = AgitationField.Find(AgitationCellKey(Location));
-		return C ? C->WeightedDirection.GetSafeNormal2D() : FVector::ZeroVector;
-	}();
-
-	// Blend gradient (toward hotspot) with deposited direction. Falls back gracefully when either
-	// is zero so a lone deposit still produces a usable direction before diffusion fills in.
-	const float W = FMath::Clamp(AgitationGradientWeight, 0.f, 1.f);
-	FVector Blended = Gradient * W + Deposited * (1.f - W);
-	if (Blended.IsNearlyZero())
-		Blended = Gradient.IsNearlyZero() ? Deposited : Gradient;
-
-	OutDirection = Blended.GetSafeNormal2D();
+	OutAgitation = Mom.Size();
+	OutDirection = FVector(Mom.X, Mom.Y, 0.0).GetSafeNormal2D();
 }
 
 // ─── Intent Selection + Lost-Sight Search ────────────────────────────────────
@@ -1408,7 +1484,7 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 	// direction comes from the field only. This is the only horde coupling — no shared target.
 	float   FieldAgitation = 0.f;
 	FVector FieldDirection  = FVector::ZeroVector;
-	SampleAgitationField(State.Location, FieldAgitation, FieldDirection);
+	SampleMomentumField(State.Location, FieldAgitation, FieldDirection);
 	const float EffectiveAgitation = FMath::Max(State.Agitation, FieldAgitation);
 	A.HordePressureDirection = FieldDirection;
 
@@ -1475,12 +1551,26 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 	}
 	else if (bSeeing)
 	{
-		// Confirmed visible → chase the actor itself.
+		// Confirmed visible → chase the actor itself. Keep the Actor move target even when we flip to
+		// Attack, so the echo keeps closing/pushing forward (the melee task layers grab/bite/pull on
+		// top without stopping movement — momentum is preserved).
 		NewIntent           = EATR_EchoIntent::ChaseVisibleActor;
 		Move.Type           = EATR_EchoMoveTargetType::Actor;
 		Move.Actor          = A.ConfirmedVisibleActor;
 		Move.AcceptanceRadius = ReachLocationRadius;
 		S.bSearchActive     = false; // reacquired — abandon any search
+
+		// Within reach → engage melee.
+		const bool  bMelee   = !CachedSettings || CachedSettings->bEnableMeleeAttack;
+		const float AtkRange = CachedSettings ? CachedSettings->MeleeAttackRange : 220.f;
+		if (bMelee)
+		{
+			if (const AActor* Tgt = A.ConfirmedVisibleActor.Get())
+			{
+				if (FVector::Dist2D(State.Location, Tgt->GetActorLocation()) <= AtkRange)
+					NewIntent = EATR_EchoIntent::Attack;
+			}
+		}
 	}
 	else if (bSearchProducedIntent)
 	{
@@ -1499,7 +1589,8 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 		}
 		else
 		{
-			NewIntent = EATR_EchoIntent::TurnTowardStimulus; // weak — orient only, no path move
+			NewIntent     = EATR_EchoIntent::TurnTowardStimulus; // weak — orient only, no path move
+			Move.Location = A.LastHeardLocation;                 // orient target for the orient task
 		}
 	}
 	else if (EffectiveAgitation >= AgitationJoinThreshold && !A.HordePressureDirection.IsNearlyZero())
@@ -1515,14 +1606,16 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 	}
 	else if (EffectiveAgitation >= AgitationJoinThreshold)
 	{
-		NewIntent = EATR_EchoIntent::TurnTowardStimulus; // agitated but no clear direction
-		A.Mode    = EATR_AwarenessMode::HordeAgitated;
+		NewIntent     = EATR_EchoIntent::TurnTowardStimulus; // agitated but no clear direction
+		Move.Location = State.Location + A.HordePressureDirection * 500.f;
+		A.Mode        = EATR_AwarenessMode::HordeAgitated;
 	}
 	else if (EffectiveAgitation >= HordeCuriosityThreshold)
 	{
 		// Mild pressure → curious. Orient toward the hotspot but don't commit to migrating.
-		NewIntent = EATR_EchoIntent::TurnTowardStimulus;
-		A.Mode    = EATR_AwarenessMode::HordeAgitated;
+		NewIntent     = EATR_EchoIntent::TurnTowardStimulus;
+		Move.Location = State.Location + A.HordePressureDirection * 500.f;
+		A.Mode        = EATR_AwarenessMode::HordeAgitated;
 	}
 	else
 	{
@@ -1604,7 +1697,7 @@ void UATR_EchoSubsystem::UpdateLowDetailEcho(int32 Index, float Now, float Delta
 
 	float   FieldAgit = 0.f;
 	FVector FieldDir  = FVector::ZeroVector;
-	SampleAgitationField(State.Location, FieldAgit, FieldDir);
+	SampleMomentumField(State.Location, FieldAgit, FieldDir);
 	const float EffAgit = FMath::Max(State.Agitation, FieldAgit);
 	A.HordePressureDirection = FieldDir;
 
@@ -1713,7 +1806,7 @@ void UATR_EchoSubsystem::RunAbstractPass(float DeltaTime)
 
 		float   FieldAgit = 0.f;
 		FVector FieldDir  = FVector::ZeroVector;
-		SampleAgitationField(Pos, FieldAgit, FieldDir);
+		SampleMomentumField(Pos, FieldAgit, FieldDir);
 		if (FieldAgit > Cell.Agitation) Cell.Agitation = FieldAgit;
 		if (!FieldDir.IsNearlyZero())   Cell.PressureDirection = FVector2D(FieldDir.X, FieldDir.Y);
 		Cell.LastUpdatedTime = Now;
@@ -2084,7 +2177,7 @@ namespace
 	}
 }
 
-void UATR_EchoSubsystem::RunSteeringPass()
+void UATR_EchoSubsystem::RunSteeringPass(float DeltaTime)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_RunSteeringPass);
 
@@ -2101,6 +2194,7 @@ void UATR_EchoSubsystem::RunSteeringPass()
 	if (PlayerPositions.IsEmpty()) return;
 
 	const float MustPromoteSq = MustPromoteRadius * MustPromoteRadius;
+	const float Now           = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
 
 	// Crowd-shaping params, read-only inside the parallel body.
 	const bool  bSep        = bEnableHordeSeparation && HordeSeparationRadius > 1.f && SpatialGrid.IsInitialized();
@@ -2111,9 +2205,19 @@ void UATR_EchoSubsystem::RunSteeringPass()
 	const float ApproachJit = FMath::DegreesToRadians(HordeApproachJitterDegrees);
 	const float FlowJit     = FMath::DegreesToRadians(HordeDirectionJitterDegrees);
 
-	// Single pass over all local entities — each steers toward its nearest player within
-	// MustPromoteRadius (with jitter + separation so they don't pack into a perfect ring), or
-	// drifts on the diffused agitation field otherwise.
+	// Detachment params.
+	const bool   bDetach     = bEnableHordeDetachment;
+	const int32  EdgeN       = DetachEdgeNeighborCount;
+	const float  BackDot     = DetachBackDot;
+	const float  PEdge       = DetachChanceEdgePerSec;
+	const float  PBack       = DetachChanceBackPerSec;
+	const float  PRandom     = DetachChanceRandomPerSec;
+	const float  DriftSpeed  = DetachDriftSpeed;
+	const float  AlignThresh = MomentumAlignThreshold;
+	const uint32 DetachSalt  = (uint32)(Now * 1000.0);
+
+	// Single pass over all local entities — each aligns to local horde momentum (with separation,
+	// jitter, and edge/back/random detachment), or seeks a very-near player.
 	ParallelFor(LocalEntityScratch.Num(), [&](int32 LocalIdx)
 	{
 		const int32 EntityIndex = LocalEntityScratch[LocalIdx];
@@ -2121,12 +2225,13 @@ void UATR_EchoSubsystem::RunSteeringPass()
 
 		const FVector3f Pi = Positions[EntityIndex];
 
-		// Short-range separation: sum of away-from-neighbour * (1 - dist/R) over nearby echoes.
+		// Short-range separation + neighbour stats (count + centroid) for detachment.
 		// Allocation-free — walks the fine-grid cells overlapping the separation box.
 		FVector2f Sep(0.f, 0.f);
+		FVector2f NbrSum(0.f, 0.f);
+		int32     Count = 0;
 		if (bSep)
 		{
-			int32 Count = 0;
 			const FVector2D Mn(Pi.X - SepR, Pi.Y - SepR);
 			const FVector2D Mx(Pi.X + SepR, Pi.Y + SepR);
 			SpatialGrid.ForEachInBounds(Mn, Mx, [&](int32 j)
@@ -2141,6 +2246,7 @@ void UATR_EchoSubsystem::RunSteeringPass()
 					const float falloff = 1.f - (d2 * inv) / SepR; // 1 - dist/R
 					Sep.X += dx * inv * falloff;
 					Sep.Y += dy * inv * falloff;
+					NbrSum.X += Pj.X; NbrSum.Y += Pj.Y;
 					++Count;
 				}
 			});
@@ -2159,24 +2265,81 @@ void UATR_EchoSubsystem::RunSteeringPass()
 
 		if (BestPlayerIndex == INDEX_NONE)
 		{
-			// No player within MustPromoteRadius → drift on the (now smooth, diffused) field.
-			float   FieldAgit = 0.f;
-			FVector FieldDir  = FVector::ZeroVector;
-			SampleAgitationField(FVector(Pi), FieldAgit, FieldDir);
+			// No very-near player → align to local horde MOMENTUM (what others are doing).
+			float   Strength = 0.f;
+			FVector MomDir   = FVector::ZeroVector;
+			SampleMomentumField(FVector(Pi), Strength, MomDir);
 
-			const bool bHasFlow = (FieldAgit >= HordeCuriosityThreshold && !FieldDir.IsNearlyZero());
-			if (!bHasFlow && Sep.IsNearlyZero()) return; // genuinely idle → leave velocity as-is
+			// Weak local momentum → no horde to follow (this is how a horde finally disperses).
+			const bool bInHorde = (Strength >= AlignThresh && !MomDir.IsNearlyZero());
+
+			if (bInHorde && bDetach)
+			{
+				// Detachment: edge (few neighbours) + back (behind the crowd along momentum) + a
+				// constant random trickle. If it fires, the echo peels OUTWARD instead of aligning.
+				const bool bEdge = (Count < EdgeN);
+				bool bBack = false;
+				if (Count > 0)
+				{
+					const FVector2f Cen(NbrSum.X / Count, NbrSum.Y / Count);
+					FVector2f ToCen(Cen.X - Pi.X, Cen.Y - Pi.Y);
+					if (!ToCen.IsNearlyZero())
+					{
+						ToCen.Normalize();
+						const FVector2f MomN = FVector2f((float)MomDir.X, (float)MomDir.Y).GetSafeNormal();
+						bBack = FVector2f::DotProduct(MomN, ToCen) > BackDot; // crowd is ahead of me
+					}
+				}
+
+				float P = PRandom + (bEdge ? PEdge : 0.f) + (bBack ? PBack : 0.f);
+				if (P > 0.f && EchoHash01(EchoId, DetachSalt) < P * DeltaTime)
+				{
+					// Peel off: drift away from the crowd centre (or just use separation), no align.
+					FVector2f Out = Sep;
+					if (Count > 0)
+					{
+						const FVector2f Cen(NbrSum.X / Count, NbrSum.Y / Count);
+						FVector2f Away(Pi.X - Cen.X, Pi.Y - Cen.Y);
+						if (!Away.IsNearlyZero()) { Away.Normalize(); Out += Away; }
+					}
+					if (Out.IsNearlyZero())
+					{
+						// Dead-zone fix: no neighbours to push away from. Peel BACKWARD against the
+						// momentum (leave the flow), with a per-echo jitter; if there's no momentum
+						// direction either, pick a deterministic per-echo random heading.
+						FVector2f Back(-(float)MomDir.X, -(float)MomDir.Y);
+						if (Back.IsNearlyZero())
+						{
+							const float Ang = EchoHash01(EchoId, 0xDEADu) * 2.f * PI;
+							Back = FVector2f(FMath::Cos(Ang), FMath::Sin(Ang));
+						}
+						else
+						{
+							Back.Normalize();
+							Back = ATR_RotateVec2(Back, (EchoHash01(EchoId, 0xBEEFu) * 2.f - 1.f) * FlowJit);
+						}
+						Out = Back;
+					}
+					Out.Normalize();
+					Velocities[EntityIndex] = FVector3f(Out.X, Out.Y, 0.f) * DriftSpeed;
+					Yaws[EntityIndex]       = FMath::RadiansToDegrees(FMath::Atan2(Out.Y, Out.X));
+					MarkEchoDirty(EntityIndex, EEchoDirtyFlags::Transform);
+					return;
+				}
+			}
+
+			if (!bInHorde && Sep.IsNearlyZero()) return; // genuinely idle → leave velocity as-is
 
 			FVector2f Steer(0.f, 0.f);
 			float Speed = 0.f;
-			if (bHasFlow)
+			if (bInHorde)
 			{
-				FVector2f Flow(FieldDir.X, FieldDir.Y);
+				FVector2f Flow((float)MomDir.X, (float)MomDir.Y);
 				Flow.Normalize();
 				if (FlowJit > 0.f)
 					Flow = ATR_RotateVec2(Flow, (EchoHash01(EchoId, 0xF10Du) * 2.f - 1.f) * FlowJit);
 				Steer += Flow;
-				Speed = HordeWalkSpeed * FMath::Clamp(FieldAgit, 0.f, 1.f);
+				Speed = HordeWalkSpeed * FMath::Clamp(Strength, 0.f, 1.f);
 			}
 			Steer += Sep * SepStrength;
 			if (Steer.IsNearlyZero()) return;

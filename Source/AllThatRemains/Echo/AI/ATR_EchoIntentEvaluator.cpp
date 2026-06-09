@@ -35,11 +35,17 @@ void FATR_EchoIntentEvaluator::Tick(FStateTreeExecutionContext& Context, const f
 	Data.MoveRequest      = State->Movement.Request;
 	Data.AcceptanceRadius = State->Movement.Request.AcceptanceRadius;
 
+	// Always mirror the request location so orient-only intents (TurnTowardStimulus) can bind it as
+	// the point to turn toward, even though they don't path-move.
+	Data.TargetLocation = State->Movement.Request.Location;
+
 	switch (State->Movement.Request.Type)
 	{
 		case EATR_EchoMoveTargetType::Actor:
 			// Surface the actor only when sight is genuinely current — never chase stale memory.
-			if (State->Intent == EATR_EchoIntent::ChaseVisibleActor && State->Awareness.bHasCurrentLineOfSight)
+			// Both ChaseVisibleActor and Attack keep moving toward the live target.
+			if ((State->Intent == EATR_EchoIntent::ChaseVisibleActor || State->Intent == EATR_EchoIntent::Attack)
+				&& State->Awareness.bHasCurrentLineOfSight)
 			{
 				Data.ConfirmedVisibleActor = State->Movement.Request.Actor.Get();
 				Data.bHasValidMoveRequest  = (Data.ConfirmedVisibleActor != nullptr);
@@ -47,7 +53,6 @@ void FATR_EchoIntentEvaluator::Tick(FStateTreeExecutionContext& Context, const f
 			break;
 
 		case EATR_EchoMoveTargetType::Location:
-			Data.TargetLocation       = State->Movement.Request.Location;
 			Data.bHasValidMoveRequest = true;
 			break;
 

@@ -483,7 +483,7 @@ public:
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="1.0", ForceUnits="cm",
 		ToolTip="World size of one agitation cell. Larger = coarser, cheaper horde field."))
-	float AgitationCellSize = 2000.f;
+	float MomentumCellSize = 2000.f;
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0",
 		ToolTip="How fast deposited field pressure fades per second."))
@@ -501,10 +501,6 @@ public:
 		ToolTip="Agitation at/above which an Echo migrates with horde pressure."))
 	float AgitationJoinThreshold = 0.50f;
 
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="1.0",
-		ToolTip="Agitation deposited into the field by an Echo that currently sees a target."))
-	float SightAgitationAmount = 0.6f;
-
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0",
 		ToolTip="Scale from noise strength to agitation deposited into the field."))
 	float NoiseAgitationAmountScale = 1.0f;
@@ -512,10 +508,6 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="1.0",
 		ToolTip="Agitation deposited by combat events."))
 	float CombatAgitationAmount = 1.0f;
-
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ForceUnits="cm",
-		ToolTip="Radius over which an Echo-sourced agitation spreads into the field."))
-	float EchoAgitationSpreadRadius = 2000.f;
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ForceUnits="cm",
 		ToolTip="Distance an Echo moves per step when migrating under horde pressure."))
@@ -531,15 +523,11 @@ public:
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(
 		ToolTip="Spread agitation into neighbouring cells every tick so pressure forms a smooth gradient instead of staying in the deposit cell. Turn OFF to see the old grid-locked behaviour."))
-	bool bEnableAgitationDiffusion = true;
+	bool bEnableMomentumDiffusion = true;
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="20.0",
 		ToolTip="How fast agitation propagates outward, in cells-worth of exchange per second. Higher = pressure reaches far echoes sooner and the 'doesn't leave the grid' look disappears. 0 disables spread."))
-	float AgitationDiffusionRate = 3.0f;
-
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="1.0",
-		ToolTip="Blend between steering up the smooth pressure gradient toward the hotspot (1.0) and the raw deposited direction (0.0). Higher = smoother, less grid-aligned horde flow."))
-	float AgitationGradientWeight = 0.75f;
+	float MomentumDiffusionRate = 3.0f;
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="180.0", ForceUnits="deg",
 		ToolTip="Per-Echo random angular jitter added to field-driven movement so a group fans out instead of marching in lockstep along identical directions. 0 = no jitter (sharper patterns)."))
@@ -568,6 +556,88 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="1", ClampMax="64",
 		ToolTip="Maximum neighbours considered when computing an echo's separation (performance cap)."))
 	int32 HordeSeparationMaxNeighbors = 12;
+
+	// Detachment — echoes peel off a horde from the edges, the tail, and as a constant trickle, so
+	// hordes erode and eventually break up rather than persisting forever.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(
+		ToolTip="Enable echoes detaching/peeling off a moving horde (edge, tail, and random trickle). Off = once aligned, echoes follow momentum until it decays."))
+	bool bEnableHordeDetachment = true;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0", ClampMax="32",
+		ToolTip="An echo with fewer nearby neighbours than this counts as being on the EDGE of the horde and detaches more easily."))
+	int32 DetachEdgeNeighborCount = 3;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="-1.0", ClampMax="1.0",
+		ToolTip="An echo is at the BACK of the horde when the local crowd centre lies ahead of it along the momentum direction by at least this dot value. Lower = more echoes count as 'back'."))
+	float DetachBackDot = 0.25f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ClampMax="5.0",
+		ToolTip="Per-second probability that an EDGE echo detaches and wanders off."))
+	float DetachChanceEdgePerSec = 0.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ClampMax="5.0",
+		ToolTip="Per-second probability that a BACK (tail) echo detaches and wanders off."))
+	float DetachChanceBackPerSec = 0.6f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ClampMax="5.0",
+		ToolTip="Constant per-second detach probability for ANY horde echo, so hordes always shed a few stragglers."))
+	float DetachChanceRandomPerSec = 0.05f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ForceUnits="cm/s",
+		ToolTip="Speed a detached echo drifts outward (away from the crowd) as it peels off."))
+	float DetachDriftSpeed = 70.f;
+
+	// ── Echo|HordeMomentum ─────────────────────────────────────────────────────
+	// Movement-momentum model. Echoes don't share targets or deposit 'I saw the player' pressure;
+	// instead, MOVING echoes build a momentum field that nearby echoes align to. Aligned movement
+	// self-reinforces (more movers = stronger, longer-lived momentum) and a loud sound kicks a group
+	// into motion to seed it. Sight only makes that one echo chase — its movement can still drag a
+	// horde along via momentum, but it never reveals the player's location to others.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(
+		ToolTip="Master switch for the movement-momentum horde model. Off = no horde alignment (echoes act individually)."))
+	bool bEnableHordeMomentum = true;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ClampMax="10.0",
+		ToolTip="How fast aligned movement builds a cell's momentum per second. Higher = hordes coalesce faster."))
+	float MomentumBuildRate = 1.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ClampMax="10.0",
+		ToolTip="Base momentum decay per second. Higher = hordes peter out sooner."))
+	float MomentumDecayPerSecond = 0.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="How much strong momentum resists its own decay (0..1). Higher = big, coherent hordes take much longer to dissipate than weak ones."))
+	float MomentumPersistence = 0.7f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ForceUnits="cm/s",
+		ToolTip="Minimum speed for an echo's movement to count toward building momentum. Filters out idle jitter."))
+	float MomentumMoverSpeedThreshold = 30.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="1.0", ClampMax="200.0",
+		ToolTip="Number of aligned movers in a cell for full-strength momentum build. This is why a loud sound that starts 30 moving builds far stronger momentum than 3 wandering echoes."))
+	float MomentumRefMoverCount = 12.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Minimum local momentum strength before an echo will align/join the horde. Below this it acts on its own."))
+	float MomentumAlignThreshold = 0.12f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.1", ClampMax="4.0",
+		ToolTip="Maximum momentum magnitude a cell can hold."))
+	float MomentumMaxStrength = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Earshot radius of a loud sound: echoes within this start moving toward it (seeding a horde)."))
+	float SoundImpulseRadius = 4000.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ForceUnits="cm/s",
+		ToolTip="Initial speed an echo moves toward a heard sound (scaled by loudness & distance falloff)."))
+	float SoundImpulseSpeed = 150.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ClampMax="4.0",
+		ToolTip="Scales the sound movement impulse by event strength."))
+	float SoundImpulseStrengthScale = 1.0f;
 
 	// ── Echo|LowerTierSimulation ───────────────────────────────────────────────
 	// Budgets and speeds for LowDetail individual simulation and Abstract cell simulation.
@@ -663,6 +733,46 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(
 		ToolTip="Default obstacle behavior asset. Leave empty for sidestep/repath only."))
 	TSoftObjectPtr<UATR_EchoObstacleBehaviorDataAsset> DefaultObstacleBehavior;
+
+	// ── Echo|Combat ────────────────────────────────────────────────────────────
+	// Melee grab → bite → pull. Promoted echoes keep moving forward (momentum preserved) and, when
+	// within reach, attempt to grab; once grabbed they bite on a cadence and pull the target in.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(
+		ToolTip="Master switch for melee grab/bite. Off = promoted echoes only chase, never attack."))
+	bool bEnableMeleeAttack = true;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="A seen target within this range flips the echo's intent from Chase to Attack (engages the melee task). Keep >= GrabRange so the attack state is active a little before arm's length."))
+	float MeleeAttackRange = 220.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Arm's length — within this the echo attempts a grab (while still moving forward)."))
+	float GrabRange = 160.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Minimum seconds between grab attempts."))
+	float GrabCooldownSeconds = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="1.0",
+		ToolTip="The grab releases if the target gets farther than GrabRange * this multiplier."))
+	float GrabReleaseMultiplier = 1.6f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Once grabbed, the echo bites when the target is within this range. Clamped to <= GrabRange."))
+	float BiteRange = 110.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Minimum seconds between bites."))
+	float BiteCooldownSeconds = 1.2f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0",
+		ToolTip="Strength passed to the pawn's PullTarget hook while grabbed (your pull/root-motion logic scales off this)."))
+	float MeleePullStrength = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="deg",
+		ToolTip="Yaw turn rate (deg/sec) for the TurnTowardStimulus orient task."))
+	float OrientTurnRateDegPerSec = 240.f;
 
 	// ── Echo|Demotion ──────────────────────────────────────────────────────────
 	// Guards that keep an actively engaged Echo from being demoted out of the active pool.
