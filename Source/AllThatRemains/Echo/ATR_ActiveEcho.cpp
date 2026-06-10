@@ -10,6 +10,19 @@
 #include "Components/CapsuleComponent.h"
 #include "Logging/StructuredLog.h"
 
+namespace
+{
+	// "EATR_GrabOutcome::GrabbedWeak" → "GrabbedWeak" for compact structured log fields.
+	template <typename TEnum>
+	FString EnumShort(TEnum Value)
+	{
+		FString S = UEnum::GetValueAsString(Value);
+		int32 Idx = INDEX_NONE;
+		S.FindLastChar(TEXT(':'), Idx);
+		return Idx != INDEX_NONE ? S.Mid(Idx + 1) : S;
+	}
+}
+
 // ─── Construction ─────────────────────────────────────────────────────────────
 
 AATR_ActiveEcho::AATR_ActiveEcho()
@@ -189,18 +202,19 @@ void AATR_ActiveEcho::WriteBackToSoA(UATR_EchoSubsystem* Sub) const
 bool AATR_ActiveEcho::TryGrabTarget_Implementation(AActor* Target)
 {
 	if (!HasAuthority() || !IsValid(Target))
-	{
 		return false;
-	}
 
 	const FATR_GrabResult Result = ResolveGrabAttempt(Target);
 	CurrentGrip = Result.Grip;
 
+	if (Result.IsGrabbed())
+		BP_OnGrabConnected(Target, Result.Grip);
+	else
+		BP_OnGrabMissed(Target, Result.Outcome, Result.bScratchedTarget);
+
 	UE_LOGFMT(LogATR_EchoCombat, Log, "Grab Echo={Echo} Target={Target} Outcome={Outcome} Grip={Grip} Scratched={Scratched}",
-		("Echo", SourceIndex),
-		("Target", GetNameSafe(Target)),
-		("Outcome", static_cast<int32>(Result.Outcome)),
-		("Grip", static_cast<int32>(Result.Grip)),
+		("Echo", SourceIndex), ("Target", GetNameSafe(Target)),
+		("Outcome", EnumShort(Result.Outcome)), ("Grip", EnumShort(Result.Grip)),
 		("Scratched", Result.bScratchedTarget));
 
 	return Result.IsGrabbed();
@@ -220,8 +234,7 @@ FATR_GrabResult AATR_ActiveEcho::ResolveGrabAttempt(AActor* Target)
 
 	const FATR_EchoHealthModel& Model = Sub->GetHealthModel();
 
-	// Physically incapable — no arms/hands left at all. FAIL-OPEN on unknown
-	// rows (flags 0): missing data must never disarm a healthy Echo.
+	// Physically incapable — no arms/hands left at all. FAIL-OPEN on unknown rows (flags 0).
 	const uint16 Caps = Model.GetCapabilityFlags(SourceIndex);
 	if (Caps != 0 && !(Caps & ATR_EchoCapability::CanGrabAny))
 	{
@@ -243,14 +256,11 @@ FATR_GrabResult AATR_ActiveEcho::ResolveGrabAttempt(AActor* Target)
 	{
 		Result.Outcome = EATR_GrabOutcome::Missed;
 		if (FMath::FRand() < S->ScratchOnMissChance)
-		{
 			Result.bScratchedTarget = ApplyWoundToTarget(Target, EATR_BiteWound::Scratch);
-		}
 		return Result;
 	}
 
-	// Grip strength: any hand with enough fingers (UATR_HealthSettings.
-	// MinFingersForStrongGrab) holds strong; otherwise the grab takes weak.
+	// Grip strength: any hand with enough fingers holds strong; otherwise weak.
 	const bool bStrong = Model.CanGrabStrong(SourceIndex, /*bLeftHand =*/ true)
 	                  || Model.CanGrabStrong(SourceIndex, /*bLeftHand =*/ false);
 	Result.Outcome = bStrong ? EATR_GrabOutcome::GrabbedStrong : EATR_GrabOutcome::GrabbedWeak;
@@ -261,16 +271,12 @@ FATR_GrabResult AATR_ActiveEcho::ResolveGrabAttempt(AActor* Target)
 bool AATR_ActiveEcho::TryBiteTarget_Implementation(AActor* Target)
 {
 	if (!HasAuthority() || !IsValid(Target))
-	{
 		return false;
-	}
 
 	const UATR_EchoSettings* S = GetDefault<UATR_EchoSettings>();
 	UATR_EchoSubsystem* Sub = GetWorld() ? GetWorld()->GetSubsystem<UATR_EchoSubsystem>() : nullptr;
 	if (!S || !Sub || SourceIndex == INDEX_NONE)
-	{
 		return false;
-	}
 
 	// No jaw (or no neck function) = no bite. The grab can still hold.
 	// FAIL-OPEN on unknown rows (flags 0) — see ResolveGrabAttempt.
@@ -293,13 +299,11 @@ bool AATR_ActiveEcho::TryBiteTarget_Implementation(AActor* Target)
 		                                  EATR_BiteWound::Scratch;
 
 	const bool bLanded = ApplyWoundToTarget(Target, Tier);
+	BP_OnBiteResolved(Target, Tier);
 
 	UE_LOGFMT(LogATR_EchoCombat, Log, "Bite Echo={Echo} Target={Target} Grip={Grip} Tier={Tier} Landed={Landed}",
-		("Echo", SourceIndex),
-		("Target", GetNameSafe(Target)),
-		("Grip", static_cast<int32>(CurrentGrip)),
-		("Tier", static_cast<int32>(Tier)),
-		("Landed", bLanded));
+		("Echo", SourceIndex), ("Target", GetNameSafe(Target)),
+		("Grip", EnumShort(CurrentGrip)), ("Tier", EnumShort(Tier)), ("Landed", bLanded));
 
 	return bLanded;
 }
@@ -307,32 +311,22 @@ bool AATR_ActiveEcho::TryBiteTarget_Implementation(AActor* Target)
 void AATR_ActiveEcho::PullTarget_Implementation(AActor* Target, float Strength)
 {
 	if (!HasAuthority() || !IsValid(Target) || CurrentGrip == EATR_EchoGripType::None)
-	{
 		return;
-	}
 
 	const UATR_EchoSettings* S = GetDefault<UATR_EchoSettings>();
 	const UWorld* World = GetWorld();
 	if (!S || !World)
-	{
 		return;
-	}
 
 	const float GripScale = CurrentGrip == EATR_EchoGripType::Weak ? S->WeakGripPullScale : 1.f;
 	const float PullSpeed = S->MeleePullSpeed * FMath::Max(Strength, 0.f) * GripScale;
 	if (PullSpeed <= 0.f)
-	{
 		return;
-	}
 
 	const FVector Dir = (GetActorLocation() - Target->GetActorLocation()).GetSafeNormal2D();
 	if (Dir.IsNearlyZero())
-	{
 		return;
-	}
 
-	// Per-second velocity drag: PullTarget is called every melee-task tick, so
-	// scale by frame time — sustained pulling accelerates at ~PullSpeed cm/s².
 	const float Dt = World->GetDeltaSeconds();
 
 	if (const ACharacter* Char = Cast<ACharacter>(Target))
@@ -346,13 +340,10 @@ void AATR_ActiveEcho::PullTarget_Implementation(AActor* Target, float Strength)
 		return;
 	}
 
-	// Non-character fallback: physics-simulated roots get a velocity-change impulse.
 	if (UPrimitiveComponent* Prim = Cast<UPrimitiveComponent>(Target->GetRootComponent()))
 	{
 		if (Prim->IsSimulatingPhysics())
-		{
 			Prim->AddImpulse(Dir * PullSpeed * Dt, NAME_None, /*bVelChange =*/ true);
-		}
 	}
 }
 

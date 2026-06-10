@@ -738,6 +738,8 @@ public:
 	// ── Echo|Combat ────────────────────────────────────────────────────────────
 	// Melee grab → bite → pull. Promoted echoes keep moving forward (momentum preserved) and, when
 	// within reach, attempt to grab; once grabbed they bite on a cadence and pull the target in.
+	// Resolution (success/failure, grip strength, wound severity, failed-grab scratches) is fully
+	// C++-owned on AATR_ActiveEcho — these are the tuning knobs for that math.
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(
 		ToolTip="Master switch for melee grab/bite. Off = promoted echoes only chase, never attack."))

@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "StateTreeTaskBase.h"
+#include "../ATR_EchoCombatTypes.h"
 #include "ATR_EchoMeleeTask.generated.h"
 
 // Instance data. Bind Target to the Echo Intent evaluator's ConfirmedVisibleActor so the melee task
@@ -18,10 +19,11 @@ struct FATR_EchoMeleeTaskInstanceData
 	TObjectPtr<AActor> Target = nullptr;
 
 	// Internal grab state + cooldown clocks (not designer-bound).
-	UPROPERTY(Transient) bool  bGrabbed     = false;
-	UPROPERTY(Transient) float LastGrabTime = -1000.f;
-	UPROPERTY(Transient) float LastBiteTime = -1000.f;
-	UPROPERTY(Transient) float GrabStartTime = -1.f; // server-time when current grab began
+	UPROPERTY(Transient) bool  bGrabbed      = false;
+	UPROPERTY(Transient) float LastGrabTime  = -1000.f;
+	UPROPERTY(Transient) float LastBiteTime  = -1000.f;
+	UPROPERTY(Transient) float GrabStartTime = -1.f;
+	UPROPERTY(Transient) EATR_EchoGripType Grip = EATR_EchoGripType::None;
 };
 
 // Melee grab → bite → pull, layered ON TOP of the chase. This task NEVER stops (always Running) so
@@ -29,6 +31,10 @@ struct FATR_EchoMeleeTaskInstanceData
 //   - within GrabRange  → attempt a grab (TryGrabTarget); on success, hold it and block demotion;
 //   - while grabbed     → pull the target in (PullTarget) and bite (TryBiteTarget) on a cadence;
 //   - target slips away → release the grab.
+//
+// This task only drives CADENCE (when to attempt). All combat RESOLUTION — success/failure,
+// grip strength, wounds, failed-grab scratches, pull physics — is C++-owned by AATR_ActiveEcho
+// and logged to LogATR_EchoCombat. Blueprint only receives cosmetic BP_On* events from the pawn.
 //
 // Context owner must be AATR_EchoAIController; its pawn must be an AATR_ActiveEcho. Place this task
 // on the Attack state alongside ATR_EchoMoveRequestTask.

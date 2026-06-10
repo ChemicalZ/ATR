@@ -34,4 +34,8 @@ private:
 
 	TSharedPtr<SATR_EchoDebugMapView> MapView;
 	FSimpleDelegate OnCloseRequested;
+
+	// Sound stimulus type picker options (label + parallel EATR_StimulusType ordinal).
+	TArray<TSharedPtr<FString>> SoundTypeOptions;
+	TArray<uint8>               SoundTypeValues;
 };

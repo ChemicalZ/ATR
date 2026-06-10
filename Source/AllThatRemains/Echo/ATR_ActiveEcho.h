@@ -118,6 +118,27 @@ public:
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 protected:
+	// --- Cosmetic Blueprint hooks (presentation ONLY) ---
+	// No return values: by the time these fire, C++ has already resolved and applied the outcome.
+	// Use them for montages, attaching the target hand-to-chest, blood FX, audio.
+
+	// A grab connected. Attach/constraint visuals + grab montage go here.
+	UFUNCTION(BlueprintImplementableEvent, Category = "Echo|Combat", meta = (DisplayName = "On Grab Connected"))
+	void BP_OnGrabConnected(AActor* Target, EATR_EchoGripType Grip);
+
+	// A grab attempt failed (whiff/bad angle/no arms). bScratchedTarget = the whiff still raked
+	// a scratch (already applied by C++) — play swipe FX accordingly.
+	UFUNCTION(BlueprintImplementableEvent, Category = "Echo|Combat", meta = (DisplayName = "On Grab Missed"))
+	void BP_OnGrabMissed(AActor* Target, EATR_GrabOutcome Outcome, bool bScratchedTarget);
+
+	// The grab ended (escape, state exit). Detach visuals here.
+	UFUNCTION(BlueprintImplementableEvent, Category = "Echo|Combat", meta = (DisplayName = "On Grab Released"))
+	void BP_OnGrabReleased(AActor* Target);
+
+	// A bite resolved (including Miss). Wound severity already decided/logged by C++.
+	UFUNCTION(BlueprintImplementableEvent, Category = "Echo|Combat", meta = (DisplayName = "On Bite Resolved"))
+	void BP_OnBiteResolved(AActor* Target, EATR_BiteWound Wound);
+
 	virtual void BeginPlay() override;
 
 	// Previous SourceIndex on this machine — lets OnRep unregister the old slot before registering the new one.

@@ -42,6 +42,12 @@ public:
 	bool bShowMoveArrows    = false; // per-echo current movement-direction arrow
 	bool bShowTargetLines   = false; // line from echo to its current move target
 
+	// Click-to-emit sound (debug map). When bEmitSoundMode is on, left-click emits a stimulus.
+	bool  bEmitSoundMode = false;
+	float SoundStrength  = 1.0f;
+	float SoundRadius    = 4000.f;
+	uint8 SoundType      = 0; // EATR_StimulusType ordinal (0 = Noise)
+
 	// View controls invoked by the toolbar buttons.
 	void ZoomBy(float Factor);                 // multiply zoom about the view center
 	void ResetView();                          // frame the whole world extent
@@ -61,6 +67,9 @@ public:
 private:
 	UATR_EchoSubsystem* GetSubsystem() const;
 
+	// Emit a stimulus at a world XY using the current Sound* params (called on click in emit mode).
+	void EmitSoundAtWorld(const FVector2D& WorldXY);
+
 	// World(cm) ⇄ local-screen(px) transforms. +X world → screen right, +Y world → screen up.
 	FVector2D WorldToScreen(const FVector2D& World, const FVector2D& LocalSize) const;
 	FVector2D ScreenToWorld(const FVector2D& Screen, const FVector2D& LocalSize) const;
@@ -78,7 +87,11 @@ private:
 	bool      bPanning = false;
 	FVector2D LastPanScreenPos = FVector2D::ZeroVector;
 
-	UATR_EchoSubsystem* WeakSubsystem;
+	UATR_EchoSubsystem* WeakSubsystem = nullptr;
+
+	// Recent emit pulses for visual feedback (expanding fading rings).
+	struct FEmitMarker { FVector2D World; double Time; float Radius; };
+	mutable TArray<FEmitMarker> RecentEmits;
 
 	// Solid white 1x1 brush; MakeBox tint supplies the actual color.
 	FSlateColorBrush FillBrush = FSlateColorBrush(FLinearColor::White);

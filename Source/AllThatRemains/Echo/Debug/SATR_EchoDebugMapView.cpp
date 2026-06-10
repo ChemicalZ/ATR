@@ -433,6 +433,32 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 		}
 	}
 
+	// ── Sound emission pulses (click-to-emit feedback) ──
+	{
+		const double NowT = FPlatformTime::Seconds();
+		const double Life = 1.6;
+		for (int32 i = RecentEmits.Num() - 1; i >= 0; --i)
+		{
+			const double Age = NowT - RecentEmits[i].Time;
+			if (Age > Life) { RecentEmits.RemoveAt(i); continue; }
+			const float Tt  = (float)(Age / Life);
+			const FVector2D Cs = WorldToScreen(RecentEmits[i].World, LS);
+			const float Rpx = RecentEmits[i].Radius * Tt * PixelsPerCm;
+			const FLinearColor C(1.f, 0.8f, 0.15f, 1.f - Tt);
+			const int32 Seg = 28;
+			TArray<FVector2D> Pts; Pts.Reserve(Seg + 1);
+			for (int32 s = 0; s <= Seg; ++s) { const float A = (float)s / Seg * 2.f * PI; Pts.Add(Cs + FVector2D(FMath::Cos(A), FMath::Sin(A)) * Rpx); }
+			FSlateDrawElement::MakeLines(OutDrawElements, LPlayer, AllottedGeometry.ToPaintGeometry(), Pts, ESlateDrawEffect::None, C, true, 2.f);
+			Box(LPlayer, Cs - FVector2D(3.f, 3.f), FVector2D(6.f, 6.f), FLinearColor(1.f, 0.8f, 0.15f, 1.f - Tt));
+		}
+	}
+
+	if (bEmitSoundMode)
+		Text(LText, FVector2D(10, LS.Y - 40),
+			FString::Printf(TEXT("EMIT SOUND: click map to drop  [type %d  strength %.2f  radius %.0f]"),
+				(int32)SoundType, SoundStrength, SoundRadius),
+			Font10, FLinearColor(1.f, 0.85f, 0.25f));
+
 	// ── HUD stat line ──
 	{
 		const float CmPerPixel = (PixelsPerCm > KINDA_SMALL_NUMBER) ? 1.f / PixelsPerCm : 0.f;
@@ -531,8 +557,43 @@ FReply SATR_EchoDebugMapView::OnMouseWheel(const FGeometry& MyGeometry, const FP
 	return FReply::Handled();
 }
 
+void SATR_EchoDebugMapView::EmitSoundAtWorld(const FVector2D& WorldXY)
+{
+	UATR_EchoSubsystem* Sub = GetSubsystem();
+	if (!Sub) return;
+
+	UWorld* W = Sub->GetWorld();
+
+	// Place the stimulus at the local player's Z so 3D distance falloff matches the echoes' height.
+	double Z = 0.0;
+	if (W)
+		if (APlayerController* PC = W->GetFirstPlayerController())
+			if (APawn* P = PC->GetPawn())
+				Z = P->GetActorLocation().Z;
+
+	FATR_StimulusEvent E;
+	E.Type        = static_cast<EATR_StimulusType>(SoundType);
+	E.Location    = FVector(WorldXY.X, WorldXY.Y, Z);
+	E.Strength    = SoundStrength;
+	E.Radius      = SoundRadius;
+	E.Direction   = FVector::ZeroVector;
+	E.TimeSeconds = W ? W->GetTimeSeconds() : 0.f;
+
+	Sub->EmitWorldStimulus(E);
+	RecentEmits.Add({ WorldXY, FPlatformTime::Seconds(), SoundRadius });
+}
+
 FReply SATR_EchoDebugMapView::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
+	// Emit-sound mode: left-click drops a stimulus at the clicked world point (no pan).
+	if (bEmitSoundMode && MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
+	{
+		const FVector2D LS    = MyGeometry.GetLocalSize();
+		const FVector2D Local = MyGeometry.AbsoluteToLocal(MouseEvent.GetScreenSpacePosition());
+		EmitSoundAtWorld(ScreenToWorld(Local, LS));
+		return FReply::Handled();
+	}
+
 	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton || MouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
 	{
 		bPanning = true;
@@ -566,3 +627,4 @@ FReply SATR_EchoDebugMapView::OnMouseMove(const FGeometry& MyGeometry, const FPo
 	ViewCenterWorld.Y += DeltaPx.Y * Inv; // screen-down drag reveals world below
 	return FReply::Handled();
 }
+  

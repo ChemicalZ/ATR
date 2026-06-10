@@ -7,6 +7,8 @@
 #include "Widgets/Layout/SSpacer.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SCheckBox.h"
+#include "Widgets/Input/SSpinBox.h"
+#include "Widgets/Input/SComboBox.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Styling/CoreStyle.h"
 #include "Fonts/SlateFontInfo.h"
@@ -55,6 +57,13 @@ void SATR_EchoDebugMapWidget::Construct(const FArguments& InArgs)
 	OnCloseRequested = InArgs._OnCloseRequested;
 
 	SAssignNew(MapView, SATR_EchoDebugMapView);
+
+	if (SoundTypeOptions.Num() == 0)
+	{
+		auto AddType = [&](const TCHAR* L, uint8 V){ SoundTypeOptions.Add(MakeShared<FString>(L)); SoundTypeValues.Add(V); };
+		AddType(TEXT("Noise"), 0); AddType(TEXT("Combat"), 6); AddType(TEXT("DoorImpact"), 4);
+		AddType(TEXT("WindowImpact"), 5); AddType(TEXT("Scripted"), 7);
+	}
 
 	auto Sep = []() { return SNew(SSpacer).Size(FVector2D(14.f, 1.f)); };
 
@@ -113,6 +122,41 @@ void SATR_EchoDebugMapWidget::Construct(const FArguments& InArgs)
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)[ MakeButton(TEXT("Zoom -"), [this]() { if (MapView.IsValid()) MapView->ZoomBy(0.8f); }) ]
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)[ MakeButton(TEXT("Focus"),  [this]() { if (MapView.IsValid()) MapView->FocusOnEchoes(); }, TEXT("Frame the current active-echo cluster.")) ]
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)[ MakeButton(TEXT("Reset"),  [this]() { if (MapView.IsValid()) MapView->ResetView(); }, TEXT("Reset to the full world extent.")) ]
+
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)[ Sep() ]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)[ MakeToggle(TEXT("Emit"), &SATR_EchoDebugMapView::bEmitSoundMode, TEXT("Click-to-emit: left-click the map to emit a sound stimulus at that point. Pan with right-drag while on.")) ]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(4.f,0.f,2.f,0.f))[ SNew(STextBlock).Text(FText::FromString(TEXT("Str"))).Font(ToolbarFont()) ]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)
+				[
+					SNew(SSpinBox<float>).MinValue(0.f).MaxValue(4.f).Delta(0.05f).MinDesiredWidth(56.f)
+					.Value_Lambda([this]{ return MapView.IsValid() ? MapView->SoundStrength : 1.f; })
+					.OnValueChanged_Lambda([this](float V){ if (MapView.IsValid()) MapView->SoundStrength = V; })
+				]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(4.f,0.f,2.f,0.f))[ SNew(STextBlock).Text(FText::FromString(TEXT("Rad"))).Font(ToolbarFont()) ]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)
+				[
+					SNew(SSpinBox<float>).MinValue(0.f).MaxValue(50000.f).Delta(100.f).MinDesiredWidth(74.f)
+					.Value_Lambda([this]{ return MapView.IsValid() ? MapView->SoundRadius : 4000.f; })
+					.OnValueChanged_Lambda([this](float V){ if (MapView.IsValid()) MapView->SoundRadius = V; })
+				]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(4.f,0.f,2.f,0.f))[ SNew(STextBlock).Text(FText::FromString(TEXT("Type"))).Font(ToolbarFont()) ]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)
+				[
+					SNew(SComboBox<TSharedPtr<FString>>)
+					.OptionsSource(&SoundTypeOptions)
+					.OnGenerateWidget_Lambda([](TSharedPtr<FString> In){ return SNew(STextBlock).Text(FText::FromString(*In)); })
+					.OnSelectionChanged_Lambda([this](TSharedPtr<FString> In, ESelectInfo::Type){
+						if (!In.IsValid() || !MapView.IsValid()) return;
+						const int32 Idx = SoundTypeOptions.IndexOfByKey(In);
+						if (SoundTypeValues.IsValidIndex(Idx)) MapView->SoundType = SoundTypeValues[Idx];
+					})
+					[
+						SNew(STextBlock).Font(ToolbarFont()).Text_Lambda([this]{
+							const int32 Idx = SoundTypeValues.IndexOfByKey(MapView.IsValid() ? MapView->SoundType : (uint8)0);
+							return FText::FromString(SoundTypeOptions.IsValidIndex(Idx) ? *SoundTypeOptions[Idx] : FString(TEXT("Noise")));
+						})
+					]
+				]
 
 				+ SHorizontalBox::Slot().FillWidth(1.f)[ SNew(SSpacer) ]
 

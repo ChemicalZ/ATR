@@ -2,6 +2,7 @@
 
 #include "ATR_EchoMeleeTask.h"
 #include "ATR_EchoAIController.h"
+#include "ATR_EchoAILog.h"
 #include "../ATR_ActiveEcho.h"
 #include "../ATR_EchoSettings.h"
 #include "StateTreeExecutionContext.h"
@@ -10,18 +11,19 @@
 EStateTreeRunStatus FATR_EchoMeleeTask::EnterState(FStateTreeExecutionContext& Context, const FStateTreeTransitionResult& Transition) const
 {
 	FInstanceDataType& Data = Context.GetInstanceData(*this);
-	Data.bGrabbed     = false;
-	Data.LastGrabTime = -1000.f;
-	Data.LastBiteTime = -1000.f;
+	Data.bGrabbed      = false;
+	Data.LastGrabTime  = -1000.f;
+	Data.LastBiteTime  = -1000.f;
 	Data.GrabStartTime = -1.f;
+	Data.Grip          = EATR_EchoGripType::None;
 
-	// Safety net: a prior task instance may have leaked bBlockDemotion=true
-	// (e.g. StateTree force-exited without ExitState firing cleanly). Clear it
-	// on every fresh enter so the demotion guard never strands across attempts.
+	// Safety net: a prior task instance may have leaked bBlockDemotion=true if StateTree
+	// force-exited without ExitState firing cleanly. Clear it on fresh enter.
 	if (AATR_EchoAIController* AIC = Cast<AATR_EchoAIController>(Context.GetOwner()))
 		if (AATR_ActiveEcho* Pawn = Cast<AATR_ActiveEcho>(AIC->GetPawn()))
 			Pawn->bBlockDemotion = false;
 
+	UE_LOG(LogATR_EchoAI, Verbose, TEXT("EchoMelee: enter attack state"));
 	return EStateTreeRunStatus::Running;
 }
 
@@ -36,27 +38,31 @@ EStateTreeRunStatus FATR_EchoMeleeTask::Tick(FStateTreeExecutionContext& Context
 	if (!Pawn)
 		return EStateTreeRunStatus::Running; // can't act this frame; keep the move task driving
 
-	auto ReleaseGrab = [&]()
+	const int32 EchoId = AIC ? AIC->GetEchoId() : INDEX_NONE;
+
+	auto ReleaseGrab = [&](const TCHAR* Why)
 	{
 		if (Data.bGrabbed)
 		{
 			Data.bGrabbed = false;
+			Data.Grip     = EATR_EchoGripType::None;
 			Pawn->bBlockDemotion = false;
-			Pawn->NotifyGrabReleased(); // clears CurrentGrip (replicated)
+			Pawn->NotifyGrabReleased();
+			UE_LOG(LogATR_EchoAI, Verbose, TEXT("EchoMelee[%d]: RELEASE grab (%s)"), EchoId, Why);
 		}
 	};
 
 	AActor* Target = Data.Target;
 	if (!IsValid(Target))
 	{
-		ReleaseGrab();
+		ReleaseGrab(TEXT("target invalid"));
 		return EStateTreeRunStatus::Running;
 	}
 
 	const UATR_EchoSettings* S = GetDefault<UATR_EchoSettings>();
 	if (!S || !S->bEnableMeleeAttack)
 	{
-		ReleaseGrab();
+		ReleaseGrab(TEXT("melee disabled"));
 		return EStateTreeRunStatus::Running;
 	}
 
@@ -64,35 +70,38 @@ EStateTreeRunStatus FATR_EchoMeleeTask::Tick(FStateTreeExecutionContext& Context
 	const float Now  = W ? W->GetTimeSeconds() : 0.f;
 	const float Dist = FVector::Dist2D(Pawn->GetActorLocation(), Target->GetActorLocation());
 
-	// Grab attempt — within arm's length, off cooldown. The echo keeps moving forward regardless.
+	// Grab attempt - within arm's length, off cooldown. The echo keeps moving forward regardless.
+	// Outcome (incl. failed-grab scratches) is resolved + logged by the pawn in LogATR_EchoCombat.
 	if (!Data.bGrabbed && Dist <= S->GrabRange && (Now - Data.LastGrabTime) >= S->GrabCooldownSeconds)
 	{
 		Data.LastGrabTime = Now;
 		if (Pawn->TryGrabTarget(Target))
 		{
-			Data.bGrabbed = true;
+			Data.bGrabbed      = true;
 			Data.GrabStartTime = Now;
+			Data.Grip          = Pawn->CurrentGrip; // resolved by TryGrabTarget_Implementation
 			Pawn->bBlockDemotion = true; // don't demote mid-grab
+			UE_LOG(LogATR_EchoAI, Verbose, TEXT("EchoMelee[%d]: GRAB %s (dist %.0f cm)"),
+				EchoId, *GetNameSafe(Target), Dist);
 		}
 	}
 
 	// While grabbed — pull the target in and bite on a cadence; release if it slips away,
-	// the grip got cleared externally (e.g. structural damage broke both arms), or the
-	// grab has been held too long (anti-strand: max grab duration).
+	// the grip was lost externally (structural damage), or the grab has held too long (anti-strand).
 	if (Data.bGrabbed)
 	{
 		// External grip loss (capability change cleared CurrentGrip): bail out cleanly.
 		if (Pawn->CurrentGrip == EATR_EchoGripType::None)
 		{
-			ReleaseGrab();
+			Data.Grip = EATR_EchoGripType::None;
+			ReleaseGrab(TEXT("grip lost externally"));
 			return EStateTreeRunStatus::Running;
 		}
 
-		// Anti-strand: cap any single grab to MaxGrabHoldSeconds so a stuck grab can't
-		// hold bBlockDemotion forever (e.g. target stays in BadAngle/cone-fail loop).
+		// Anti-strand: cap any single grab so bBlockDemotion can't strand forever.
 		if (Data.GrabStartTime > 0.f && (Now - Data.GrabStartTime) > S->MaxGrabHoldSeconds)
 		{
-			ReleaseGrab();
+			ReleaseGrab(TEXT("max hold exceeded"));
 			return EStateTreeRunStatus::Running;
 		}
 
@@ -101,14 +110,14 @@ EStateTreeRunStatus FATR_EchoMeleeTask::Tick(FStateTreeExecutionContext& Context
 		if (Dist <= S->BiteRange && (Now - Data.LastBiteTime) >= S->BiteCooldownSeconds)
 		{
 			Data.LastBiteTime = Now;
-			Pawn->TryBiteTarget(Target);
+			Pawn->TryBiteTarget(Target); // grip read from Pawn->CurrentGrip internally
 		}
 
 		if (Dist > S->GrabRange * S->GrabReleaseMultiplier)
-			ReleaseGrab();
+			ReleaseGrab(TEXT("target escaped"));
 	}
 
-	return EStateTreeRunStatus::Running; // never completes — chase + attack run together
+	return EStateTreeRunStatus::Running; // never completes - chase + attack run together
 }
 
 void FATR_EchoMeleeTask::ExitState(FStateTreeExecutionContext& Context, const FStateTreeTransitionResult& Transition) const
@@ -119,9 +128,10 @@ void FATR_EchoMeleeTask::ExitState(FStateTreeExecutionContext& Context, const FS
 		if (AATR_EchoAIController* AIC = Cast<AATR_EchoAIController>(Context.GetOwner()))
 			if (AATR_ActiveEcho* Pawn = Cast<AATR_ActiveEcho>(AIC->GetPawn()))
 			{
-				Pawn->bBlockDemotion = false; // always release the demotion block on exit
-				Pawn->NotifyGrabReleased();   // clears CurrentGrip (replicated)
+				Pawn->bBlockDemotion = false;
+				Pawn->NotifyGrabReleased();
 			}
 		Data.bGrabbed = false;
+		Data.Grip     = EATR_EchoGripType::None;
 	}
 }
