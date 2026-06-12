@@ -84,6 +84,9 @@ materials, body regions) is in DataAssets as the doc requires.
   replication component to carry.
 - Kept lightweight per doc: no vitamin chemistry, no addiction sim, no surgery,
   no prosthetics, blood compatibility = standard type matrix only.
+- Debug: full state dumps (`GetDebugString` on the component, per-Echo dump on the
+  model) plus log toggles in settings. The on-screen debug UI panel needs HUD/input
+  wiring into existing systems, so it ships with the linking pass.
 
 ---
 
@@ -96,6 +99,4 @@ materials, body regions) is in DataAssets as the doc requires.
 | Base + derived stats | `Health/Human/ATR_HumanStats.h` |
 | Human simulation component (combat pipeline, tick buckets, treatment, healing, death) | `Health/Human/ATR_HumanHealthComponent.h/.cpp` |
 | Tunables (rates, fatal thresholds, tick Hz, Echo rules, debug toggles) | `Health/ATR_HealthSettings.h/.cpp` |
-| Content DataAssets | `Health/Data/ATR_*Definition.h`, `ATR_WeaponDamageProfile.h` |
-| Echo SoA, masks, capability flags, deltas | `Health/Echo/ATR_EchoHealthTypes.h` |
-| Echo structural model (damage, recompute, delta queue) | `Health/Echo/ATR_EchoHealthModel.h/.cpp` |
+| Content DataAssets | `Health/Data/AT

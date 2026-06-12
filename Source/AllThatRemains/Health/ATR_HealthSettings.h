@@ -217,6 +217,14 @@ public:
 		ToolTip="Wetness01 dried per hour in neutral conditions (heat/wind handled by callers of AddWetness)."))
 	float WetnessDryPerHour = 0.3f;
 
+	UPROPERTY(Config, EditAnywhere, Category="Health|Survival", meta=(ClampMin="0.0",
+		ToolTip="Fatigue01 gained per second at full exertion."))
+	float FatigueGainPerSecond = 0.002f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Health|Survival", meta=(ClampMin="0.0",
+		ToolTip="Fatigue01 recovered per second at rest (scaled by calories/sleep)."))
+	float FatigueRecoveryPerSecond = 0.001f;
+
 	// ── Health|Infection & Healing ─────────────────────────────────────────
 
 	UPROPERTY(Config, EditAnywhere, Category="Health|InfectionHealing", meta=(ClampMin="0.0",
@@ -275,13 +283,4 @@ public:
 
 	UPROPERTY(Config, EditAnywhere, Category="Debug",
 		meta=(ToolTip="Log condition add/remove/stage transitions."))
-	bool bLogConditionChanges = true;
-
-	UPROPERTY(Config, EditAnywhere, Category="Debug",
-		meta=(ToolTip="Verbose: log vital deltas every fast tick (spammy — VeryVerbose channel)."))
-	bool bLogVitalDeltas = false;
-
-	UPROPERTY(Config, EditAnywhere, Category="Debug",
-		meta=(ToolTip="Log Echo structural mask/capability changes and delta queue stats."))
-	bool bLogEchoStructuralChanges = false;
-};
+	bool bL

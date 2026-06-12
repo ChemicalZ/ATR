@@ -157,16 +157,24 @@ public:
 
 	// ── Queries ────────────────────────────────────────────────────────────
 
-	UFUNCTION(BlueprintPure, Category = "Health") const FATR_HumanVitals& GetVitals() const { return Vitals; }
-	UFUNCTION(BlueprintPure, Category = "Health") const FATR_HumanSurvivalStats& GetSurvivalStats() const { return Survival; }
-	UFUNCTION(BlueprintPure, Category = "Health") const FATR_DerivedCombatStats& GetDerivedStats() const { return Derived; }
-	UFUNCTION(BlueprintPure, Category = "Health") const FATR_BloodState& GetBloodState() const { return Blood; }
-	UFUNCTION(BlueprintPure, Category = "Health") const TArray<FATR_Wound>& GetWounds() const { return Wounds; }
-	UFUNCTION(BlueprintPure, Category = "Health") const TArray<FATR_Condition>& GetConditions() const { return Conditions; }
-	UFUNCTION(BlueprintPure, Category = "Health") const TArray<FATR_PermanentImpairment>& GetImpairments() const { return Impairments; }
+	// UFUNCTIONs cannot return references — BP getters copy. C++ callers that
+	// care should use the *Ref accessors below.
+	UFUNCTION(BlueprintPure, Category = "Health") FATR_HumanVitals GetVitals() const { return Vitals; }
+	UFUNCTION(BlueprintPure, Category = "Health") FATR_HumanSurvivalStats GetSurvivalStats() const { return Survival; }
+	UFUNCTION(BlueprintPure, Category = "Health") FATR_DerivedCombatStats GetDerivedStats() const { return Derived; }
+	UFUNCTION(BlueprintPure, Category = "Health") FATR_BloodState GetBloodState() const { return Blood; }
+	UFUNCTION(BlueprintPure, Category = "Health") TArray<FATR_Wound> GetWounds() const { return Wounds; }
+	UFUNCTION(BlueprintPure, Category = "Health") TArray<FATR_Condition> GetConditions() const { return Conditions; }
+	UFUNCTION(BlueprintPure, Category = "Health") TArray<FATR_PermanentImpairment> GetImpairments() const { return Impairments; }
 	UFUNCTION(BlueprintPure, Category = "Health") bool IsAlive() const { return DeathCause == EATR_DeathCause::None; }
 	UFUNCTION(BlueprintPure, Category = "Health") bool IsConscious() const { return !bUnconscious && IsAlive(); }
 	UFUNCTION(BlueprintPure, Category = "Health") EATR_DeathCause GetDeathCause() const { return DeathCause; }
+
+	const FATR_HumanVitals& GetVitalsRef() const { return Vitals; }
+	const FATR_HumanSurvivalStats& GetSurvivalStatsRef() const { return Survival; }
+	const FATR_DerivedCombatStats& GetDerivedStatsRef() const { return Derived; }
+	const TArray<FATR_Wound>& GetWoundsRef() const { return Wounds; }
+	const TArray<FATR_Condition>& GetConditionsRef() const { return Conditions; }
 
 	UFUNCTION(BlueprintPure, Category = "Health")
 	bool HasCondition(EATR_ConditionType Type) const;
@@ -227,7 +235,9 @@ private:
 
 	// Step 7: immediate organ damage, fractures, concussion, pneumothorax,
 	// catastrophic-trauma check, pain/shock spike.
-	void ApplyImmediateEffects(const FATR_DamageEvent& Event, const FResolvedDamage& Damage, const FATR_Wound& Wound);
+	// Wound is BY VALUE on purpose: this function can add internal-bleeding
+	// wounds, which may reallocate the Wounds array under a reference.
+	void ApplyImmediateEffects(const FATR_DamageEvent& Event, const FResolvedDamage& Damage, FATR_Wound Wound);
 
 	// ── Condition management ───────────────────────────────────────────────
 
@@ -297,19 +307,4 @@ private:
 
 	// Bucket accumulators.
 	float FastAcc = 0.f;
-	float MediumAcc = 0.f;
-	float SlowAcc = 0.f;
-
-	int32 NextWoundId = 0;
-
-	// Cached settings (read once at BeginPlay; settings are DefaultConfig).
-	UPROPERTY() TObjectPtr<const UATR_HealthSettings> Settings;
-
-	// Data tables resolved once at BeginPlay (may stay null — code defaults).
-	UPROPERTY() TObjectPtr<const UATR_BodyRegionDefinition> RegionDef;
-	UPROPERTY() TObjectPtr<const UATR_DamageTypeDefinition> DamageTypeDef;
-	UPROPERTY() TObjectPtr<const UATR_ConditionDefinition> ConditionDef;
-
-	// Last damage event summary for the debug requirements.
-	FString LastDamageDebug;
-};
+	

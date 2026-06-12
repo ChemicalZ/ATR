@@ -205,7 +205,8 @@ struct FATR_DamageEvent
 	GENERATED_BODY()
 
 	// Who/what caused this (for logging/aggro). May be null (environment).
-	UPROPERTY(BlueprintReadWrite, Category = "Health|Damage")
+	// Not Blueprint-exposed: weak pointers make poor BP pins; C++ producers set it.
+	UPROPERTY()
 	TWeakObjectPtr<AActor> Instigator;
 
 	// Where the hit landed.
@@ -222,7 +223,7 @@ struct FATR_DamageEvent
 	// Data-driven damage description. When set, the profile's components are
 	// applied (each becomes a wound candidate) scaled by EventScale01.
 	UPROPERTY(BlueprintReadWrite, Category = "Health|Damage")
-	TObjectPtr<const UATR_WeaponDamageProfile> WeaponProfile = nullptr;
+	TObjectPtr<UATR_WeaponDamageProfile> WeaponProfile = nullptr;
 
 	// Overall scale of this event vs. the profile's nominal values
 	// (light swing vs. full swing, grazing ballistic, fall height factor...).
@@ -289,7 +290,7 @@ class ALLTHATREMAINS_API IATR_DamageMitigationProvider
 
 public:
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "Health|Armor")
-	FATR_DamageMitigation GetMitigationForHit(EATR_BodyRegion Region, EATR_DamageType DamageType) const;
+	FATR_DamageMitigation GetMitigationForHit(EATR_BodyRegion Region, EATR_DamageType DamageType);
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -303,5 +304,4 @@ namespace ATR_Health
 	ALLTHATREMAINS_API bool IsBloodCompatible(EATR_BloodType Donor, EATR_BloodType Recipient);
 
 	// True for the limb regions whose bleeding a tourniquet can stop.
-	ALLTHATREMAINS_API bool IsLimbRegion(EATR_BodyRegion Region);
-}
+	ALLTHATREMAINS_API bool IsLimbRegion(EAT

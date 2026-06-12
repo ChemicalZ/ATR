@@ -11,6 +11,7 @@
 #include "../Data/ATR_TreatmentDefinition.h"
 #include "../Data/ATR_WeaponDamageProfile.h"
 #include "GameFramework/Actor.h"
+#include "Misc/StringBuilder.h"
 
 namespace
 {
@@ -242,7 +243,7 @@ int32 UATR_HumanHealthComponent::CreateWound(const FATR_DamageEvent& Event, cons
 	return W.WoundId;
 }
 
-void UATR_HumanHealthComponent::ApplyImmediateEffects(const FATR_DamageEvent& Event, const FResolvedDamage& Damage, const FATR_Wound& Wound)
+void UATR_HumanHealthComponent::ApplyImmediateEffects(const FATR_DamageEvent& Event, const FResolvedDamage& Damage, const FATR_Wound Wound)
 {
 	const FATR_DamageTypeRow Row = GetDamageTypeRow(Damage.Type);
 	const FATR_BodyRegionRow RegionRow = GetRegionRow(Event.Region);
@@ -1452,7 +1453,4 @@ FString UATR_HumanHealthComponent::GetDebugString() const
 	Sb.Appendf(TEXT("Derived: gripL=%.2f gripR=%.2f melee=%.2f aim=%.2f move=%.2f sprint=%d limp=%d 2h=%d\n"),
 		Derived.GripStrengthLeft01, Derived.GripStrengthRight01, Derived.MeleePower01, Derived.AimStability01,
 		Derived.MoveSpeedMult, Derived.bCanSprint ? 1 : 0, Derived.bIsLimping ? 1 : 0, Derived.bCanUseTwoHandedWeapons ? 1 : 0);
-	Sb.Appendf(TEXT("LastDamage: %s\n"), *LastDamageDebug);
-
-	return Sb.ToString();
-}
+	Sb.Appendf(TEXT("LastDamage: %s\n"), *LastDamageDeb

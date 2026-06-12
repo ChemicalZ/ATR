@@ -154,8 +154,12 @@ struct FATR_Wound
 
 	UPROPERTY(BlueprintReadOnly, Category = "Health|Wounds") EATR_DamageType DamageType = EATR_DamageType::None;
 
-	// Overall trauma magnitude after mitigation, 0..1.
+	// Overall trauma magnitude after mitigation, 0..1. Falls as the wound heals.
 	UPROPERTY(BlueprintReadOnly, Category = "Health|Wounds") float Severity01 = 0.f;
+
+	// Severity at creation (or worst point). Decides scarring/impairment when
+	// the wound finally closes.
+	UPROPERTY(BlueprintReadOnly, Category = "Health|Wounds") float PeakSeverity01 = 0.f;
 
 	// How deep it reached (organ involvement), 0..1.
 	UPROPERTY(BlueprintReadOnly, Category = "Health|Wounds") float Depth01 = 0.f;
@@ -179,6 +183,10 @@ struct FATR_Wound
 	UPROPERTY(BlueprintReadOnly, Category = "Health|Wounds") float AgeSeconds = 0.f;
 
 	UPROPERTY(BlueprintReadOnly, Category = "Health|Wounds") EATR_WoundStage Stage = EATR_WoundStage::Open;
+
+	// Internal bleeding pseudo-wound (blunt/crush torso trauma). Cannot be
+	// bandaged/sutured/disinfected from outside; only clotting and time help.
+	UPROPERTY(BlueprintReadOnly, Category = "Health|Wounds") bool bInternal = false;
 
 	// Embedded treatment state (amendment #4).
 	UPROPERTY(BlueprintReadOnly, Category = "Health|Wounds") FATR_WoundTreatmentState Treatment;
@@ -302,12 +310,4 @@ struct FATR_PermanentImpairment
 {
 	GENERATED_BODY()
 
-	UPROPERTY(BlueprintReadOnly, Category = "Health|Impairments") EATR_BodyRegion Region = EATR_BodyRegion::None;
-
-	UPROPERTY(BlueprintReadOnly, Category = "Health|Impairments") EATR_BodyDetailKind DetailKind = EATR_BodyDetailKind::None;
-	UPROPERTY(BlueprintReadOnly, Category = "Health|Impairments") uint8 DetailIndex = 0;
-
-	UPROPERTY(BlueprintReadOnly, Category = "Health|Impairments") EATR_ImpairmentType Type = EATR_ImpairmentType::None;
-
-	UPROPERTY(BlueprintReadOnly, Category = "Health|Impairments") float Severity01 = 1.f;
-};
+	UPROPERTY(BlueprintReadOnly, Category = "Health|Impairments") EATR_BodyRegion 
