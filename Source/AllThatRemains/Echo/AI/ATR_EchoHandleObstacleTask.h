@@ -8,7 +8,7 @@
 #include "ATR_EchoHandleObstacleTask.generated.h"
 
 // Instance data — bind MoveRequest/bHasValidMoveRequest from the intent evaluator. When the
-// subsystem chose HandleObstacle, MoveRequest is the sidestep/repath around the obstacle.
+// subsystem chose EngageBarrier, MoveRequest is the direct move to the barrier contact point.
 USTRUCT(BlueprintType)
 struct FATR_EchoHandleObstacleTaskInstanceData
 {
@@ -20,19 +20,39 @@ struct FATR_EchoHandleObstacleTaskInstanceData
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Input")
 	bool bHasValidMoveRequest = false;
 
-	// Internal — serial of the sidestep/repath move issued in EnterState, polled in Tick.
+	// Internal — time of this Echo's last barrier hit (engage or frustrated tap).
+	UPROPERTY(Transient)
+	float LastHitTime = -1.f;
+
+	// Internal — serial of the legacy sidestep move when bAllowActivePursuitTacticalReroute
+	// (debug) is enabled. 0 when barrier engagement is active (normal mode).
 	UPROPERTY(Transient)
 	int32 WaitMoveSerial = 0;
+
+	// Internal — when this engagement entered the state (drives the first-attack delay).
+	UPROPERTY(Transient)
+	float EnterTime = -1.f;
+
+	// Internal — current frustrated-shuffle target point (zero = pick a new one).
+	UPROPERTY(Transient)
+	FVector ShuffleTarget = FVector::ZeroVector;
 };
 
-// Obstacle-handling task. Logs the classified obstacle, executes the subsystem's sidestep/repath
-// fallback, and resolves from the classified move result so the StateTree falls back to search/idle
-// when the obstacle is not cleared. This is the seam where real door/window/fence breaking, group
-// pounding, and obstacle audio/FX attach via UATR_EchoObstacleBehaviorDataAsset in a later pass —
-// without reworking the movement/intent architecture.
+// Barrier engagement task (design doc: Engage Barrier / Reach Through Barrier / Frustrated
+// Search). While the subsystem keeps Intent == EngageBarrier this task:
+//   - faces the barrier and closes into contact range (direct approach — no pathfinding);
+//   - presses and attacks on the configured interval (ReportBarrierImpact: damage scaled by
+//     group pressure, pounding agitation, impact-noise stimulus that attracts the horde);
+//   - in the ReachThrough phase, keeps attacking from contact (the melee task layers
+//     grab/claw-through on top when the target enters reach);
+//   - in the FrustratedSearch phase, lingers near the barrier with small shuffles and
+//     occasional hits.
+// It NEVER sidesteps, repaths, or picks an alternate entrance. It resolves Succeeded when
+// the subsystem clears the barrier (opened/broken/expired) so the tree re-evaluates into
+// pursuit/search/idle.
 //
 // Context owner must be AATR_EchoAIController.
-USTRUCT(BlueprintType, meta = (DisplayName = "Echo Handle Obstacle"))
+USTRUCT(BlueprintType, meta = (DisplayName = "Echo Engage Barrier"))
 struct FATR_EchoHandleObstacleTask : public FStateTreeTaskCommonBase
 {
 	GENERATED_BODY()

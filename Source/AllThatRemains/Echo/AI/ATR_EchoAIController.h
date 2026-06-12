@@ -64,7 +64,26 @@ public:
 	// (never moves to world origin). Returns the path-following request code so the task can
 	// branch on AlreadyAtGoal / Failed / Running. The classified completion result is
 	// reported to the subsystem via HandleMoveCompleted.
+	//
+	// Requests with bDirectPursuit run the LINE-OF-DESIRE model instead of path following:
+	// each tick the pawn moves directly toward the stimulus vector, the navmesh validates
+	// (ground projection) but never plans, and a meaningful blocker on the line of desire is
+	// classified and reported as a blocked move — transitioning the StateTree into barrier
+	// engagement. No alternate route is ever requested.
 	EPathFollowingRequestResult::Type IssueMoveRequest(const FATR_EchoMoveRequest& Request);
+
+	// One tick of dumb physical approach toward a location (used by the barrier engagement
+	// task to close into contact range). Applies movement input directly — no pathfinding.
+	// Returns true once the pawn is within AcceptRadius (2D, capsule-inclusive).
+	bool DirectApproach(const FVector& TargetLocation, float AcceptRadius);
+
+	// Map a barrier type to the legacy failure-reason enum for movement-result reporting.
+	static EATR_MoveFailureReason BarrierTypeToFailureReason(EATR_EchoBarrierType Type);
+
+	// Clears any active path-following AND line-of-desire move. Safe to call from task ExitState.
+	virtual void StopMovement() override;
+
+	virtual void Tick(float DeltaTime) override;
 
 	// Resolution of a move whose completion is reported asynchronously to the subsystem. A
 	// StateTree task records the serial returned by GetLastIssuedMoveSerial() in EnterState and
@@ -114,6 +133,33 @@ private:
 	// Identify what blocked the pawn via a short forward trace and classify it by actor tag
 	// (door/window/fence) — generic dynamic block otherwise. OutBlocker may be null.
 	EATR_MoveFailureReason ClassifyBlockingObstacle(AActor*& OutBlocker) const;
+
+	// --- Line-of-desire pursuit (direct movement, navmesh = validator only) ---
+
+	// Per-tick direct pursuit step: resolve goal, sweep the line of desire for blockers,
+	// ground-project, apply movement input, wall-slide on glancing contact, and detect stuck.
+	void TickDirectPursuit(float DeltaTime);
+
+	// Classify an actor hit on the line of desire. Interface > tags > mobility fallback.
+	// bOutMeaningful = the hit should transition to barrier engagement (vs slide past it).
+	EATR_EchoBarrierType ClassifyBarrierActor(const AActor* Actor, bool& bOutMeaningful) const;
+
+	// End the active direct-pursuit move with a classified result.
+	void CompleteDirectPursuit(bool bSuccess, EATR_MoveFailureReason Reason, AActor* Blocker);
+
+	// Report a meaningful line-of-desire blocker (seeds barrier memory + fails the move).
+	void ReportBlockedByBarrier(AActor* Blocker, EATR_EchoBarrierType Type, const FVector& HitLocation, const FVector& HitNormal);
+
+	// Direct-pursuit state. Active only while a bDirectPursuit move request is running.
+	bool                   bDirectPursuitActive   = false;
+	TWeakObjectPtr<AActor> DirectGoalActor;                       // actor-type goal (confirmed-visible target)
+	FVector                DirectGoalLocation     = FVector::ZeroVector; // location-type goal
+	bool                   bDirectGoalIsActor     = false;
+	float                  DirectAcceptanceRadius = 50.f;
+
+	// Stuck detection — engage whatever is ahead if no progress is made for the configured time.
+	FVector DirectStuckAnchor    = FVector::ZeroVector;
+	float   DirectStuckTime      = 0.f;
 
 	// Previous visible sample of the confirmed target, used to derive observed velocity from a
 	// position delta instead of reading the actor's movement component. No-cheat: this only ever

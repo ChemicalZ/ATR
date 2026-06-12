@@ -197,11 +197,6 @@ public:
 	float VisualFarDistance = 20000.f;
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Rendering", meta=(
-		ToolTip="Reserved for future debug visualization. Promoted Actor echoes are currently excluded from horde ISM to prevent duplicate visuals and stale transform rendering. Use Actor debug drawing for promoted echo debugging."
-	))
-	bool bDebugShowPromotedEchoISM = false;
-
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Rendering", meta=(
 		ToolTip="Whether horde ISM components cast shadows. Default false for performance. Enabling this can greatly increase RenderThread and shadow cost when many horde instances are visible."
 	))
 	bool bHordeISMCastShadows = false;
@@ -368,21 +363,9 @@ public:
 		ToolTip="Urgency at/above which a heard noise causes InvestigateLocation; below this the Echo only turns toward it."))
 	float HeardInvestigateUrgency = 0.40f;
 
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Awareness", meta=(ClampMin="0.0", ForceUnits="s",
-		ToolTip="How long a smell/blood location stays actionable. Higher = follows older trails."))
-	float SmellMemorySeconds = 12.0f;
-
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Awareness", meta=(ClampMin="0.0", ClampMax="1.0",
-		ToolTip="Urgency at/above which a smell stimulus causes investigation rather than mild orientation."))
-	float SmellInvestigateUrgency = 0.35f;
-
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Awareness", meta=(ClampMin="0.0", ClampMax="1.0",
 		ToolTip="Confidence restored when sight is reacquired on a previously lost target."))
 	float ReacquireSightConfidence = 1.0f;
-
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Awareness", meta=(ClampMin="0.0", ForceUnits="s",
-		ToolTip="Grace period after sight is first lost before the Echo commits to memory/search. Smooths brief occlusions."))
-	float SightLossGraceSeconds = 0.5f;
 
 	// ── Echo|Sight ─────────────────────────────────────────────────────────────
 	// Active perception sight config + last-seen projection. Applied to the active
@@ -416,6 +399,41 @@ public:
 		ToolTip="Smoothing for stored observed velocity. 1 = snap to newest observation; lower = smoother. Only updates while the target is actually visible."))
 	float LastSeenVelocitySmoothingAlpha = 0.5f;
 
+	// ── Echo|Acoustics ─────────────────────────────────────────────────────────
+	// Real-unit sound propagation (see ATR_EchoAcoustics.h). Sounds are authored as dB SPL
+	// at the reference distance; received level falls off with inverse-square spreading
+	// (−6 dB per doubling of distance) plus linear atmospheric absorption. Audible radius
+	// is DERIVED — never authored. This free-field model is the seam where sound ray
+	// tracing (occlusion/diffraction path loss) plugs in later.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Acoustics", meta=(ClampMin="1.0", ForceUnits="cm",
+		ToolTip="Reference distance at which a source's LoudnessDb is specified. 100 cm = 1 m, the standard SPL spec distance."))
+	float AcousticReferenceDistanceCm = 100.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Acoustics", meta=(ClampMin="0.0", ClampMax="194.0", ForceUnits="dB",
+		ToolTip="Hearing threshold: received level an Echo needs to notice a sound at all. Roughly the ambient noise floor of the world — sounds arriving below this are masked."))
+	float EchoHearingThresholdDb = 35.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Acoustics", meta=(ClampMin="0.0", ClampMax="194.0", ForceUnits="dB",
+		ToolTip="Received level at/above which a sound registers at full perceived intensity (normalized strength 1.0). Between threshold and saturation, intensity scales linearly in dB."))
+	float EchoHearingSaturationDb = 95.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Acoustics", meta=(ClampMin="0.0", ClampMax="10.0",
+		ToolTip="Atmospheric absorption in dB per 100 m, on top of inverse-square spreading. ~0.5 approximates mid-frequency air absorption; raise for muffled/foggy atmospheres."))
+	float AirAbsorptionDbPer100m = 0.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Acoustics", meta=(ClampMin="100.0", ForceUnits="cm",
+		ToolTip="Hard cap on any sound's audible radius, bounding stimulus fan-out queries regardless of source loudness."))
+	float MaxAudibleRangeCm = 30000.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Acoustics", meta=(ClampMin="0.0", ClampMax="194.0", ForceUnits="dB",
+		ToolTip="Source level assumed for an AIPerception noise event reported with Loudness 1.0 (e.g. MakeNoise). Loudness multipliers shift this by 20·log10(loudness)."))
+	float DefaultPerceivedNoiseLoudnessDb = 70.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Acoustics", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Imperfect hearing: maximum positional error in an Echo's estimate of a sound's origin, as a fraction of its distance to the source. Applies fully at barely-audible levels and shrinks to zero at saturation — so a distant gunshot draws Echoes to scattered nearby estimates (forming several converging hordes) instead of one exact point."))
+	float HearingMaxLocationErrorFraction = 0.30f;
+
 	// ── Echo|Hearing ───────────────────────────────────────────────────────────
 	// Hearing is location-only. These scale noise strength into urgency/agitation and
 	// gate whether a noise causes a turn or a full investigation.
@@ -435,14 +453,6 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Hearing", meta=(ClampMin="0.0",
 		ToolTip="Scale from noise strength to local agitation contribution."))
 	float NoiseStrengthToAgitationScale = 0.25f;
-
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Hearing", meta=(ClampMin="0.0", ClampMax="1.0",
-		ToolTip="Below this post-falloff strength a noise only turns the Echo toward it."))
-	float WeakNoiseTurnOnlyThreshold = 0.20f;
-
-	UPROPERTY(Config, EditAnywhere, Category="Echo|Hearing", meta=(ClampMin="0.0", ClampMax="1.0",
-		ToolTip="At/above this post-falloff strength a noise triggers a move-to investigation."))
-	float StrongNoiseInvestigateThreshold = 0.40f;
 
 	// ── Echo|Search ────────────────────────────────────────────────────────────
 	// Lost-sight search tuning. Search points are nav-projected before becoming moves.
@@ -474,6 +484,34 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(ClampMin="1",
 		ToolTip="Maximum number of fan steps before a search is considered exhausted."))
 	int32 MaxSearchSteps = 5;
+
+	// Per-echo search variation: radius = base × (RadiusBaseScale + RadiusPerEchoVariation × hash
+	// + RadiusAggressionBonus × aggression); duration likewise. Spread keeps a searching group
+	// from sweeping identical robotic arcs.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(ClampMin="0.0", ClampMax="2.0",
+		ToolTip="Base fraction of the computed search radius every echo gets."))
+	float SearchRadiusBaseScale = 0.8f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(ClampMin="0.0", ClampMax="2.0",
+		ToolTip="Per-echo random variation added to the search radius scale (0..this, stable per echo)."))
+	float SearchRadiusPerEchoVariation = 0.6f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(ClampMin="0.0", ClampMax="2.0",
+		ToolTip="Extra search radius scale at maximum aggression — aggressive echoes sweep wider."))
+	float SearchRadiusAggressionBonus = 0.3f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(ClampMin="0.0", ClampMax="2.0",
+		ToolTip="Base fraction of the configured search duration every echo gets."))
+	float SearchDurationBaseScale = 0.7f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(ClampMin="0.0", ClampMax="2.0",
+		ToolTip="Per-echo random variation added to the search duration scale (0..this, stable per echo)."))
+	float SearchDurationPerEchoVariation = 0.6f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(ClampMin="0.0", ClampMax="2.0",
+		ToolTip="Extra search duration scale at maximum aggression — aggressive echoes persist longer."))
+	float SearchDurationAggressionBonus = 0.3f;
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(
 		ToolTip="Default search pattern asset. Leave empty to use the built-in standard directional fan."))
@@ -517,6 +555,18 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="1.0",
 		ToolTip="Smoothing for an Echo's horde pressure direction. 1 = snap; lower = smoother turns."))
 	float HordePressureDirectionSmoothingAlpha = 0.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Distance of the pseudo-target an agitated/curious echo turns toward along the horde pressure direction (orient-only intents)."))
+	float HordeOrientTargetDistanceCm = 500.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Fraction of HordeWalkSpeed a horde-tier echo moves at toward its own heard estimate when its urgency is ZERO; scales linearly to full speed at urgency 1."))
+	float HeardSteerMinSpeedFraction = 0.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Fraction of HordeWalkSpeed used when an echo is only de-clumping (separation with no horde flow or stimulus)."))
+	float HordeSeparationOnlySpeedFraction = 0.35f;
 
 	// Field diffusion + gradient shaping. Spread pressure across cells and steer by the smooth
 	// pressure gradient (toward hotspots) instead of the raw deposited direction, so hordes react
@@ -624,6 +674,10 @@ public:
 		ToolTip="Minimum local momentum strength before an echo will align/join the horde. Below this it acts on its own."))
 	float MomentumAlignThreshold = 0.12f;
 
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ClampMax="10.0",
+		ToolTip="How strongly CALM echoes resist being dragged along by passing horde momentum. The align threshold scales by (1 + this × (1 − agitation)) — an agitated echo (heard the gunshot) joins readily, while a calm echo far from the stimulus ignores the passing flow instead of being carried off with it."))
+	float MomentumCalmResistance = 3.0f;
+
 	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.1", ClampMax="4.0",
 		ToolTip="Maximum momentum magnitude a cell can hold."))
 	float MomentumMaxStrength = 1.0f;
@@ -703,36 +757,139 @@ public:
 		ToolTip="Scale from cell agitation to migration attraction."))
 	float AbstractCellAgitationAttractionScale = 1.0f;
 
+	// ── Echo|ActivePursuit ─────────────────────────────────────────────────────
+	// Line-of-desire pursuit (design doc: Active Prey-Driven Pursuit). During active
+	// pursuit the Echo moves directly along the stimulus vector with short validated
+	// steps; the navmesh is a movement VALIDATOR (ground projection), never a route
+	// planner. Blockers on the line of desire transition to barrier engagement.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ActivePursuit", meta=(
+		ToolTip="Master switch for line-of-desire pursuit. ON (default, design-correct): chase/last-seen/search moves go straight toward the stimulus and engage blockers. OFF: legacy full-pathfinding moves (Echoes intelligently route around fences/doors — for debugging only)."))
+	bool bUseLineOfDesirePursuit = true;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ActivePursuit", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Forward sweep distance along the desired direction used to detect meaningful blockers during direct pursuit."))
+	float ActivePursuitForwardSweepDistanceCm = 150.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ActivePursuit", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Sphere radius of the forward blocker sweep. 0 = line trace."))
+	float ActivePursuitSweepRadiusCm = 30.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ActivePursuit", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Navmesh projection radius used to validate that direct-pursuit movement stays on walkable ground. Validation only — never route planning."))
+	float ActivePursuitGroundProjectionRadiusCm = 300.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ActivePursuit", meta=(ClampMin="0.05", ForceUnits="s",
+		ToolTip="If a direct-pursuit Echo makes less than ActivePursuitStuckProgressCm of progress for this long, whatever is ahead is classified as a blocker and engaged."))
+	float ActivePursuitStuckTimeSeconds = 0.75f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ActivePursuit", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Minimum progress over ActivePursuitStuckTimeSeconds for a direct-pursuit move to count as moving."))
+	float ActivePursuitStuckProgressCm = 15.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ActivePursuit", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Heard/smelled investigations within this distance use line-of-desire movement (strong NEARBY stimulus = active pursuit). Beyond it, broad navigation is allowed (distant investigation = ambient movement)."))
+	float ActivePursuitDirectInvestigateDistanceCm = 2500.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ActivePursuit", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="How head-on a swept TAGGED barrier hit must be (dot of desired direction vs inverse hit normal) to immediately trigger engagement. Glancing contacts wall-slide instead; the stuck timer still catches everything."))
+	float ActivePursuitBlockerHeadOnDot = 0.35f;
+
+	// ── Echo|Barrier ───────────────────────────────────────────────────────────
+	// Barrier engagement (design doc: Engage Barrier / Reach Through Barrier /
+	// Frustrated Search). Doors buy time but make noise; fences stop movement but not
+	// attention; hordes overwhelm through pressure, not intelligence.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Contact range — the Echo closes to within this distance of the barrier before pressing/attacking."))
+	float BarrierEngageDistanceCm = 150.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Default reach-through interaction distance for permeable barriers (chain-link fence, broken window). Barrier data assets can override per type."))
+	float BarrierReachThroughDistanceCm = 180.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="0.05", ForceUnits="s",
+		ToolTip="Seconds between barrier attacks while engaged."))
+	float BarrierAttackIntervalSeconds = 1.2f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Wind-up before the FIRST hit after reaching barrier contact, when no obstacle-behavior data asset overrides it."))
+	float BarrierFirstAttackDelaySeconds = 0.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="0.0",
+		ToolTip="Fallback damage per barrier hit when no obstacle-behavior or barrier data asset provides a value."))
+	float BarrierDamagePerHit = 10.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="0.0",
+		ToolTip="Group pressure each engaged Echo contributes to a barrier per hit. Pressure from multiple Echoes stacks and scales damage — the horde overwhelms, it does not solve."))
+	float BarrierPressurePerEcho = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="0.0",
+		ToolTip="How fast accumulated barrier pressure decays per second once Echoes stop hitting it."))
+	float BarrierPressureDecayPerSecond = 0.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="0.0",
+		ToolTip="Damage multiplier per unit of accumulated group pressure (EffectiveDamage = DamagePerHit * (1 + Pressure * this))."))
+	float BarrierPressureDamageMultiplier = 0.25f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="0.0", ClampMax="194.0", ForceUnits="dB",
+		ToolTip="Source loudness (dB SPL @ acoustic reference distance) of each barrier impact. Pounding on a door is ~85 dB. The audible radius derives from the Echo|Acoustics propagation model — banging attracts nearby Echoes, the sound feedback loop."))
+	float BarrierImpactLoudnessDb = 85.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Maximum time an Echo keeps engaging a barrier after its stimulus confidence has gone stale, before flipping to frustrated search."))
+	float MaxBarrierEngageSecondsWithoutStimulus = 6.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="How long the frustrated phase lingers near the barrier (shuffling, occasional hits) before decaying to idle/wander."))
+	float FrustratedSearchDurationSeconds = 6.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Radius of the small random shuffle movements during frustrated search."))
+	float FrustratedSearchRadiusCm = 300.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="0.1", ForceUnits="s",
+		ToolTip="Seconds between the occasional barrier hits during frustrated search."))
+	float FrustratedSearchHitIntervalSeconds = 3.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="1.0", ClampMax="5.0",
+		ToolTip="A frustrated echo only lands its occasional tap when within BarrierEngageDistanceCm × this of the barrier."))
+	float FrustratedSearchHitRangeMultiplier = 1.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Minimum frustrated-shuffle distance as a fraction of FrustratedSearchRadiusCm (shuffle targets land between this fraction and the full radius)."))
+	float FrustratedShuffleMinRadiusFraction = 0.3f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Barrier", meta=(ClampMin="1.0", ForceUnits="cm",
+		ToolTip="Arrival tolerance for a frustrated-shuffle point before the echo picks a new one."))
+	float FrustratedShuffleAcceptRadiusCm = 40.f;
+
 	// ── Echo|ObstacleHooks ─────────────────────────────────────────────────────
-	// Obstacle classification + sidestep/repath tuning. Break/climb behavior lives in the
-	// obstacle behavior DataAsset (future seam); only sidestep/repath is active today.
+	// Obstacle classification tuning. Sidestep/repath values remain ONLY for the
+	// bAllowActivePursuitTacticalReroute debug override — never normal game behavior.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(
+		ToolTip="DEBUG/TESTING ONLY. When true, a blocked pursuit falls back to the legacy sidestep/repath instead of barrier engagement. The design doc requires this to be false in normal play: a blocked Echo engages the blocker, it never solves the layout."))
+	bool bAllowActivePursuitTacticalReroute = false;
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(ClampMin="0.0", ForceUnits="cm",
 		ToolTip="Forward trace length used to identify what physically blocked a move."))
 	float ObstacleForwardTraceLength = 200.f;
 
-	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(ClampMin="0.0", ForceUnits="cm",
-		ToolTip="Sphere-trace radius used when classifying a blocking obstacle. 0 = line trace."))
-	float ObstacleTraceRadius = 34.f;
-
 	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(ClampMin="0.0", ForceUnits="s",
-		ToolTip="How long a fresh block forces HandleObstacle before falling through to other intents."))
+		ToolTip="How long a fresh block keeps EngageBarrier active without a new impact before falling through to other intents."))
 	float ObstacleHandleTimeoutSeconds = 2.0f;
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(ClampMin="0.0", ForceUnits="cm",
-		ToolTip="Lateral sidestep distance used by the obstacle fallback."))
+		ToolTip="Lateral sidestep distance — used ONLY by the bAllowActivePursuitTacticalReroute debug override."))
 	float ObstacleSidestepDistance = 300.f;
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(ClampMin="0.0", ForceUnits="cm",
-		ToolTip="Forward nudge applied alongside the sidestep so the Echo presses the obstacle."))
+		ToolTip="Forward nudge applied alongside the sidestep — used ONLY by the bAllowActivePursuitTacticalReroute debug override."))
 	float ObstacleForwardNudgeDistance = 100.f;
 
-	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(ClampMin="0.0", ForceUnits="s",
-		ToolTip="Cooldown before retrying a failed obstacle handling attempt."))
-	float ObstacleRetryCooldownSeconds = 1.0f;
-
 	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(
-		ToolTip="Default obstacle behavior asset. Leave empty for sidestep/repath only."))
+		ToolTip="Default obstacle behavior asset (per-Echo barrier interaction capabilities). Leave empty for built-in defaults."))
 	TSoftObjectPtr<UATR_EchoObstacleBehaviorDataAsset> DefaultObstacleBehavior;
 
 	// ── Echo|Combat ────────────────────────────────────────────────────────────
@@ -846,6 +1003,134 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="deg",
 		ToolTip="Yaw turn rate (deg/sec) for the TurnTowardStimulus orient task."))
 	float OrientTurnRateDegPerSec = 240.f;
+
+	// --- Shoulder barge (player pushes through an echo) ---
+	// A fast-moving player colliding with an echo can knock it aside and break its grip.
+	// Power = (speed / reference) × (player mass / echo mass) × glancing factor / echo strength.
+	// Dead-center hits are hardest; clipping a shoulder is easiest. Resolved server-side in
+	// AATR_ActiveEcho::NotifyHit.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="cm/s",
+		ToolTip="Minimum player speed for a collision to count as a barge attempt at all. Below this the echo just blocks."))
+	float BargeMinSpeed = 300.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="1.0", ForceUnits="cm/s",
+		ToolTip="Player speed at which the speed term of barge power equals 1.0 (≈ sprint speed)."))
+	float BargeReferenceSpeed = 450.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0",
+		ToolTip="Barge power required to knock the echo aside. Power below this = the echo holds its ground (and its grip)."))
+	float BargeSuccessPowerThreshold = 0.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Glancing factor for a DEAD-CENTER hit (angle of attack). 0.35 = running straight through an echo's torso is ~3x harder than clipping its shoulder (factor 1.0 at the capsule edge)."))
+	float BargeCenterEffectiveness = 0.35f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="cm/s",
+		ToolTip="Base knockback speed applied to a successfully barged echo (scaled by barge power, mostly sideways out of the player's path)."))
+	float BargeKnockbackSpeed = 450.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="How long a barged echo is staggered: it cannot grab, and any held grip is released. Scaled up by barge power."))
+	float BargeStaggerSeconds = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Fraction of player speed lost barging dead-center through an echo. Glancing hits lose proportionally less (down to ~none at the shoulder). Lowering the shoulder costs momentum."))
+	float BargePlayerSpeedLossAtCenter = 0.45f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Per-echo cooldown between barge resolutions, so one sustained contact doesn't re-resolve every frame."))
+	float BargeCooldownSeconds = 0.4f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="-1.0", ClampMax="1.0",
+		ToolTip="Minimum dot between the player's movement direction and the direction to the echo for a collision to count as running INTO it (vs brushing past)."))
+	float BargeMinApproachDot = 0.2f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="2.0",
+		ToolTip="Sideways component of barge knockback (out of the player's path). Mixed with the forward component, then normalized."))
+	float BargeKnockbackSideMix = 0.8f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="2.0",
+		ToolTip="Forward (carry-through) component of barge knockback. Mixed with the sideways component, then normalized."))
+	float BargeKnockbackForwardMix = 0.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="cm/s",
+		ToolTip="Small upward velocity added to barge knockback so the echo visibly staggers off its feet."))
+	float BargeKnockbackUpSpeed = 60.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.01", ClampMax="1.0",
+		ToolTip="Lower clamp on the player/echo mass ratio in barge power — a feather-light player still has SOME shove."))
+	float BargeMassRatioMin = 0.25f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="1.0", ClampMax="20.0",
+		ToolTip="Upper clamp on the player/echo mass ratio in barge power — a heavy player can't trivialize every echo."))
+	float BargeMassRatioMax = 4.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="1.0", ClampMax="10.0",
+		ToolTip="Cap on resolved barge power when scaling knockback speed and stagger duration."))
+	float BargePowerCap = 2.f;
+
+	// --- Body condition distribution (rolled deterministically per echo on promotion) ---
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Fraction of echoes with both arms healthy (full grip range). Healthy + MissingFingers + MissingHand should be <= 1; the remainder spawn with no arms."))
+	float BodyHealthyChance = 0.70f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Fraction of echoes missing fingers (weak grip only, scratches less often)."))
+	float BodyMissingFingersChance = 0.15f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Fraction of echoes missing a hand (grabs less reliably, weak grip only)."))
+	float BodyMissingHandChance = 0.10f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="2.0",
+		ToolTip="Minimum per-echo muscle power. Scales strong-grip chance, pull force, and barge resistance."))
+	float BodyStrengthScalarMin = 0.6f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="2.0",
+		ToolTip="Maximum per-echo muscle power."))
+	float BodyStrengthScalarMax = 1.4f;
+
+	// --- Grip / grab condition modifiers ---
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Fraction of pull force transmitted through a WEAK grip (a strong grip transmits 100%)."))
+	float WeakGripPullTransmission = 0.45f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Hard cap on strong-grip chance after the StrengthScalar multiplier."))
+	float StrongGripChanceCap = 0.95f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Grab-chance multiplier for an echo with missing fingers."))
+	float GrabMissingFingersMultiplier = 0.90f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Grab-chance multiplier for an echo with a missing hand."))
+	float GrabMissingHandMultiplier = 0.75f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Multiplier on the failed-grab scratch chance for fingerless echoes."))
+	float ScratchFingerlessMultiplier = 0.5f;
+
+	// --- Bite severity tables (cumulative roll thresholds; remainder = Laceration) ---
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="STRONG grip: rolls below this are a Scratch."))
+	float BiteStrongScratchUpTo = 0.20f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="STRONG grip: rolls below this (and above the scratch threshold) are a DeepScratch; the rest are Lacerations."))
+	float BiteStrongDeepScratchUpTo = 0.60f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="WEAK grip: rolls below this are a Scratch."))
+	float BiteWeakScratchUpTo = 0.50f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="WEAK grip: rolls below this (and above the scratch threshold) are a DeepScratch; the rest are Lacerations."))
+	float BiteWeakDeepScratchUpTo = 0.85f;
 
 	// ── Echo|Demotion ──────────────────────────────────────────────────────────
 	// Guards that keep an actively engaged Echo from being demoted out of the active pool.

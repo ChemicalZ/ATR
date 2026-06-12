@@ -47,7 +47,7 @@ enum class EATR_EchoIntent : uint8
 	FanSearchArea,            // projection exhausted — fan out search points
 	JoinHordePressure,        // pulled by agitation field, not a specific target
 	Attack,                   // in attack range of a confirmed target
-	HandleObstacle,           // movement blocked — run obstacle fallback/break hook
+	EngageBarrier,            // pursuit blocked by a meaningful barrier — press/attack/reach it (never reroute)
 	ReturnToIdle              // memory/urgency expired — wind down
 };
 
@@ -60,7 +60,7 @@ enum class EATR_AwarenessMode : uint8
 	HeardLocation,   // location-only knowledge from a noise stimulus
 	SawTarget,       // currently-confirmed visible actor
 	LostSightSearch, // had sight, now operating on memory/search
-	SmellTrail,      // (future) following a smell trail
+	SmellTrail,      // TODO: smell-trail following (design doc: Smell stimulus) — not yet driven
 	HordeAgitated,   // pulled by indirect agitation/pressure
 	ObstacleBlocked  // movement blocked by an obstacle
 };
@@ -90,6 +90,38 @@ enum class EATR_EchoMoveTargetType : uint8
 	Location
 };
 
+// Classification of a meaningful pursuit blocker. Describes what the Echo DOES to the
+// blocker (attack/press/reach), never how it reroutes around it. Mirrors the design
+// document's EATR_EchoBarrierType.
+UENUM(BlueprintType)
+enum class EATR_EchoBarrierType : uint8
+{
+	None,
+	Door,
+	Window,
+	Fence,
+	Gate,
+	Barricade,
+	Vehicle,
+	DestructibleWall,
+	NonInteractableWall,  // press briefly → frustrated search → decay; never damaged
+	SmallProp,            // push/step around locally; not engaged
+	Crowd,                // other Echoes — local separation only; not engaged
+	Unknown
+};
+
+// Sub-phase of barrier engagement. Expressed as a phase (not separate intents) so the
+// single EngageBarrier StateTree state drives all three without re-wiring the asset;
+// dedicated states can be split out later by branching on this.
+UENUM(BlueprintType)
+enum class EATR_EchoBarrierPhase : uint8
+{
+	None,
+	Engage,           // face, press, attack the barrier on an interval
+	ReachThrough,     // target sensed through a permeable barrier — reach/claw/grab through it
+	FrustratedSearch  // stimulus confidence expired at the barrier — linger, occasional hits, decay
+};
+
 // Why a movement request failed. Feeds obstacle hooks and failure-classified search.
 UENUM(BlueprintType)
 enum class EATR_MoveFailureReason : uint8
@@ -102,7 +134,6 @@ enum class EATR_MoveFailureReason : uint8
 	BlockedByWindow,
 	BlockedByFence,
 	TargetUnreachable,
-	NavmeshMissing,
 	AbortedByNewIntent
 };
 
@@ -140,6 +171,8 @@ struct FATR_EchoAwarenessState
 	FVector ProjectedSearchLocation = FVector::ZeroVector;
 
 	FVector LastHeardLocation       = FVector::ZeroVector;
+	// TODO: smell-trail following consumes LastSmelled* (design doc: Smell stimulus).
+	// Currently written by smell ingestion but not yet read by intent selection.
 	FVector LastSmelledLocation     = FVector::ZeroVector;
 	FVector HordePressureDirection  = FVector::ZeroVector;
 
@@ -183,9 +216,23 @@ struct FATR_StimulusEvent
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Echo|Stimulus")
 	FVector Direction = FVector::ZeroVector;
 
+	// AUTHORITATIVE loudness for sound-typed stimuli, in real units: dB SPL at the acoustic
+	// reference distance (Echo|Acoustics, default 1 m). Reference points: whisper ≈ 30,
+	// footstep ≈ 45, speech ≈ 60, door pounding ≈ 85, breaking glass ≈ 100, gunshot ≈ 140.
+	// Received level and audible radius are DERIVED from propagation math (inverse-square
+	// spreading + air absorption — see ATR_EchoAcoustics.h). 0 = legacy event: Strength is
+	// converted to a dB level on ingestion.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Echo|Stimulus", meta = (ForceUnits = "dB"))
+	float LoudnessDb = 0.f;
+
+	// Scalar intensity for NON-sound stimuli (smell/blood/agitation), and the legacy [0,1]
+	// strength for old sound call sites that don't set LoudnessDb yet. For sound types this
+	// is recomputed per receiver from the propagation math — do not author it for sounds.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Echo|Stimulus")
 	float Strength = 1.f;
 
+	// Effect radius for NON-sound stimuli. For sound types the audible radius is DERIVED
+	// from LoudnessDb and the hearing threshold — this value is ignored.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Echo|Stimulus")
 	float Radius = 0.f;
 
@@ -216,6 +263,15 @@ struct FATR_EchoMoveRequest
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Echo|Move")
 	float AcceptanceRadius = 50.f;
+
+	// Line-of-desire movement (design doc: Active Prey-Driven Pursuit). When true, the
+	// controller moves directly along the vector to the goal — navmesh is used only as a
+	// movement VALIDATOR (ground projection), never as a route planner — and a meaningful
+	// blocker on the line of desire is classified and reported instead of being routed
+	// around. When false the move is a normal pathfinding move (ambient/abstract movement
+	// such as wander, horde migration, and distant investigation is allowed broad routing).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Echo|Move")
+	bool bDirectPursuit = false;
 };
 
 // Last/most-recent movement execution facts reported back from the active layer.
@@ -262,18 +318,33 @@ struct FATR_AbstractCell
 	float     LastUpdatedTime    = -1.f;
 };
 
-// Obstacle hook record. Breaking is deferred, but the classified failure + location
-// are recorded now so HandleObstacle has something to act on.
+// Barrier memory — the blocker currently associated with pursuit (design doc:
+// FEchoBarrierMemory). Tracks contact/pressure/damage so EngageBarrier can press,
+// attack, reach through, and eventually frustrate WITHOUT ever requesting a reroute.
 struct FATR_EchoObstacleIntent
 {
 	bool bHasObstacle = false;
 
-	EATR_MoveFailureReason Reason = EATR_MoveFailureReason::None;
+	EATR_MoveFailureReason Reason      = EATR_MoveFailureReason::None;
+	EATR_EchoBarrierType   BarrierType = EATR_EchoBarrierType::None;
+	EATR_EchoBarrierPhase  Phase       = EATR_EchoBarrierPhase::None;
 
 	TWeakObjectPtr<AActor> ObstacleActor;
 	FVector ObstacleLocation = FVector::ZeroVector;
+	FVector BarrierNormal    = FVector::ZeroVector;
 
-	float LastObstacleTime = -1.f;
+	// Whether the barrier physically permits reach-through interaction (chain-link fence,
+	// broken window, …). Resolved from the barrier data asset or a per-type default.
+	bool bReachThroughCapable = false;
+
+	float FirstContactTime    = -1.f; // first time this barrier blocked pursuit
+	float LastObstacleTime    = -1.f; // most recent block/impact — drives engagement freshness
+	float FrustratedStartTime = -1.f; // when Phase flipped to FrustratedSearch
+
+	float PressureApplied = 0.f; // group pressure on the barrier at last impact (subsystem-accumulated)
+	float DamageApplied   = 0.f; // total damage this Echo has dealt to the barrier
+
+	float StimulusConfidenceAtContact = 0.f;
 };
 
 // Canonical per-Echo runtime state owned by the subsystem. One per live Echo,

@@ -93,6 +93,11 @@ public:
 	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Echo|Combat")
 	EATR_EchoGripType CurrentGrip = EATR_EchoGripType::None;
 
+	// Rolled deterministically from SoA Index in InitFromSoA; same Index → same condition
+	// across promote/demote cycles. Drives grab multipliers, grip cap, and barge resistance.
+	UPROPERTY(BlueprintReadOnly, Category = "Echo|Combat")
+	FATR_EchoBodyCondition BodyCondition;
+
 	// Called by the melee task whenever its grab releases (slip-away, task exit).
 	void NotifyGrabReleased();
 
@@ -100,6 +105,22 @@ public:
 	// run = full speed, walk-only = limp (LimpSpeedScale), crawl = CrawlSpeed,
 	// immobile/dead = 0. Called on promotion and after surviving structural damage.
 	void ApplyStructuralStateToMovement();
+
+	// --- Shoulder barge ---
+	// A fast-moving player colliding with this echo can shove it aside and break its grip.
+	// Resolved server-side in NotifyHit from real physical terms:
+	//   Power = (speed / BargeReferenceSpeed)            — momentum from running
+	//         × (player mass / echo mass)                — weight of myself vs the echo
+	//         × glancing factor (angle of attack)        — clipping a shoulder ≫ dead-center torso
+	//         ÷ echo StrengthScalar                      — strong echoes hold their ground better
+	// Success knocks the echo sideways out of the path, staggers it (no grabbing, grip drops),
+	// and costs the player speed (more for center hits — lowering the shoulder has a price).
+	virtual void NotifyHit(UPrimitiveComponent* MyComp, AActor* Other, UPrimitiveComponent* OtherComp,
+		bool bSelfMoved, FVector HitLocation, FVector HitNormal, FVector NormalImpulse, const FHitResult& Hit) override;
+
+	// True while this echo is reeling from a successful barge: it cannot grab, and the melee
+	// task releases any held grip. Checked by FATR_EchoMeleeTask each tick.
+	bool IsBargeStaggered(float TimeSeconds) const { return TimeSeconds < BargeStaggeredUntilTime; }
 
 	// --- Lifecycle ---
 
@@ -138,6 +159,17 @@ protected:
 	// A bite resolved (including Miss). Wound severity already decided/logged by C++.
 	UFUNCTION(BlueprintImplementableEvent, Category = "Echo|Combat", meta = (DisplayName = "On Bite Resolved"))
 	void BP_OnBiteResolved(AActor* Target, EATR_BiteWound Wound);
+
+	// The player barged through this echo. Outcome already applied by C++ (knockback +
+	// stagger) — play stumble montage / impact FX here. Power > 1 = an emphatic hit.
+	// (Parameter named BargeInstigator because AActor already declares 'Instigator'.)
+	UFUNCTION(BlueprintImplementableEvent, Category = "Echo|Combat", meta = (DisplayName = "On Barged"))
+	void BP_OnBarged(AActor* BargeInstigator, float Power);
+
+	// Server time until which this echo is barge-staggered, and the last barge resolution
+	// time (cooldown so sustained contact doesn't re-resolve every frame).
+	float BargeStaggeredUntilTime = -1.f;
+	float LastBargeTime           = -1000.f;
 
 	virtual void BeginPlay() override;
 

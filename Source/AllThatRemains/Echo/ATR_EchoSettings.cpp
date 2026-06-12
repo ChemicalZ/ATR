@@ -68,10 +68,7 @@ void UATR_EchoSettings::ValidateAndClamp()
 	LostSightMemoryThreshold  = FMath::Clamp(LostSightMemoryThreshold, 0.f, 1.f);
 	HeardMemorySeconds        = FMath::Max(0.f, HeardMemorySeconds);
 	HeardInvestigateUrgency   = FMath::Clamp(HeardInvestigateUrgency, 0.f, 1.f);
-	SmellMemorySeconds        = FMath::Max(0.f, SmellMemorySeconds);
-	SmellInvestigateUrgency   = FMath::Clamp(SmellInvestigateUrgency, 0.f, 1.f);
 	ReacquireSightConfidence  = FMath::Clamp(ReacquireSightConfidence, 0.f, 1.f);
-	SightLossGraceSeconds     = FMath::Max(0.f, SightLossGraceSeconds);
 
 	// Sight — LoseSight >= Sight provides hysteresis
 	ActiveSightRadius                  = FMath::Max(1.f, ActiveSightRadius);
@@ -82,13 +79,20 @@ void UATR_EchoSettings::ValidateAndClamp()
 	MaxLastSeenProjectionDistance      = FMath::Max(0.f, MaxLastSeenProjectionDistance);
 	LastSeenVelocitySmoothingAlpha     = FMath::Clamp(LastSeenVelocitySmoothingAlpha, 0.f, 1.f);
 
+	// Acoustics — saturation must not fall below the hearing threshold
+	AcousticReferenceDistanceCm   = FMath::Max(1.f, AcousticReferenceDistanceCm);
+	EchoHearingThresholdDb        = FMath::Clamp(EchoHearingThresholdDb, 0.f, 194.f);
+	EchoHearingSaturationDb       = FMath::Clamp(EchoHearingSaturationDb, EchoHearingThresholdDb, 194.f);
+	AirAbsorptionDbPer100m        = FMath::Clamp(AirAbsorptionDbPer100m, 0.f, 10.f);
+	MaxAudibleRangeCm             = FMath::Max(100.f, MaxAudibleRangeCm);
+	DefaultPerceivedNoiseLoudnessDb = FMath::Clamp(DefaultPerceivedNoiseLoudnessDb, 0.f, 194.f);
+	HearingMaxLocationErrorFraction = FMath::Clamp(HearingMaxLocationErrorFraction, 0.f, 1.f);
+
 	// Hearing — weak threshold must not exceed strong threshold
 	ActiveHearingRange              = FMath::Max(1.f, ActiveHearingRange);
 	ActiveHearingMaxAgeSeconds      = FMath::Max(0.f, ActiveHearingMaxAgeSeconds);
 	NoiseStrengthToUrgencyScale     = FMath::Max(0.f, NoiseStrengthToUrgencyScale);
 	NoiseStrengthToAgitationScale   = FMath::Max(0.f, NoiseStrengthToAgitationScale);
-	WeakNoiseTurnOnlyThreshold      = FMath::Clamp(WeakNoiseTurnOnlyThreshold, 0.f, 1.f);
-	StrongNoiseInvestigateThreshold = FMath::Clamp(StrongNoiseInvestigateThreshold, WeakNoiseTurnOnlyThreshold, 1.f);
 
 	// Search
 	ReachLocationRadius            = FMath::Max(0.f, ReachLocationRadius);
@@ -98,6 +102,12 @@ void UATR_EchoSettings::ValidateAndClamp()
 	SearchPointNavProjectionRadius = FMath::Max(0.f, SearchPointNavProjectionRadius);
 	SearchRandomAngleDegrees       = FMath::Max(0.f, SearchRandomAngleDegrees);
 	MaxSearchSteps                 = FMath::Max(1, MaxSearchSteps);
+	SearchRadiusBaseScale          = FMath::Clamp(SearchRadiusBaseScale, 0.f, 2.f);
+	SearchRadiusPerEchoVariation   = FMath::Clamp(SearchRadiusPerEchoVariation, 0.f, 2.f);
+	SearchRadiusAggressionBonus    = FMath::Clamp(SearchRadiusAggressionBonus, 0.f, 2.f);
+	SearchDurationBaseScale        = FMath::Clamp(SearchDurationBaseScale, 0.f, 2.f);
+	SearchDurationPerEchoVariation = FMath::Clamp(SearchDurationPerEchoVariation, 0.f, 2.f);
+	SearchDurationAggressionBonus  = FMath::Clamp(SearchDurationAggressionBonus, 0.f, 2.f);
 
 	// Agitation — curiosity threshold must not exceed join threshold
 	MomentumCellSize                    = FMath::Max(1.f, MomentumCellSize);
@@ -109,6 +119,9 @@ void UATR_EchoSettings::ValidateAndClamp()
 	CombatAgitationAmount                = FMath::Clamp(CombatAgitationAmount, 0.f, 1.f);
 	HordePressureMoveDistance            = FMath::Max(0.f, HordePressureMoveDistance);
 	HordePressureDirectionSmoothingAlpha = FMath::Clamp(HordePressureDirectionSmoothingAlpha, 0.f, 1.f);
+	HordeOrientTargetDistanceCm          = FMath::Max(0.f, HordeOrientTargetDistanceCm);
+	HeardSteerMinSpeedFraction           = FMath::Clamp(HeardSteerMinSpeedFraction, 0.f, 1.f);
+	HordeSeparationOnlySpeedFraction     = FMath::Clamp(HordeSeparationOnlySpeedFraction, 0.f, 1.f);
 
 	// Field diffusion + jitter shaping
 	MomentumDiffusionRate      = FMath::Clamp(MomentumDiffusionRate, 0.f, 20.f);
@@ -135,6 +148,7 @@ void UATR_EchoSettings::ValidateAndClamp()
 	MomentumMoverSpeedThreshold  = FMath::Max(0.f, MomentumMoverSpeedThreshold);
 	MomentumRefMoverCount        = FMath::Clamp(MomentumRefMoverCount, 1.f, 200.f);
 	MomentumAlignThreshold       = FMath::Clamp(MomentumAlignThreshold, 0.f, 1.f);
+	MomentumCalmResistance       = FMath::Clamp(MomentumCalmResistance, 0.f, 10.f);
 	MomentumMaxStrength          = FMath::Clamp(MomentumMaxStrength, 0.1f, 4.f);
 	SoundImpulseRadius           = FMath::Max(0.f, SoundImpulseRadius);
 	SoundImpulseSpeed            = FMath::Max(0.f, SoundImpulseSpeed);
@@ -157,13 +171,38 @@ void UATR_EchoSettings::ValidateAndClamp()
 	AbstractCellNoiseAttractionScale     = FMath::Max(0.f, AbstractCellNoiseAttractionScale);
 	AbstractCellAgitationAttractionScale = FMath::Max(0.f, AbstractCellAgitationAttractionScale);
 
+	// Active pursuit (line-of-desire)
+	ActivePursuitForwardSweepDistanceCm        = FMath::Max(0.f, ActivePursuitForwardSweepDistanceCm);
+	ActivePursuitSweepRadiusCm                 = FMath::Max(0.f, ActivePursuitSweepRadiusCm);
+	ActivePursuitGroundProjectionRadiusCm      = FMath::Max(0.f, ActivePursuitGroundProjectionRadiusCm);
+	ActivePursuitStuckTimeSeconds              = FMath::Max(0.05f, ActivePursuitStuckTimeSeconds);
+	ActivePursuitStuckProgressCm               = FMath::Max(0.f, ActivePursuitStuckProgressCm);
+	ActivePursuitDirectInvestigateDistanceCm   = FMath::Max(0.f, ActivePursuitDirectInvestigateDistanceCm);
+	ActivePursuitBlockerHeadOnDot              = FMath::Clamp(ActivePursuitBlockerHeadOnDot, 0.f, 1.f);
+
+	// Barrier engagement
+	BarrierEngageDistanceCm                = FMath::Max(0.f, BarrierEngageDistanceCm);
+	BarrierReachThroughDistanceCm          = FMath::Max(0.f, BarrierReachThroughDistanceCm);
+	BarrierAttackIntervalSeconds           = FMath::Max(0.05f, BarrierAttackIntervalSeconds);
+	BarrierFirstAttackDelaySeconds         = FMath::Max(0.f, BarrierFirstAttackDelaySeconds);
+	BarrierDamagePerHit                    = FMath::Max(0.f, BarrierDamagePerHit);
+	BarrierPressurePerEcho                 = FMath::Max(0.f, BarrierPressurePerEcho);
+	BarrierPressureDecayPerSecond          = FMath::Max(0.f, BarrierPressureDecayPerSecond);
+	BarrierPressureDamageMultiplier        = FMath::Max(0.f, BarrierPressureDamageMultiplier);
+	BarrierImpactLoudnessDb                = FMath::Clamp(BarrierImpactLoudnessDb, 0.f, 194.f);
+	MaxBarrierEngageSecondsWithoutStimulus = FMath::Max(0.f, MaxBarrierEngageSecondsWithoutStimulus);
+	FrustratedSearchDurationSeconds        = FMath::Max(0.f, FrustratedSearchDurationSeconds);
+	FrustratedSearchRadiusCm               = FMath::Max(0.f, FrustratedSearchRadiusCm);
+	FrustratedSearchHitIntervalSeconds     = FMath::Max(0.1f, FrustratedSearchHitIntervalSeconds);
+	FrustratedSearchHitRangeMultiplier     = FMath::Clamp(FrustratedSearchHitRangeMultiplier, 1.f, 5.f);
+	FrustratedShuffleMinRadiusFraction     = FMath::Clamp(FrustratedShuffleMinRadiusFraction, 0.f, 1.f);
+	FrustratedShuffleAcceptRadiusCm        = FMath::Max(1.f, FrustratedShuffleAcceptRadiusCm);
+
 	// Obstacle hooks
 	ObstacleForwardTraceLength   = FMath::Max(0.f, ObstacleForwardTraceLength);
-	ObstacleTraceRadius          = FMath::Max(0.f, ObstacleTraceRadius);
 	ObstacleHandleTimeoutSeconds = FMath::Max(0.f, ObstacleHandleTimeoutSeconds);
 	ObstacleSidestepDistance     = FMath::Max(0.f, ObstacleSidestepDistance);
 	ObstacleForwardNudgeDistance = FMath::Max(0.f, ObstacleForwardNudgeDistance);
-	ObstacleRetryCooldownSeconds = FMath::Max(0.f, ObstacleRetryCooldownSeconds);
 
 	// Combat — bite within grab range; release multiplier >= 1
 	MeleeAttackRange       = FMath::Max(0.f, MeleeAttackRange);
@@ -191,6 +230,41 @@ void UATR_EchoSettings::ValidateAndClamp()
 	LacerationTierScale    = FMath::Clamp(LacerationTierScale, 0.f, 1.f);
 	LimpSpeedScale         = FMath::Clamp(LimpSpeedScale, 0.f, 1.f);
 	CrawlSpeed             = FMath::Max(0.f, CrawlSpeed);
+
+	// Shoulder barge
+	BargeMinSpeed               = FMath::Max(0.f, BargeMinSpeed);
+	BargeReferenceSpeed         = FMath::Max(1.f, BargeReferenceSpeed);
+	BargeSuccessPowerThreshold  = FMath::Max(0.f, BargeSuccessPowerThreshold);
+	BargeCenterEffectiveness    = FMath::Clamp(BargeCenterEffectiveness, 0.f, 1.f);
+	BargeKnockbackSpeed         = FMath::Max(0.f, BargeKnockbackSpeed);
+	BargeStaggerSeconds         = FMath::Max(0.f, BargeStaggerSeconds);
+	BargePlayerSpeedLossAtCenter = FMath::Clamp(BargePlayerSpeedLossAtCenter, 0.f, 1.f);
+	BargeCooldownSeconds        = FMath::Max(0.f, BargeCooldownSeconds);
+	BargeMinApproachDot         = FMath::Clamp(BargeMinApproachDot, -1.f, 1.f);
+	BargeKnockbackSideMix       = FMath::Clamp(BargeKnockbackSideMix, 0.f, 2.f);
+	BargeKnockbackForwardMix    = FMath::Clamp(BargeKnockbackForwardMix, 0.f, 2.f);
+	BargeKnockbackUpSpeed       = FMath::Max(0.f, BargeKnockbackUpSpeed);
+	BargeMassRatioMin           = FMath::Clamp(BargeMassRatioMin, 0.01f, 1.f);
+	BargeMassRatioMax           = FMath::Max(BargeMassRatioMin, BargeMassRatioMax);
+	BargePowerCap               = FMath::Clamp(BargePowerCap, 1.f, 10.f);
+
+	// Body condition — chances must sum to <= 1 (remainder = NoArms); strength min <= max.
+	BodyHealthyChance        = FMath::Clamp(BodyHealthyChance, 0.f, 1.f);
+	BodyMissingFingersChance = FMath::Clamp(BodyMissingFingersChance, 0.f, 1.f - BodyHealthyChance);
+	BodyMissingHandChance    = FMath::Clamp(BodyMissingHandChance, 0.f, 1.f - BodyHealthyChance - BodyMissingFingersChance);
+	BodyStrengthScalarMin    = FMath::Clamp(BodyStrengthScalarMin, 0.f, 2.f);
+	BodyStrengthScalarMax    = FMath::Clamp(BodyStrengthScalarMax, BodyStrengthScalarMin, 2.f);
+
+	// Grip / bite tables — deep-scratch threshold can't be below the scratch threshold.
+	WeakGripPullTransmission     = FMath::Clamp(WeakGripPullTransmission, 0.f, 1.f);
+	StrongGripChanceCap          = FMath::Clamp(StrongGripChanceCap, 0.f, 1.f);
+	GrabMissingFingersMultiplier = FMath::Clamp(GrabMissingFingersMultiplier, 0.f, 1.f);
+	GrabMissingHandMultiplier    = FMath::Clamp(GrabMissingHandMultiplier, 0.f, 1.f);
+	ScratchFingerlessMultiplier  = FMath::Clamp(ScratchFingerlessMultiplier, 0.f, 1.f);
+	BiteStrongScratchUpTo        = FMath::Clamp(BiteStrongScratchUpTo, 0.f, 1.f);
+	BiteStrongDeepScratchUpTo    = FMath::Clamp(BiteStrongDeepScratchUpTo, BiteStrongScratchUpTo, 1.f);
+	BiteWeakScratchUpTo          = FMath::Clamp(BiteWeakScratchUpTo, 0.f, 1.f);
+	BiteWeakDeepScratchUpTo      = FMath::Clamp(BiteWeakDeepScratchUpTo, BiteWeakScratchUpTo, 1.f);
 
 	// Demotion
 	DemotionConfidenceBlockThreshold = FMath::Clamp(DemotionConfidenceBlockThreshold, 0.f, 1.f);

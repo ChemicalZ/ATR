@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Containers/BitArray.h"
 #include "Subsystems/WorldSubsystem.h"
+#include "UObject/ObjectKey.h"
 #include "ATR_EchoRuntimeTypes.h"
 #include "../Health/Echo/ATR_EchoHealthModel.h"
 #include "ATR_EchoSubsystem.generated.h"
@@ -16,6 +17,7 @@ class AATR_EchoAIController;
 class UATR_EchoSettings;
 class UATR_EchoSearchPatternDataAsset;
 class UATR_EchoObstacleBehaviorDataAsset;
+class UATR_EchoBarrierDataAsset;
 
 UENUM()
 enum class EEchoDirtyFlags : uint8
@@ -63,7 +65,6 @@ public:
 			}
 	}
 
-	int32 GetNumCells()   const { return NumCellsX * NumCellsY; }
 	bool  IsInitialized() const { return NumCellsX > 0; }
 
 	FORCEINLINE float GetCellSize() const { return CellSize; }
@@ -127,8 +128,6 @@ public:
 	void  AddEntity(int32 EntityIndex, int32 CellId, int32& OutSlotInCell);
 	int32 RemoveEntityAndReturnMoved(int32 EntityIndex, int32 CellId, int32 SlotInCell);
 	void  ReplaceEntityAtSlot(int32 CellId, int32 SlotInCell, int32 ExpectedOld, int32 NewEntity);
-
-	bool ValidateEntitySlot(int32 EntityIndex, int32 CellId, int32 SlotInCell) const;
 
 	template<typename FuncType>
 	void ForEachEntityInRadius(FVector2f Origin, float Radius,
@@ -345,6 +344,21 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Echo|Health")
 	bool ApplyDamageToEcho(int32 SoAIndex, const FATR_DamageEvent& Event);
 
+	// --- Barrier engagement reporting (design doc: Engage Barrier / Reach Through Barrier) ---
+
+	// A meaningful blocker was detected on the line of desire during direct pursuit. Stamps
+	// the failed move completion (so the waiting StateTree task resolves) AND seeds barrier
+	// memory with full classification (type/normal/contact time), flipping the Echo's next
+	// intent to EngageBarrier. Never produces a reroute.
+	void ReportEchoBlockedByBarrier(int32 EchoId, AActor* Barrier, EATR_EchoBarrierType BarrierType,
+	                                const FVector& HitLocation, const FVector& HitNormal, float TimeSeconds);
+
+	// One barrier attack landed (called by the EngageBarrier task on its attack interval).
+	// Accumulates group pressure, scales and delivers damage through IATR_EchoBarrier,
+	// deposits pounding agitation, and emits the impact noise stimulus that attracts nearby
+	// Echoes — the door-banging feedback loop. Refreshes barrier memory freshness.
+	void ReportBarrierImpact(int32 EchoId);
+
 	// --- Public API ---
 
 	int32 AddEcho(FVector3f Position);
@@ -352,6 +366,7 @@ public:
 
 	// Immediately demote (if promoted) and remove from SoA. Use when an echo dies.
 	// Bypasses bBlockDemotion and hysteresis — unconditional.
+	// TODO: gameplay death entry point — wire to the health/wound system once it exists.
 	void ForceDestroyEcho(int32 SoAIndex);
 	void ForceDestroyEcho(AATR_ActiveEcho* Actor); // convenience overload for promoted echoes
 
@@ -375,7 +390,6 @@ public:
 	bool                    IsGridReady()    const { return bGridReady; }
 
 	void MarkEchoDirty(int32 Index, EEchoDirtyFlags Flags);
-	bool IsEchoDirty  (int32 Index, EEchoDirtyFlags Flags) const;
 
 	float PositionDirtyThresholdSq = 25.f;  // set from settings in Initialize()
 	float YawDirtyThresholdDeg     = 2.f;
@@ -397,18 +411,6 @@ public:
 		       Yaws.Num()       >= InitializeCount &&
 		       AnimState.Num()  >= InitializeCount;
 	}
-
-	bool ValidateActiveArrays() const
-	{
-		return ActiveEntities >= 0                  &&
-		       ActiveEntities <= InitializeCount    &&
-		       Positions.Num()   >= ActiveEntities  &&
-		       Yaws.Num()        >= ActiveEntities  &&
-		       AnimState.Num()   >= ActiveEntities  &&
-		       IndexToActor.Num() >= ActiveEntities;
-	}
-
-	bool ValidateEchoSpatialState() const;
 
 	// Client-side partial replication support. On clients, only snapshot-received
 	// echo indices are relevant/valid for local coarse/fine grid and ISM queries.
@@ -574,6 +576,7 @@ public:
 	float MomentumMoverSpeedThreshold = 30.f;
 	float MomentumRefMoverCount      = 12.f;
 	float MomentumAlignThreshold     = 0.12f;
+	float MomentumCalmResistance     = 3.0f;  // calm echoes resist field alignment (threshold scale)
 	float MomentumMaxStrength        = 1.0f;
 	float SoundImpulseRadius         = 4000.f;
 	float SoundImpulseSpeed          = 150.f;
@@ -618,7 +621,7 @@ public:
 	float ReachLocationRadius          = 120.f; // "arrived" tolerance for memory/search points
 	float SightProjectionSeconds       = 2.0f;  // lead time for projected-direction search
 	float MaxSightProjectionDistance   = 800.f; // clamp so prediction can't be supernatural
-	float ObstacleHandleTimeoutSeconds = 2.0f;  // how long a fresh block forces HandleObstacle
+	float ObstacleHandleTimeoutSeconds = 2.0f;  // freshness window for a block to start/keep EngageBarrier
 
 	// Frame-scope scratch for local entity indices; allocation persists across ticks.
 	TArray<int32> LocalEntityScratch;
@@ -662,6 +665,31 @@ private:
 	// bFlushAll forces a complete drain (used just before a killed Echo's SoA
 	// row is recycled, so the EchoKilled delta can't be invalidated by reuse).
 	void ReplicateEchoHealthDeltas(bool bFlushAll = false);
+
+	// --- Barrier engagement internals ---
+
+	// Per-tick barrier state machine for one Echo: Engage ↔ ReachThrough → FrustratedSearch
+	// → decay. Returns true (and fills OutIntent/OutMove) while a barrier drives behavior;
+	// returns false once the obstacle is cleared/expired so lower-priority drivers run.
+	bool UpdateBarrierEngagement(FATR_EchoRuntimeState& State, float Now,
+	                             EATR_EchoIntent& OutIntent, FATR_EchoMoveRequest& OutMove);
+
+	// Barrier interaction rules via IATR_EchoBarrier, or null (per-type defaults apply).
+	const UATR_EchoBarrierDataAsset* GetBarrierData(AActor* Barrier) const;
+
+	// Lazily-decayed group pressure accumulator, keyed by barrier actor identity. Each call
+	// applies decay since the last update, adds Add, and returns the current pressure.
+	float AccumulateBarrierPressure(const AActor* Barrier, float Add, float Now);
+
+	// Group pressure per engaged barrier. FObjectKey keeps identity without ownership;
+	// records decay to zero and are pruned lazily on access.
+	struct FATR_BarrierPressureRecord
+	{
+		float Pressure       = 0.f;
+		float LastUpdateTime = -1.f;
+	};
+	TMap<FObjectKey, FATR_BarrierPressureRecord> BarrierPressure;
+
 	void RegisterEntityToCoarseGrid(int32 EntityIndex);
 	void UnregisterEntityFromCoarseGrid(int32 EntityIndex);
 	void MoveEntityCoarseCell(int32 EntityIndex, int32 NewCellId);

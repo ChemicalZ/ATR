@@ -43,10 +43,11 @@ public:
 	bool bShowTargetLines   = false; // line from echo to its current move target
 
 	// Click-to-emit sound (debug map). When bEmitSoundMode is on, left-click emits a stimulus.
-	bool  bEmitSoundMode = false;
-	float SoundStrength  = 1.0f;
-	float SoundRadius    = 4000.f;
-	uint8 SoundType      = 0; // EATR_StimulusType ordinal (0 = Noise)
+	// Loudness is authored in REAL units (dB SPL @ 1 m): footstep ≈ 45, speech ≈ 60, door
+	// pounding ≈ 85, gunshot ≈ 140. The audible radius is derived by the acoustics model.
+	bool  bEmitSoundMode  = false;
+	float SoundLoudnessDb = 80.f;
+	uint8 SoundType       = 0; // EATR_StimulusType ordinal (0 = Noise)
 
 	// View controls invoked by the toolbar buttons.
 	void ZoomBy(float Factor);                 // multiply zoom about the view center

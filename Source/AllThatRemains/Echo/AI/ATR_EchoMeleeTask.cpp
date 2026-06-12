@@ -70,6 +70,14 @@ EStateTreeRunStatus FATR_EchoMeleeTask::Tick(FStateTreeExecutionContext& Context
 	const float Now  = W ? W->GetTimeSeconds() : 0.f;
 	const float Dist = FVector::Dist2D(Pawn->GetActorLocation(), Target->GetActorLocation());
 
+	// Barged: a shoulder-charge knocked this echo aside (resolved in AATR_ActiveEcho::NotifyHit).
+	// The grip is physically broken and the echo is too staggered to grab until it recovers.
+	if (Pawn->IsBargeStaggered(Now))
+	{
+		ReleaseGrab(TEXT("barged"));
+		return EStateTreeRunStatus::Running; // recover, then resume grabbing
+	}
+
 	// Grab attempt - within arm's length, off cooldown. The echo keeps moving forward regardless.
 	// Outcome (incl. failed-grab scratches) is resolved + logged by the pawn in LogATR_EchoCombat.
 	if (!Data.bGrabbed && Dist <= S->GrabRange && (Now - Data.LastGrabTime) >= S->GrabCooldownSeconds)

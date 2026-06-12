@@ -125,19 +125,15 @@ void SATR_EchoDebugMapWidget::Construct(const FArguments& InArgs)
 
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)[ Sep() ]
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)[ MakeToggle(TEXT("Emit"), &SATR_EchoDebugMapView::bEmitSoundMode, TEXT("Click-to-emit: left-click the map to emit a sound stimulus at that point. Pan with right-drag while on.")) ]
-				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(4.f,0.f,2.f,0.f))[ SNew(STextBlock).Text(FText::FromString(TEXT("Str"))).Font(ToolbarFont()) ]
+				// Loudness in REAL units (dB SPL @ 1 m). Footstep ≈ 45, speech ≈ 60, door pounding ≈ 85,
+				// breaking glass ≈ 100, gunshot ≈ 140. Audible radius derives from the acoustics model.
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(4.f,0.f,2.f,0.f))[ SNew(STextBlock).Text(FText::FromString(TEXT("dB"))).Font(ToolbarFont()) ]
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)
 				[
-					SNew(SSpinBox<float>).MinValue(0.f).MaxValue(4.f).Delta(0.05f).MinDesiredWidth(56.f)
-					.Value_Lambda([this]{ return MapView.IsValid() ? MapView->SoundStrength : 1.f; })
-					.OnValueChanged_Lambda([this](float V){ if (MapView.IsValid()) MapView->SoundStrength = V; })
-				]
-				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(4.f,0.f,2.f,0.f))[ SNew(STextBlock).Text(FText::FromString(TEXT("Rad"))).Font(ToolbarFont()) ]
-				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)
-				[
-					SNew(SSpinBox<float>).MinValue(0.f).MaxValue(50000.f).Delta(100.f).MinDesiredWidth(74.f)
-					.Value_Lambda([this]{ return MapView.IsValid() ? MapView->SoundRadius : 4000.f; })
-					.OnValueChanged_Lambda([this](float V){ if (MapView.IsValid()) MapView->SoundRadius = V; })
+					SNew(SSpinBox<float>).MinValue(20.f).MaxValue(160.f).Delta(1.f).MinDesiredWidth(56.f)
+					.ToolTipText(FText::FromString(TEXT("Source loudness in dB SPL @ 1 m. Footstep ~45, speech ~60, door pounding ~85, gunshot ~140. Audible radius is derived from inverse-square falloff + air absorption.")))
+					.Value_Lambda([this]{ return MapView.IsValid() ? MapView->SoundLoudnessDb : 80.f; })
+					.OnValueChanged_Lambda([this](float V){ if (MapView.IsValid()) MapView->SoundLoudnessDb = V; })
 				]
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(4.f,0.f,2.f,0.f))[ SNew(STextBlock).Text(FText::FromString(TEXT("Type"))).Font(ToolbarFont()) ]
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f)

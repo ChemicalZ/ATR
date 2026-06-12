@@ -254,9 +254,9 @@ void AATR_EchoManager::ConfigureISMComponent(UInstancedStaticMeshComponent* ISM)
 	// Preserve hard safety defaults even if a setting read fails.
 	ApplyISMSafeDefaults(ISM);
 
-	const bool bCastShadows               = Settings ? Settings->bHordeISMCastShadows : false;
-	const bool bReceivesDecals            = Settings ? Settings->bHordeISMReceivesDecals : false;
-	const bool bAffectDistanceFieldLighting = Settings ? Settings->bHordeISMAffectDistanceFieldLighting : false;
+	const bool bCastShadows                 = Settings->bHordeISMCastShadows;
+	const bool bReceivesDecals              = Settings->bHordeISMReceivesDecals;
+	const bool bAffectDistanceFieldLighting = Settings->bHordeISMAffectDistanceFieldLighting;
 
 	ISM->SetCastShadow(bCastShadows);
 	ISM->bCastDynamicShadow            = bCastShadows;

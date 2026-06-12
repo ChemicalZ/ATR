@@ -11,11 +11,18 @@
 #include "Data/ATR_EchoObstacleBehaviorDataAsset.h"
 #include "../Health/ATR_HealthSettings.h"
 #include "../Health/Data/ATR_WeaponDamageProfile.h"
+#include "Data/ATR_EchoBarrierDataAsset.h"
+#include "ATR_EchoBarrierInterface.h"
+#include "ATR_EchoAcoustics.h"
 #include "Engine/World.h"
 #include "NavigationSystem.h"
 #include "Async/ParallelFor.h"
 #include "Logging/StructuredLog.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
+
+// Forward declaration — defined in the intent-helpers anonymous namespace further down.
+// Needed by EmitWorldStimulus (imperfect-hearing jitter), which appears earlier in the file.
+namespace { float EchoHash01(int32 EchoId, uint32 Salt); }
 
 // ─── FATR_SparseGrid ─────────────────────────────────────────────────────────
 
@@ -130,14 +137,6 @@ void FATR_CoarseGrid::ReplaceEntityAtSlot(int32 CellId, int32 SlotInCell, int32 
 	(*Bucket)[SlotInCell] = NewEntity;
 }
 
-bool FATR_CoarseGrid::ValidateEntitySlot(int32 EntityIndex, int32 CellId, int32 SlotInCell) const
-{
-	const TArray<int32>* Bucket = CellEntities.Find(CellId);
-	if (!Bucket) return false;
-	if (!Bucket->IsValidIndex(SlotInCell)) return false;
-	return (*Bucket)[SlotInCell] == EntityIndex;
-}
-
 // ─── UATR_EchoSubsystem ──────────────────────────────────────────────────────
 
 TStatId UATR_EchoSubsystem::GetStatId() const
@@ -216,6 +215,8 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	// Cache the settings CDO (program-lifetime object) so behavior code reads tuning directly.
 	// Hot tuning values used in the existing intent/agitation paths are mirrored to members
 	// below to keep their use sites unchanged.
+	// CachedSettings is the validated settings CDO — non-null for the subsystem's entire
+	// lifetime (everything behavior-related runs post-Initialize, gated by bInitialized).
 	CachedSettings = Settings;
 
 	// Awareness / intent decays + thresholds (mirrors of Echo|Awareness, Echo|Sight, Echo|Search).
@@ -264,6 +265,7 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	MomentumMoverSpeedThreshold = Settings->MomentumMoverSpeedThreshold;
 	MomentumRefMoverCount       = Settings->MomentumRefMoverCount;
 	MomentumAlignThreshold      = Settings->MomentumAlignThreshold;
+	MomentumCalmResistance      = Settings->MomentumCalmResistance;
 	MomentumMaxStrength         = Settings->MomentumMaxStrength;
 	SoundImpulseRadius          = Settings->SoundImpulseRadius;
 	SoundImpulseSpeed           = Settings->SoundImpulseSpeed;
@@ -382,7 +384,7 @@ void UATR_EchoSubsystem::Tick(float DeltaTime)
 		// Lower-tier simulation — budgeted individual (LowDetail) + cell-level (Abstract). Both run
 		// off accumulators at their configured Hz so cost stays bounded regardless of horde size.
 		LowDetailAccumulator += DeltaTime;
-		const float LowDetailInterval = 1.f / FMath::Max(0.1f, CachedSettings ? CachedSettings->LowDetailUpdateHz : 8.f);
+		const float LowDetailInterval = 1.f / FMath::Max(0.1f, CachedSettings->LowDetailUpdateHz);
 		if (LowDetailAccumulator >= LowDetailInterval)
 		{
 			RunLowDetailPass(LowDetailAccumulator);
@@ -390,7 +392,7 @@ void UATR_EchoSubsystem::Tick(float DeltaTime)
 		}
 
 		AbstractAccumulator += DeltaTime;
-		const float AbstractInterval = 1.f / FMath::Max(0.1f, CachedSettings ? CachedSettings->AbstractUpdateHz : 1.f);
+		const float AbstractInterval = 1.f / FMath::Max(0.1f, CachedSettings->AbstractUpdateHz);
 		if (AbstractAccumulator >= AbstractInterval)
 		{
 			RunAbstractPass(AbstractAccumulator);
@@ -820,7 +822,7 @@ void UATR_EchoSubsystem::ReportEchoSawActor(int32 EchoId, AActor* Actor, const F
 	// derives it from a visible position delta, not the actor's movement component). Smooth it
 	// into stored velocity; snap on first observation / when prior is zero so we don't lerp from
 	// a stale zero. This is the only place LastSeenVelocity is written.
-	const float Alpha = CachedSettings ? CachedSettings->LastSeenVelocitySmoothingAlpha : 0.5f;
+	const float Alpha = CachedSettings->LastSeenVelocitySmoothingAlpha;
 	const bool  bWasVisible = (A.ConfirmedVisibleActor.Get() == Actor) && !A.LastSeenVelocity.IsNearlyZero();
 	A.LastSeenVelocity = bWasVisible
 		? FMath::Lerp(A.LastSeenVelocity, ObservedVelocity, Alpha)
@@ -831,7 +833,7 @@ void UATR_EchoSubsystem::ReportEchoSawActor(int32 EchoId, AActor* Actor, const F
 	A.bHasCurrentLineOfSight = true;
 	A.LastSeenLocation      = Location;
 	A.LastSeenTime          = TimeSeconds;
-	A.Confidence            = CachedSettings ? CachedSettings->ReacquireSightConfidence : 1.f;
+	A.Confidence            = CachedSettings->ReacquireSightConfidence;
 	A.Urgency               = FMath::Max(A.Urgency, 1.f);
 
 	// NOTE: sight no longer deposits any horde pressure. Seeing the player only makes THIS echo
@@ -888,8 +890,8 @@ void UATR_EchoSubsystem::ReportEchoHeardLocation(int32 EchoId, const FVector& Lo
 	}
 
 	const float Loud = FMath::Clamp(Strength, 0.f, 1.f);
-	const float UrgencyScale   = CachedSettings ? CachedSettings->NoiseStrengthToUrgencyScale   : 1.0f;
-	const float AgitationScale  = CachedSettings ? CachedSettings->NoiseStrengthToAgitationScale : 0.25f;
+	const float UrgencyScale   = CachedSettings->NoiseStrengthToUrgencyScale;
+	const float AgitationScale  = CachedSettings->NoiseStrengthToAgitationScale;
 	A.Urgency = FMath::Max(A.Urgency, FMath::Clamp(Loud * UrgencyScale, 0.f, 1.f));
 
 	// Mild agitation contribution — even weak noise nudges horde pressure. Strong noise raises
@@ -947,17 +949,43 @@ void UATR_EchoSubsystem::EmitWorldStimulus(const FATR_StimulusEvent& Event)
 
 	const float Now = W->GetTimeSeconds();
 
-	// Validate / clamp. Strength/Radius are non-negative; missing time stamps to now.
+	// Validate / clamp. Missing time stamps to now.
 	FATR_StimulusEvent E = Event;
-	E.Strength = FMath::Max(0.f, E.Strength);
-	E.Radius   = FMath::Max(0.f, E.Radius);
+	E.Strength   = FMath::Max(0.f, E.Strength);
+	E.Radius     = FMath::Max(0.f, E.Radius);
+	E.LoudnessDb = FMath::Clamp(E.LoudnessDb, 0.f, 194.f);
 	if (E.TimeSeconds <= 0.f) E.TimeSeconds = Now;
-	if (E.Strength <= 0.f) return;
 
-	const float Radius = (E.Radius > 0.f)
-		? E.Radius
-		: (CachedSettings ? CachedSettings->LowDetailStimulusQueryRadius : 3000.f);
-	const float HearRange = FMath::Max(1.f, Radius);
+	// Acoustic model parameters (see ATR_EchoAcoustics.h — the future ray-tracing seam).
+	const float RefDistCm    = CachedSettings->AcousticReferenceDistanceCm;
+	const float ThresholdDb  = CachedSettings->EchoHearingThresholdDb;
+	const float SaturationDb = CachedSettings->EchoHearingSaturationDb;
+	const float AirAbsorb    = CachedSettings->AirAbsorptionDbPer100m;
+	const float MaxRangeCm   = CachedSettings->MaxAudibleRangeCm;
+
+	const bool bIsSound = ATR_EchoAcoustics::IsSoundType(E.Type);
+	float HearRange = 1.f;
+	if (bIsSound)
+	{
+		// Sounds propagate in REAL units. Legacy events that only set Strength are bridged
+		// onto the dB scale so old call sites keep working during migration.
+		if (E.LoudnessDb <= 0.f)
+			E.LoudnessDb = ATR_EchoAcoustics::LegacyStrengthToDb(E.Strength, ThresholdDb, SaturationDb);
+		if (E.LoudnessDb <= ThresholdDb) return; // inaudible even at the source
+
+		// Source-relative normalized intensity, used for cell memory/agitation deposits.
+		E.Strength = ATR_EchoAcoustics::DbToNormalizedStrength(E.LoudnessDb, ThresholdDb, SaturationDb);
+
+		// Audible radius is DERIVED from the propagation model — never authored.
+		HearRange = ATR_EchoAcoustics::ComputeAudibleRadiusCm(E.LoudnessDb, ThresholdDb, RefDistCm, AirAbsorb, MaxRangeCm);
+	}
+	else
+	{
+		if (E.Strength <= 0.f) return;
+		HearRange = FMath::Max(1.f, (E.Radius > 0.f)
+			? E.Radius
+			: CachedSettings->LowDetailStimulusQueryRadius);
+	}
 
 	// Agitation deposit amount by type (smell/blood drive agitation but not heard knowledge).
 	float AgitAmount = E.Strength;
@@ -989,10 +1017,12 @@ void UATR_EchoSubsystem::EmitWorldStimulus(const FATR_StimulusEvent& Event)
 	}
 
 	// Fan location-only awareness to nearby Echoes (active + low-detail) via the coarse grid so
-	// cost is proportional to nearby population. Distance falloff scales strength. This raises
-	// urgency/agitation on affected Echoes, which is what raises their promotion priority. No
-	// branch ever records a target actor — only location/field knowledge.
-	const float SmellAgitScale = CachedSettings ? CachedSettings->NoiseStrengthToAgitationScale : 0.25f;
+	// cost is proportional to nearby population. Sound attenuates physically (inverse-square
+	// spreading + air absorption, normalized against the hearing threshold); non-sound stimuli
+	// keep a simple linear radius falloff. This raises urgency/agitation on affected Echoes,
+	// which is what raises their promotion priority. No branch ever records a target actor —
+	// only location/field knowledge.
+	const float SmellAgitScale = CachedSettings->NoiseStrengthToAgitationScale;
 	CoarseGrid.ForEachEntityInRadius(FVector2f(E.Location.X, E.Location.Y), HearRange,
 		TArrayView<const FVector3f>(Positions.GetData(), ActiveEntities),
 		[&](int32 Index)
@@ -1000,10 +1030,40 @@ void UATR_EchoSubsystem::EmitWorldStimulus(const FATR_StimulusEvent& Event)
 			FATR_EchoRuntimeState* State = GetMutableEchoStateByIndex(Index);
 			if (!State) return;
 
-			const float Dist    = FVector::Dist(FVector(GetEchoQueryPosition(Index)), E.Location);
-			const float Falloff = FMath::Clamp(1.f - Dist / HearRange, 0.f, 1.f);
-			if (Falloff <= 0.f) return;
-			const float Strength = E.Strength * Falloff;
+			const float Dist = FVector::Dist(FVector(GetEchoQueryPosition(Index)), E.Location);
+
+			float   Strength     = 0.f;
+			FVector PerceivedLoc = E.Location;
+			if (bIsSound)
+			{
+				// Received level at this Echo's ear → perceived intensity above its threshold.
+				const float ReceivedDb = ATR_EchoAcoustics::ComputeReceivedDb(E.LoudnessDb, Dist, RefDistCm, AirAbsorb);
+				Strength = ATR_EchoAcoustics::DbToNormalizedStrength(ReceivedDb, ThresholdDb, SaturationDb);
+				if (Strength <= 0.f) return;
+
+				// IMPERFECT HEARING: each Echo localizes the source with its own error — up to
+				// HearingMaxLocationErrorFraction of the distance at barely-audible, shrinking to
+				// zero at saturation. Deterministic per Echo per event, so one gunshot scatters
+				// the population's estimates into several converging streams (separate hordes
+				// closing on roughly the right place) instead of one exact point. This is also
+				// where echoes/reflections off buildings perturb the estimate once sound ray
+				// tracing lands.
+				const float ErrFraction = CachedSettings->HearingMaxLocationErrorFraction * (1.f - Strength);
+				if (ErrFraction > 0.f && Dist > 1.f)
+				{
+					const int32  RecvEchoId = GetEchoIdForIndex(Index);
+					const uint32 EventSalt  = static_cast<uint32>(E.TimeSeconds * 997.f);
+					const float  Ang = EchoHash01(RecvEchoId, EventSalt) * 2.f * PI;
+					const float  Mag = Dist * ErrFraction * EchoHash01(RecvEchoId, EventSalt ^ 0x9E3779B9u);
+					PerceivedLoc += FVector(FMath::Cos(Ang), FMath::Sin(Ang), 0.f) * Mag;
+				}
+			}
+			else
+			{
+				const float Falloff = FMath::Clamp(1.f - Dist / HearRange, 0.f, 1.f);
+				Strength = E.Strength * Falloff;
+			}
+			if (Strength <= 0.f) return;
 
 			switch (E.Type)
 			{
@@ -1014,18 +1074,19 @@ void UATR_EchoSubsystem::EmitWorldStimulus(const FATR_StimulusEvent& Event)
 					State->Agitation = FMath::Min(1.f, State->Agitation + Strength * SmellAgitScale);
 					break;
 				default:
-					// Location-only heard knowledge; never sets a target actor.
-					ReportEchoHeardLocation(GetEchoIdForIndex(Index), E.Location, Strength, E.TimeSeconds);
+					// Location-only heard knowledge — each Echo stores ITS OWN imperfect estimate
+					// of where the sound came from; never sets a target actor.
+					ReportEchoHeardLocation(GetEchoIdForIndex(Index), PerceivedLoc, Strength, E.TimeSeconds);
 
-					// Sound MOVEMENT impulse: start this horde-tier echo moving toward the source. That
-					// shared movement is what builds the momentum field next tick (a loud sound that gets
-					// 30 echoes moving together seeds a strong, persistent horde). Promoted echoes are
-					// driven by their controller/StateTree, so skip them here.
+					// Sound MOVEMENT impulse: start this horde-tier echo moving toward ITS estimate
+					// of the source. That shared movement is what builds the momentum field next tick
+					// (a loud sound that gets 30 echoes moving together seeds a strong, persistent
+					// horde). Promoted echoes are driven by their controller/StateTree, so skip here.
 					if (bEnableHordeMomentum && Dist <= SoundImpulseRadius
 						&& IndexToActor.IsValidIndex(Index) && !IndexToActor[Index]
 						&& Velocities.IsValidIndex(Index))
 					{
-						FVector ToSound = E.Location - FVector(GetEchoQueryPosition(Index));
+						FVector ToSound = PerceivedLoc - FVector(GetEchoQueryPosition(Index));
 						ToSound.Z = 0.f;
 						if (!ToSound.IsNearlyZero())
 						{
@@ -1060,34 +1121,236 @@ void UATR_EchoSubsystem::ReportEchoMoveResult(int32 EchoId, bool bSuccess, EATR_
 	// FAIRequestIDs, so this never stamps a result for a request that was replaced mid-flight.
 	M.LastCompletedMoveRequestSerial = M.MoveRequestSerial;
 
-	// Seed the obstacle hook for blocked/unreachable failures so HandleObstacle
-	// has a classified record to act on. Successful/aborted moves clear it.
+	// Seed barrier memory for blocked failures so EngageBarrier has a classified record to
+	// act on. Successful moves clear it. (Direct-pursuit blocks arrive with full
+	// classification via ReportEchoBlockedByBarrier instead; this legacy path maps the
+	// failure reason to a coarse barrier type.) TargetUnreachable deliberately does NOT
+	// seed engagement — there is nothing physical to press against; it decays into search.
 	FATR_EchoObstacleIntent& O = State->Obstacle;
 	const bool bIsObstacleFailure =
 		!bSuccess &&
 		(Reason == EATR_MoveFailureReason::BlockedByDynamicActor ||
 		 Reason == EATR_MoveFailureReason::BlockedByDoor   ||
 		 Reason == EATR_MoveFailureReason::BlockedByWindow ||
-		 Reason == EATR_MoveFailureReason::BlockedByFence  ||
-		 Reason == EATR_MoveFailureReason::TargetUnreachable);
+		 Reason == EATR_MoveFailureReason::BlockedByFence);
 
 	if (bIsObstacleFailure)
 	{
+		if (!O.bHasObstacle || O.ObstacleActor.Get() != BlockingActor)
+			O.FirstContactTime = TimeSeconds;
+
 		O.bHasObstacle     = true;
 		O.Reason           = Reason;
 		O.ObstacleActor    = BlockingActor;
 		O.ObstacleLocation = Location;
 		O.LastObstacleTime = TimeSeconds;
+		O.Phase            = EATR_EchoBarrierPhase::Engage;
+		O.StimulusConfidenceAtContact = State->Awareness.Confidence;
+
+		switch (Reason)
+		{
+			case EATR_MoveFailureReason::BlockedByDoor:   O.BarrierType = EATR_EchoBarrierType::Door;   break;
+			case EATR_MoveFailureReason::BlockedByWindow: O.BarrierType = EATR_EchoBarrierType::Window; break;
+			case EATR_MoveFailureReason::BlockedByFence:  O.BarrierType = EATR_EchoBarrierType::Fence;  break;
+			default:                                      O.BarrierType = EATR_EchoBarrierType::Unknown; break;
+		}
+		O.bReachThroughCapable = (O.BarrierType == EATR_EchoBarrierType::Fence ||
+		                          O.BarrierType == EATR_EchoBarrierType::Gate);
 	}
 	else if (bSuccess)
 	{
-		O.bHasObstacle = false;
+		O = FATR_EchoObstacleIntent{};
 	}
 
 	State->LastUpdateTime = TimeSeconds;
 
 	UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("MoveResult EchoId %d: %s (reason %d)"),
 		EchoId, bSuccess ? TEXT("success") : TEXT("FAIL"), static_cast<int32>(Reason));
+}
+
+void UATR_EchoSubsystem::ReportEchoBlockedByBarrier(int32 EchoId, AActor* Barrier, EATR_EchoBarrierType BarrierType,
+                                                    const FVector& HitLocation, const FVector& HitNormal, float TimeSeconds)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_ReportBlockedByBarrier);
+
+	FATR_EchoRuntimeState* State = GetMutableEchoState(EchoId);
+	if (!State) return;
+
+	// 1) Stamp the failed move completion so the waiting StateTree move task resolves.
+	FATR_EchoMovementIntent& M = State->Movement;
+	M.bMoveInProgress    = false;
+	M.bLastMoveSucceeded = false;
+	M.LastFailure        = AATR_EchoAIController::BarrierTypeToFailureReason(BarrierType);
+	M.LastResultTime     = TimeSeconds;
+	M.LastCompletedMoveRequestSerial = M.MoveRequestSerial;
+
+	// 2) Seed/refresh barrier memory with the full classification.
+	FATR_EchoObstacleIntent& O = State->Obstacle;
+	const bool bNewBarrier = !O.bHasObstacle || O.ObstacleActor.Get() != Barrier;
+	if (bNewBarrier)
+	{
+		O.FirstContactTime = TimeSeconds;
+		O.DamageApplied    = 0.f;
+		O.PressureApplied  = 0.f;
+	}
+
+	O.bHasObstacle     = true;
+	O.Reason           = AATR_EchoAIController::BarrierTypeToFailureReason(BarrierType);
+	O.BarrierType      = BarrierType;
+	O.Phase            = EATR_EchoBarrierPhase::Engage;
+	O.ObstacleActor    = Barrier;
+	O.ObstacleLocation = HitLocation;
+	O.BarrierNormal    = HitNormal.GetSafeNormal();
+	O.LastObstacleTime = TimeSeconds;
+	O.FrustratedStartTime         = -1.f;
+	O.StimulusConfidenceAtContact = State->Awareness.Confidence;
+
+	// Reach-through capability: barrier data asset wins, else per-type default (chain-link
+	// fences and gates are permeable; everything else needs explicit data).
+	if (const UATR_EchoBarrierDataAsset* Data = GetBarrierData(Barrier))
+		O.bReachThroughCapable = Data->bCanBeReachedThrough;
+	else
+		O.bReachThroughCapable = (BarrierType == EATR_EchoBarrierType::Fence ||
+		                          BarrierType == EATR_EchoBarrierType::Gate);
+
+	State->LastUpdateTime = TimeSeconds;
+
+	UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("BlockedByBarrier EchoId %d: %s type %d at %s"),
+		EchoId, Barrier ? *Barrier->GetName() : TEXT("none"),
+		static_cast<int32>(BarrierType), *HitLocation.ToCompactString());
+}
+
+const UATR_EchoBarrierDataAsset* UATR_EchoSubsystem::GetBarrierData(AActor* Barrier) const
+{
+	if (Barrier && Barrier->Implements<UATR_EchoBarrier>())
+		return IATR_EchoBarrier::Execute_GetEchoBarrierData(Barrier);
+	return nullptr;
+}
+
+float UATR_EchoSubsystem::AccumulateBarrierPressure(const AActor* Barrier, float Add, float Now)
+{
+	if (!Barrier) return Add;
+
+	const float DecayPerSec = CachedSettings->BarrierPressureDecayPerSecond;
+
+	FATR_BarrierPressureRecord& Rec = BarrierPressure.FindOrAdd(FObjectKey(Barrier));
+	if (Rec.LastUpdateTime >= 0.f)
+		Rec.Pressure = FMath::Max(0.f, Rec.Pressure - DecayPerSec * (Now - Rec.LastUpdateTime));
+	Rec.Pressure       += Add;
+	Rec.LastUpdateTime  = Now;
+
+	// Lazy prune so the map only ever holds barriers under (recent) pressure.
+	if (Rec.Pressure <= 0.f && Add <= 0.f)
+	{
+		const float P = Rec.Pressure;
+		BarrierPressure.Remove(FObjectKey(Barrier));
+		return P;
+	}
+	return Rec.Pressure;
+}
+
+void UATR_EchoSubsystem::ReportBarrierImpact(int32 EchoId)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_ReportBarrierImpact);
+
+	FATR_EchoRuntimeState* State = GetMutableEchoState(EchoId);
+	if (!State || !State->Obstacle.bHasObstacle) return;
+
+	const UWorld* W = GetWorld();
+	const float Now = W ? W->GetTimeSeconds() : 0.f;
+
+	FATR_EchoObstacleIntent& O = State->Obstacle;
+	AActor* Barrier = O.ObstacleActor.Get();
+	const UATR_EchoBarrierDataAsset* Data = GetBarrierData(Barrier);
+
+	// Non-interactable geometry: silent physical pressing only — no damage, no pressure, no
+	// noise, and deliberately NO freshness refresh, so the engagement goes stale on the
+	// MaxBarrierEngageSecondsWithoutStimulus window → frustrated search → decay. This is the
+	// doc's "press briefly, linger, decay" path for solid walls; it prevents infinite
+	// wall-pushing without ever computing an alternate route.
+	switch (O.BarrierType)
+	{
+		case EATR_EchoBarrierType::NonInteractableWall:
+		case EATR_EchoBarrierType::Crowd:
+		case EATR_EchoBarrierType::SmallProp:
+		case EATR_EchoBarrierType::None:
+			return;
+		default: break;
+	}
+
+	// Per-type damage gating: per-Echo capabilities (obstacle behavior asset) first, then
+	// barrier rules. With no assets present, damage defaults ON for interactable types so
+	// the system works out of the box.
+	bool bCanDamage = true;
+	if (bCanDamage && ResolvedDefaultObstacleBehavior)
+	{
+		switch (O.BarrierType)
+		{
+			case EATR_EchoBarrierType::Door:
+			case EATR_EchoBarrierType::Barricade: bCanDamage = ResolvedDefaultObstacleBehavior->bCanAttackDoors;   break;
+			case EATR_EchoBarrierType::Window:    bCanDamage = ResolvedDefaultObstacleBehavior->bCanBreakWindows; break;
+			default: break;
+		}
+	}
+	if (bCanDamage && Data)
+		bCanDamage = Data->bCanBeDamaged;
+
+	// Group pressure: each engaged Echo's hit contributes; pressure scales damage so a horde
+	// pounding one door overwhelms it — dumb persistence, not intelligence.
+	const float PressurePerEcho = CachedSettings->BarrierPressurePerEcho;
+	const float Pressure        = AccumulateBarrierPressure(Barrier, PressurePerEcho, Now);
+
+	float Damage = 0.f;
+	if (bCanDamage)
+	{
+		const float BaseDamage = ResolvedDefaultObstacleBehavior
+			? ResolvedDefaultObstacleBehavior->ObstacleDamagePerHit
+			: CachedSettings->BarrierDamagePerHit;
+		const float PressureMul = CachedSettings->BarrierPressureDamageMultiplier;
+		Damage = BaseDamage * (1.f + Pressure * PressureMul);
+
+		if (Barrier && Barrier->Implements<UATR_EchoBarrier>())
+			IATR_EchoBarrier::Execute_OnEchoBarrierImpact(Barrier, State->ActivePawn.Get(), Damage, Pressure);
+	}
+
+	O.DamageApplied   += Damage;
+	O.PressureApplied  = Pressure;
+	O.LastObstacleTime = Now; // impact keeps engagement fresh
+
+	// Pounding agitation — draws more Echoes toward a barrier already under group attack.
+	if (ResolvedDefaultObstacleBehavior)
+		State->Agitation = FMath::Min(1.f, State->Agitation + ResolvedDefaultObstacleBehavior->GroupPoundingAgitationAmount);
+
+	// Impact noise stimulus → the sound feedback loop. EmitWorldStimulus deposits cell
+	// agitation and fans location-only awareness to nearby active AND low-detail Echoes:
+	// player closes door → Echo attacks door → banging attracts more Echoes → pressure
+	// rises → the door fails. No routing intelligence anywhere.
+	FATR_StimulusEvent Impact;
+	switch (O.BarrierType)
+	{
+		case EATR_EchoBarrierType::Door:
+		case EATR_EchoBarrierType::Barricade: Impact.Type = EATR_StimulusType::DoorImpact;   break;
+		case EATR_EchoBarrierType::Window:    Impact.Type = EATR_StimulusType::WindowImpact; break;
+		default:                              Impact.Type = EATR_StimulusType::Noise;        break;
+	}
+	// Real units: pounding on a barrier is ~85 dB SPL @ 1 m by default; barrier data assets
+	// override per material (glass louder than wood). Audible radius derives from the
+	// propagation model in EmitWorldStimulus — nothing arbitrary here.
+	float LoudnessDb = CachedSettings->BarrierImpactLoudnessDb;
+	if (Data && Data->ImpactLoudnessDbOverride > 0.f)
+		LoudnessDb = Data->ImpactLoudnessDbOverride;
+
+	Impact.Location    = O.ObstacleLocation;
+	Impact.Direction   = (O.ObstacleLocation - State->Location).GetSafeNormal();
+	Impact.LoudnessDb  = LoudnessDb;
+	Impact.Radius      = 0.f; // derived from LoudnessDb by the acoustics model
+	Impact.TimeSeconds = Now;
+	Impact.SourceActor_DebugOnly = State->ActivePawn.Get(); // metadata only — never a target
+
+	EmitWorldStimulus(Impact);
+
+	UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("BarrierImpact EchoId %d: %s dmg %.1f pressure %.1f total %.1f"),
+		EchoId, Barrier ? *Barrier->GetName() : TEXT("none"), Damage, Pressure, O.DamageApplied);
 }
 
 // ─── Horde Momentum Field ──────────────────────────────────────────
@@ -1300,13 +1563,24 @@ namespace
 	{
 		const UWorld* World = nullptr;
 		const TArray<FVector2D>* Offsets = nullptr; // null → built-in fan
-		float ReachRadius            = 120.f;
-		float ProjectionSeconds      = 2.f;
-		float MaxProjectionDistance  = 800.f;
-		float DefaultRadius          = 600.f;
-		float MaxSearchDurationSeconds = 12.f;
-		float RandomAngleDegrees     = 20.f;
-		float NavProjectionRadius    = 500.f;
+
+		// All values are filled from UATR_EchoSettings at the call sites — the zeros here are
+		// never consumed as behavior.
+		float ReachRadius              = 0.f;
+		float ProjectionSeconds        = 0.f;
+		float MaxProjectionDistance    = 0.f;
+		float DefaultRadius            = 0.f;
+		float MaxSearchDurationSeconds = 0.f;
+		float RandomAngleDegrees       = 0.f;
+		float NavProjectionRadius      = 0.f;
+
+		// Per-echo variation (Echo|Search): scale = Base + PerEchoVariation × hash + AggressionBonus × aggression.
+		float RadiusBaseScale          = 0.f;
+		float RadiusPerEchoVariation   = 0.f;
+		float RadiusAggressionBonus    = 0.f;
+		float DurationBaseScale        = 0.f;
+		float DurationPerEchoVariation = 0.f;
+		float DurationAggressionBonus  = 0.f;
 
 		int32 NumSteps() const { return Offsets ? Offsets->Num() : UE_ARRAY_COUNT(GBuiltInSearchPattern); }
 		FVector2D Step(int32 i) const { return Offsets ? (*Offsets)[i] : GBuiltInSearchPattern[i]; }
@@ -1366,8 +1640,13 @@ namespace
 		S.SearchStepIndex  = 0;
 		S.StartedTime      = Now;
 		// Aggressive echoes sweep wider and persist longer (per-Echo variation around the base).
-		S.SearchRadius      = BaseRadius * (0.8f + 0.6f * EchoHash01(State.EchoId, 2) + 0.3f * State.Aggression);
-		S.MaxSearchDuration = Ctx.MaxSearchDurationSeconds * (0.7f + 0.6f * EchoHash01(State.EchoId, 3) + 0.3f * State.Aggression);
+		// All scale terms come from Echo|Search settings via the context.
+		S.SearchRadius      = BaseRadius * (Ctx.RadiusBaseScale
+			+ Ctx.RadiusPerEchoVariation * EchoHash01(State.EchoId, 2)
+			+ Ctx.RadiusAggressionBonus  * State.Aggression);
+		S.MaxSearchDuration = Ctx.MaxSearchDurationSeconds * (Ctx.DurationBaseScale
+			+ Ctx.DurationPerEchoVariation * EchoHash01(State.EchoId, 3)
+			+ Ctx.DurationAggressionBonus  * State.Aggression);
 	}
 
 	// Raw (un-projected) world point for a given fan step. False if the step is out of range.
@@ -1415,6 +1694,10 @@ namespace
 				OutMove.Type         = EATR_EchoMoveTargetType::Location;
 				OutMove.Location     = Goal;
 				OutMove.AcceptanceRadius = Ctx.ReachRadius;
+				// Last-seen pursuit is ACTIVE pursuit: move along the line of desire to the
+				// observed point and engage anything that blocks it. Nav projection above is
+				// validation of the goal point, not route planning.
+				OutMove.bDirectPursuit = true;
 				return true;
 			}
 			BeginEchoSearch(State, Now, Ctx);
@@ -1454,8 +1737,119 @@ namespace
 		OutMove.Type         = EATR_EchoMoveTargetType::Location;
 		OutMove.Location     = Projected;
 		OutMove.AcceptanceRadius = Ctx.ReachRadius;
+		// Local search is dumb physical exploration of nearby points — direct movement, with
+		// blockers along a step engaged rather than routed around.
+		OutMove.bDirectPursuit = true;
 		return true;
 	}
+}
+
+bool UATR_EchoSubsystem::UpdateBarrierEngagement(FATR_EchoRuntimeState& State, float Now,
+                                                 EATR_EchoIntent& OutIntent, FATR_EchoMoveRequest& OutMove)
+{
+	FATR_EchoObstacleIntent& O = State.Obstacle;
+	if (!O.bHasObstacle) return false;
+
+	FATR_EchoAwarenessState& A = State.Awareness;
+
+	// ── DEBUG override: legacy sidestep/repath. The design doc forbids this in normal play
+	// (Move failed → Repath to target); it survives only behind the explicit testing flag.
+	if (CachedSettings->bAllowActivePursuitTacticalReroute)
+	{
+		if ((Now - O.LastObstacleTime) > ObstacleHandleTimeoutSeconds)
+		{
+			O = FATR_EchoObstacleIntent{};
+			return false;
+		}
+
+		const FVector ToObs = (O.ObstacleLocation - State.Location).GetSafeNormal2D();
+		const FVector Side  = FVector::CrossProduct(FVector::UpVector, ToObs).GetSafeNormal();
+		const float   Sign  = (EchoHash01(State.EchoId, 7) < 0.5f) ? 1.f : -1.f;
+
+		const float Sidestep  = CachedSettings->ObstacleSidestepDistance;
+		const float FwdNudge  = CachedSettings->ObstacleForwardNudgeDistance;
+		const float NavRadius = CachedSettings->SearchPointNavProjectionRadius;
+
+		FVector Raw = State.Location + Side * (Sign * Sidestep) + ToObs * FwdNudge;
+		FVector Projected;
+		ProjectSearchPointToNav(GetWorld(), Raw, NavRadius, Projected); // Projected == Raw on failure
+
+		OutIntent             = EATR_EchoIntent::EngageBarrier;
+		OutMove.Type          = EATR_EchoMoveTargetType::Location;
+		OutMove.Location      = Projected;
+		OutMove.AcceptanceRadius = ReachLocationRadius;
+		return true;
+	}
+
+	// ── Barrier opened / broke / became passable → engagement ends, pursuit resumes through
+	// the normal seeing/search drivers this same tick. (Emergent gate usage: an OPEN gate is
+	// passable, so the Echo simply walks through it — it never selected it as a route.)
+	AActor* Barrier = O.ObstacleActor.Get();
+	if (Barrier && Barrier->Implements<UATR_EchoBarrier>() && IATR_EchoBarrier::Execute_IsEchoPassable(Barrier))
+	{
+		UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("Barrier passable — EchoId %d resumes pursuit"), State.EchoId);
+		O = FATR_EchoObstacleIntent{};
+		return false;
+	}
+
+	const float FrustratedDuration = CachedSettings->FrustratedSearchDurationSeconds;
+	const float MaxEngageStale     = CachedSettings->MaxBarrierEngageSecondsWithoutStimulus;
+	const float EngageDist         = CachedSettings->BarrierEngageDistanceCm;
+
+	// ── Frustrated phase: linger near the barrier, shuffle, occasional hits (driven by the
+	// task), then give up entirely — confidence keeps decaying naturally to idle/wander.
+	if (O.Phase == EATR_EchoBarrierPhase::FrustratedSearch)
+	{
+		// Re-confirmed stimulus (saw prey again / fresh strong noise) → re-engage.
+		if (A.bHasCurrentLineOfSight && A.ConfirmedVisibleActor.IsValid())
+		{
+			O.Phase = EATR_EchoBarrierPhase::Engage;
+		}
+		else if ((Now - O.FrustratedStartTime) > FrustratedDuration)
+		{
+			O = FATR_EchoObstacleIntent{};
+			return false;
+		}
+	}
+	else
+	{
+		// ── Engage / ReachThrough upkeep. Engagement persists while the stimulus is alive
+		// (confidence above the forget threshold or live sight) AND impacts keep it fresh;
+		// otherwise it degrades into the frustrated phase — never into a reroute.
+		const bool bStimulusAlive = A.bHasCurrentLineOfSight || A.Confidence > LostSightMemoryThreshold;
+		const bool bFresh = (Now - O.LastObstacleTime) <= FMath::Max(ObstacleHandleTimeoutSeconds, MaxEngageStale);
+
+		if (!bStimulusAlive || !bFresh)
+		{
+			O.Phase              = EATR_EchoBarrierPhase::FrustratedSearch;
+			O.FrustratedStartTime = Now;
+		}
+		else
+		{
+			// Reach-through when the barrier permits it and the target is sensed close on the
+			// other side (visible through a fence / broken window).
+			O.Phase = EATR_EchoBarrierPhase::Engage;
+			if (O.bReachThroughCapable && A.bHasCurrentLineOfSight && A.ConfirmedVisibleActor.IsValid())
+			{
+				float ReachDist = CachedSettings->BarrierReachThroughDistanceCm;
+				if (const UATR_EchoBarrierDataAsset* Data = GetBarrierData(Barrier))
+					if (Data->ReachThroughDistanceCm > 0.f)
+						ReachDist = Data->ReachThroughDistanceCm;
+
+				if (FVector::Dist2D(A.ConfirmedVisibleActor->GetActorLocation(), O.ObstacleLocation) <= ReachDist + EngageDist)
+					O.Phase = EATR_EchoBarrierPhase::ReachThrough;
+			}
+		}
+	}
+
+	// Engagement move: close to contact with the barrier point. Direct movement — the engage
+	// task presses/attacks from there; there is no route to compute.
+	OutIntent             = EATR_EchoIntent::EngageBarrier;
+	OutMove.Type          = EATR_EchoMoveTargetType::Location;
+	OutMove.Location      = O.ObstacleLocation;
+	OutMove.AcceptanceRadius = EngageDist;
+	OutMove.bDirectPursuit = true;
+	return true;
 }
 
 void UATR_EchoSubsystem::RunIntentPass(float DeltaTime)
@@ -1515,69 +1909,56 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 	const bool bHeardRecent = (A.LastHeardTime >= 0.f) && (Now - A.LastHeardTime <= HeardMemorySeconds);
 	const bool bSeeing      = A.bHasCurrentLineOfSight && A.ConfirmedVisibleActor.IsValid();
 
-	// A fresh physical block takes priority over everything — we cannot make progress until it
-	// is resolved. The placeholder fallback sidesteps around the obstacle; real break behavior
-	// hangs off the same HandleObstacle intent later.
-	const FATR_EchoObstacleIntent& O = State.Obstacle;
-	const bool bObstacleFresh = O.bHasObstacle && (Now - O.LastObstacleTime) <= ObstacleHandleTimeoutSeconds;
+	// A barrier on the line of desire takes priority over everything — the Echo engages the
+	// blocker (press/attack/reach-through/frustrate) and NEVER requests an alternate route.
+	// UpdateBarrierEngagement runs the Engage ↔ ReachThrough → FrustratedSearch → decay
+	// machine and clears itself once the barrier opens/breaks or frustration expires.
+	const bool bBarrierDrivesBehavior = UpdateBarrierEngagement(State, Now, NewIntent, Move);
 
 	// Run the lost-sight search machine (unless blocked). It may set NewIntent/Move (active
 	// search) or exhaust and zero confidence so lower-priority drivers take over this same tick.
 	// All search tuning is settings-driven and every emitted point is nav-projected.
 	bool bSearchProducedIntent = false;
-	if (!bObstacleFresh && !bSeeing && A.Confidence > LostSightMemoryThreshold)
+	if (!bBarrierDrivesBehavior && !bSeeing && A.Confidence > LostSightMemoryThreshold)
 	{
 		FEchoSearchContext Ctx;
-		Ctx.World                 = GetWorld();
-		Ctx.ReachRadius           = ReachLocationRadius;
-		Ctx.ProjectionSeconds     = SightProjectionSeconds;
-		Ctx.MaxProjectionDistance = MaxSightProjectionDistance;
-		if (CachedSettings)
-		{
-			Ctx.DefaultRadius            = CachedSettings->SearchDefaultRadius;
-			Ctx.MaxSearchDurationSeconds = CachedSettings->SearchMaxDurationSeconds;
-			Ctx.RandomAngleDegrees       = CachedSettings->SearchRandomAngleDegrees;
-			Ctx.NavProjectionRadius      = CachedSettings->SearchPointNavProjectionRadius;
-		}
+		Ctx.World                    = GetWorld();
+		Ctx.ReachRadius              = ReachLocationRadius;
+		Ctx.ProjectionSeconds        = SightProjectionSeconds;
+		Ctx.MaxProjectionDistance    = MaxSightProjectionDistance;
+		Ctx.DefaultRadius            = CachedSettings->SearchDefaultRadius;
+		Ctx.MaxSearchDurationSeconds = CachedSettings->SearchMaxDurationSeconds;
+		Ctx.RandomAngleDegrees       = CachedSettings->SearchRandomAngleDegrees;
+		Ctx.NavProjectionRadius      = CachedSettings->SearchPointNavProjectionRadius;
+		Ctx.RadiusBaseScale          = CachedSettings->SearchRadiusBaseScale;
+		Ctx.RadiusPerEchoVariation   = CachedSettings->SearchRadiusPerEchoVariation;
+		Ctx.RadiusAggressionBonus    = CachedSettings->SearchRadiusAggressionBonus;
+		Ctx.DurationBaseScale        = CachedSettings->SearchDurationBaseScale;
+		Ctx.DurationPerEchoVariation = CachedSettings->SearchDurationPerEchoVariation;
+		Ctx.DurationAggressionBonus  = CachedSettings->SearchDurationAggressionBonus;
 		if (ResolvedDefaultSearchPattern && ResolvedDefaultSearchPattern->SearchOffsets.Num() > 0)
 			Ctx.Offsets = &ResolvedDefaultSearchPattern->SearchOffsets;
 
 		bSearchProducedIntent = AdvanceLostSightSearch(State, Now, Ctx, NewIntent, Move);
 	}
 
-	if (bObstacleFresh)
+	if (bBarrierDrivesBehavior)
 	{
-		// Obstacle handling currently requests a sidestep/repath (per-Echo side choice) while
-		// nudging forward. Door/window/fence interactions attach through FATR_EchoObstacleIntent
-		// and UATR_EchoObstacleBehaviorDataAsset without changing this intent/task seam. The
-		// sidestep target is nav-projected so the fallback never paths off-mesh.
-		const FVector ToObs = (O.ObstacleLocation - State.Location).GetSafeNormal2D();
-		const FVector Side  = FVector::CrossProduct(FVector::UpVector, ToObs).GetSafeNormal();
-		const float   Sign  = (EchoHash01(State.EchoId, 7) < 0.5f) ? 1.f : -1.f;
-
-		const float Sidestep   = CachedSettings ? CachedSettings->ObstacleSidestepDistance     : 300.f;
-		const float FwdNudge   = CachedSettings ? CachedSettings->ObstacleForwardNudgeDistance : 100.f;
-		const float NavRadius  = CachedSettings ? CachedSettings->SearchPointNavProjectionRadius : 500.f;
-
-		FVector Raw = State.Location + Side * (Sign * Sidestep) + ToObs * FwdNudge;
-		FVector Projected;
-		ProjectSearchPointToNav(GetWorld(), Raw, NavRadius, Projected); // Projected == Raw on failure
-
-		NewIntent           = EATR_EchoIntent::HandleObstacle;
-		Move.Type           = EATR_EchoMoveTargetType::Location;
-		Move.Location       = Projected;
-		Move.AcceptanceRadius = ReachLocationRadius;
-		A.Mode              = EATR_AwarenessMode::ObstacleBlocked;
+		// NewIntent / Move already populated by UpdateBarrierEngagement (EngageBarrier with a
+		// direct contact-point move). Mode reflects the block for presentation/debug.
+		A.Mode = EATR_AwarenessMode::ObstacleBlocked;
 	}
 	else if (bSeeing)
 	{
-		// Confirmed visible → chase the actor itself. Keep the Actor move target even when we flip to
-		// Attack, so the echo keeps closing/pushing forward (the melee task layers grab/bite/pull on
-		// top without stopping movement — momentum is preserved).
+		// Confirmed visible → chase the actor itself along the LINE OF DESIRE (no nav routing
+		// — a fence between us and the prey is engaged, not solved). Keep the Actor move
+		// target even when we flip to Attack, so the echo keeps closing/pushing forward (the
+		// melee task layers grab/bite/pull on top without stopping movement).
 		NewIntent           = EATR_EchoIntent::ChaseVisibleActor;
 		Move.Type           = EATR_EchoMoveTargetType::Actor;
 		Move.Actor          = A.ConfirmedVisibleActor;
 		Move.AcceptanceRadius = ReachLocationRadius;
+		Move.bDirectPursuit = true;
 		S.bSearchActive     = false; // reacquired — abandon any search
 
 		// Within reach → engage melee. Structurally gated: an Echo that can
@@ -1613,6 +1994,11 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 			Move.Type           = EATR_EchoMoveTargetType::Location;
 			Move.Location       = A.LastHeardLocation;
 			Move.AcceptanceRadius = ReachLocationRadius;
+			// Strong NEARBY sound = active pursuit (line of desire, engage blockers). DISTANT
+			// investigation counts as ambient movement and may use broad navigation, per the
+			// design doc's movement-mode split.
+			const float DirectDist = CachedSettings->ActivePursuitDirectInvestigateDistanceCm;
+			Move.bDirectPursuit = FVector::Dist2D(State.Location, A.LastHeardLocation) <= DirectDist;
 		}
 		else
 		{
@@ -1624,7 +2010,7 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 	{
 		// Strong indirect pressure with a clear direction → migrate toward the hotspot.
 		// Direction-only: this Echo never learns the seer's actual target.
-		const float PressureDist = CachedSettings ? CachedSettings->HordePressureMoveDistance : 800.f;
+		const float PressureDist = CachedSettings->HordePressureMoveDistance;
 		NewIntent           = EATR_EchoIntent::JoinHordePressure;
 		Move.Type           = EATR_EchoMoveTargetType::Location;
 		Move.Location       = State.Location + A.HordePressureDirection * PressureDist;
@@ -1634,14 +2020,14 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 	else if (EffectiveAgitation >= AgitationJoinThreshold)
 	{
 		NewIntent     = EATR_EchoIntent::TurnTowardStimulus; // agitated but no clear direction
-		Move.Location = State.Location + A.HordePressureDirection * 500.f;
+		Move.Location = State.Location + A.HordePressureDirection * CachedSettings->HordeOrientTargetDistanceCm;
 		A.Mode        = EATR_AwarenessMode::HordeAgitated;
 	}
 	else if (EffectiveAgitation >= HordeCuriosityThreshold)
 	{
 		// Mild pressure → curious. Orient toward the hotspot but don't commit to migrating.
 		NewIntent     = EATR_EchoIntent::TurnTowardStimulus;
-		Move.Location = State.Location + A.HordePressureDirection * 500.f;
+		Move.Location = State.Location + A.HordePressureDirection * CachedSettings->HordeOrientTargetDistanceCm;
 		A.Mode        = EATR_AwarenessMode::HordeAgitated;
 	}
 	else
@@ -1680,7 +2066,7 @@ void UATR_EchoSubsystem::RunLowDetailPass(float DeltaTime)
 	if (Num == 0) return;
 
 	const float Now    = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
-	const int32 Budget = CachedSettings ? CachedSettings->LowDetailMaxUpdatesPerTick : 256;
+	const int32 Budget = CachedSettings->LowDetailMaxUpdatesPerTick;
 
 	// LowDetail simulates the non-active Echoes NEAR players (the local set rebuilt this frame).
 	// Far Echoes are handled by the cell-level Abstract pass. Round-robin a budget window over the
@@ -1728,9 +2114,9 @@ void UATR_EchoSubsystem::UpdateLowDetailEcho(int32 Index, float Now, float Delta
 	const float EffAgit = FMath::Max(State.Agitation, FieldAgit);
 	A.HordePressureDirection = FieldDir;
 
-	const float InvSpeed    = CachedSettings ? CachedSettings->LowDetailInvestigateSpeed : 150.f;
-	const float SearchSpeed = CachedSettings ? CachedSettings->LowDetailSearchSpeed      : 120.f;
-	const float WanderSpeed = CachedSettings ? CachedSettings->LowDetailWanderSpeed      : 60.f;
+	const float InvSpeed    = CachedSettings->LowDetailInvestigateSpeed;
+	const float SearchSpeed = CachedSettings->LowDetailSearchSpeed;
+	const float WanderSpeed = CachedSettings->LowDetailWanderSpeed;
 
 	FVector         DesiredDir = FVector::ZeroVector;
 	float           Speed      = 0.f;
@@ -1741,17 +2127,20 @@ void UATR_EchoSubsystem::UpdateLowDetailEcho(int32 Index, float Now, float Delta
 	if (A.Confidence > LostSightMemoryThreshold)
 	{
 		FEchoSearchContext Ctx;
-		Ctx.World                 = GetWorld();
-		Ctx.ReachRadius           = ReachLocationRadius;
-		Ctx.ProjectionSeconds     = SightProjectionSeconds;
-		Ctx.MaxProjectionDistance = MaxSightProjectionDistance;
-		if (CachedSettings)
-		{
-			Ctx.DefaultRadius            = CachedSettings->LowDetailSearchRadius;
-			Ctx.MaxSearchDurationSeconds = CachedSettings->LowDetailSearchDurationSeconds;
-			Ctx.RandomAngleDegrees       = CachedSettings->SearchRandomAngleDegrees;
-			Ctx.NavProjectionRadius      = CachedSettings->SearchPointNavProjectionRadius;
-		}
+		Ctx.World                    = GetWorld();
+		Ctx.ReachRadius              = ReachLocationRadius;
+		Ctx.ProjectionSeconds        = SightProjectionSeconds;
+		Ctx.MaxProjectionDistance    = MaxSightProjectionDistance;
+		Ctx.DefaultRadius            = CachedSettings->LowDetailSearchRadius;
+		Ctx.MaxSearchDurationSeconds = CachedSettings->LowDetailSearchDurationSeconds;
+		Ctx.RandomAngleDegrees       = CachedSettings->SearchRandomAngleDegrees;
+		Ctx.NavProjectionRadius      = CachedSettings->SearchPointNavProjectionRadius;
+		Ctx.RadiusBaseScale          = CachedSettings->SearchRadiusBaseScale;
+		Ctx.RadiusPerEchoVariation   = CachedSettings->SearchRadiusPerEchoVariation;
+		Ctx.RadiusAggressionBonus    = CachedSettings->SearchRadiusAggressionBonus;
+		Ctx.DurationBaseScale        = CachedSettings->SearchDurationBaseScale;
+		Ctx.DurationPerEchoVariation = CachedSettings->SearchDurationPerEchoVariation;
+		Ctx.DurationAggressionBonus  = CachedSettings->SearchDurationAggressionBonus;
 		if (ResolvedDefaultSearchPattern && ResolvedDefaultSearchPattern->SearchOffsets.Num() > 0)
 			Ctx.Offsets = &ResolvedDefaultSearchPattern->SearchOffsets;
 
@@ -1809,8 +2198,8 @@ void UATR_EchoSubsystem::RunAbstractPass(float DeltaTime)
 	if (ActiveEntities <= 0) return;
 
 	const float Now           = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
-	const float MigrationRate = CachedSettings ? CachedSettings->AbstractCellMigrationRate : 0.05f;
-	const float DriftSpeed    = CachedSettings ? CachedSettings->LowDetailWanderSpeed       : 60.f;
+	const float MigrationRate = CachedSettings->AbstractCellMigrationRate;
+	const float DriftSpeed    = CachedSettings->LowDetailWanderSpeed;
 
 	// Recompute population each pass; pressure/memory persist and decay in DecayAbstractCells.
 	for (auto& Pair : AbstractCells) Pair.Value.Population = 0;
@@ -1857,7 +2246,7 @@ void UATR_EchoSubsystem::DecayAbstractCells(float DeltaTime)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(Echo_DecayAbstractCells);
 
-	const float Decay = (CachedSettings ? CachedSettings->AgitationFieldDecayPerSecond : 0.25f) * DeltaTime;
+	const float Decay = CachedSettings->AgitationFieldDecayPerSecond * DeltaTime;
 
 	for (auto It = AbstractCells.CreateIterator(); It; ++It)
 	{
@@ -2046,11 +2435,10 @@ bool UATR_EchoSubsystem::IsDemotionBlocked(int32 Index, float Now) const
 				return true;
 		}
 
-		// Fresh obstacle handling.
+		// Active barrier engagement (any phase, including frustrated lingering).
 		if (S->bBlockDemotionDuringObstacleHandling &&
-			RS->Intent == EATR_EchoIntent::HandleObstacle &&
-			RS->Obstacle.bHasObstacle &&
-			(Now - RS->Obstacle.LastObstacleTime) <= ObstacleHandleTimeoutSeconds)
+			RS->Intent == EATR_EchoIntent::EngageBarrier &&
+			RS->Obstacle.bHasObstacle)
 			return true;
 	}
 
@@ -2243,6 +2631,10 @@ void UATR_EchoSubsystem::RunSteeringPass(float DeltaTime)
 	const float  AlignThresh = MomentumAlignThreshold;
 	const uint32 DetachSalt  = (uint32)(Now * 1000.0);
 
+	// Personal-stimulus steering params (Echo|Agitation / Echo|HordeShaping).
+	const float HeardSteerMinFrac  = CachedSettings->HeardSteerMinSpeedFraction;
+	const float SepOnlySpeedFrac   = CachedSettings->HordeSeparationOnlySpeedFraction;
+
 	// Single pass over all local entities — each aligns to local horde momentum (with separation,
 	// jitter, and edge/back/random detachment), or seeks a very-near player.
 	ParallelFor(LocalEntityScratch.Num(), [&](int32 LocalIdx)
@@ -2292,13 +2684,59 @@ void UATR_EchoSubsystem::RunSteeringPass(float DeltaTime)
 
 		if (BestPlayerIndex == INDEX_NONE)
 		{
+			// PERSONAL STIMULUS FIRST: an echo that heard something itself converges on ITS OWN
+			// (imperfect) heard estimate — it is never dragged off-course by passing horde
+			// momentum. Because every hearer has a different estimate (imperfect hearing), this
+			// is what splits a loud event into several separate hordes converging on roughly the
+			// source instead of one river flowing wherever the field happens to point.
+			float OwnAgitation = 0.f;
+			if (RuntimeStates.IsValidIndex(EntityIndex))
+			{
+				const FATR_EchoRuntimeState& RS = RuntimeStates[EntityIndex];
+				OwnAgitation = RS.Agitation;
+
+				const FATR_EchoAwarenessState& A = RS.Awareness;
+				const bool bHeardFresh =
+					A.LastHeardTime >= 0.f &&
+					(Now - A.LastHeardTime) <= HeardMemorySeconds &&
+					A.Urgency >= HeardInvestigateUrgency;
+				if (bHeardFresh)
+				{
+					FVector2f ToHeard((float)(A.LastHeardLocation.X - Pi.X), (float)(A.LastHeardLocation.Y - Pi.Y));
+					const float DistToHeard = ToHeard.Size();
+					if (DistToHeard > ReachLocationRadius)
+					{
+						ToHeard.Normalize();
+						if (ApproachJit > 0.f)
+							ToHeard = ATR_RotateVec2(ToHeard, (EchoHash01(EchoId, 0x5EE6u) * 2.f - 1.f) * ApproachJit);
+
+						FVector2f Steer = ToHeard + Sep * SepStrength;
+						if (!Steer.IsNearlyZero())
+						{
+							Steer.Normalize();
+							const float Speed = HordeWalkSpeed
+								* FMath::Lerp(HeardSteerMinFrac, 1.f, FMath::Clamp(A.Urgency, 0.f, 1.f));
+							Velocities[EntityIndex] = FVector3f(Steer.X, Steer.Y, 0.f) * Speed;
+							Yaws[EntityIndex]       = FMath::RadiansToDegrees(FMath::Atan2(Steer.Y, Steer.X));
+							MarkEchoDirty(EntityIndex, EEchoDirtyFlags::Transform);
+							return;
+						}
+					}
+					// At the estimate already → fall through (idle/separation; LowDetail search takes over).
+				}
+			}
+
 			// No very-near player → align to local horde MOMENTUM (what others are doing).
 			float   Strength = 0.f;
 			FVector MomDir   = FVector::ZeroVector;
 			SampleMomentumField(FVector(Pi), Strength, MomDir);
 
 			// Weak local momentum → no horde to follow (this is how a horde finally disperses).
-			const bool bInHorde = (Strength >= AlignThresh && !MomDir.IsNearlyZero());
+			// CALM RESISTANCE: an echo with no agitation of its own needs a much stronger local
+			// flow to be recruited — distant, unbothered echoes are no longer swept along by a
+			// migration wave merely passing through their cell.
+			const float EffAlignThresh = AlignThresh * (1.f + MomentumCalmResistance * (1.f - FMath::Clamp(OwnAgitation, 0.f, 1.f)));
+			const bool bInHorde = (Strength >= EffAlignThresh && !MomDir.IsNearlyZero());
 
 			if (bInHorde && bDetach)
 			{
@@ -2371,7 +2809,7 @@ void UATR_EchoSubsystem::RunSteeringPass(float DeltaTime)
 			Steer += Sep * SepStrength;
 			if (Steer.IsNearlyZero()) return;
 			Steer.Normalize();
-			if (Speed <= 0.f) Speed = HordeWalkSpeed * 0.35f; // gentle de-clumping when only separating
+			if (Speed <= 0.f) Speed = HordeWalkSpeed * SepOnlySpeedFrac; // gentle de-clumping when only separating
 
 			Velocities[EntityIndex] = FVector3f(Steer.X, Steer.Y, 0.f) * Speed;
 			Yaws[EntityIndex]       = FMath::RadiansToDegrees(FMath::Atan2(Steer.Y, Steer.X));
@@ -2464,69 +2902,6 @@ void UATR_EchoSubsystem::MarkEchoDirty(int32 Index, EEchoDirtyFlags Flags)
 	++DirtyStates[Index].Version;
 	if (DirtyStates[Index].Version == 0) DirtyStates[Index].Version = 1; // skip 0 — used as "never sent"
 }
-
-bool UATR_EchoSubsystem::IsEchoDirty(int32 Index, EEchoDirtyFlags Flags) const
-{
-	return DirtyStates.IsValidIndex(Index) &&
-	       EnumHasAnyFlags(DirtyStates[Index].Flags, Flags);
-}
-
-// ─── ValidateEchoSpatialState ─────────────────────────────────────────────────
-
-bool UATR_EchoSubsystem::ValidateEchoSpatialState() const
-{
-#if DO_CHECK
-	bool bValid = true;
-
-	for (int32 i = 0; i < ActiveEntities; ++i)
-	{
-		if (!ShouldProcessEchoForLocalHorde(i)) continue;
-
-		if (CoarseCellIds[i] == INDEX_NONE)
-		{
-			UE_LOG(LogTemp, Error, TEXT("Echo %d has invalid CoarseCellId"), i);
-			bValid = false;
-		}
-		if (CoarseSlotInCell[i] == INDEX_NONE)
-		{
-			UE_LOG(LogTemp, Error, TEXT("Echo %d has invalid CoarseSlotInCell"), i);
-			bValid = false;
-		}
-		if (CoarseCellIds[i] != INDEX_NONE && CoarseSlotInCell[i] != INDEX_NONE &&
-		    !CoarseGrid.ValidateEntitySlot(i, CoarseCellIds[i], CoarseSlotInCell[i]))
-		{
-			UE_LOG(LogTemp, Error,
-				TEXT("Echo %d coarse-grid bucket mismatch. Cell=%d Slot=%d"),
-				i, CoarseCellIds[i], CoarseSlotInCell[i]);
-			bValid = false;
-		}
-		if (AATR_ActiveEcho* Actor = IndexToActor[i])
-		{
-			if (Actor->SourceIndex != i)
-			{
-				UE_LOG(LogTemp, Error,
-					TEXT("Echo %d actor SourceIndex mismatch: %d"), i, Actor->SourceIndex);
-				bValid = false;
-			}
-		}
-	}
-
-	for (int32 PromotedIndex : PromotedIndices)
-	{
-		if (!IndexToActor.IsValidIndex(PromotedIndex) || !IndexToActor[PromotedIndex])
-		{
-			UE_LOG(LogTemp, Error,
-				TEXT("PromotedIndices contains invalid or unpromoted index: %d"), PromotedIndex);
-			bValid = false;
-		}
-	}
-
-	return bValid;
-#else
-	return true;
-#endif
-}
-
 
 // ─── Client Relevancy State ───────────────────────────────────────────────────
 

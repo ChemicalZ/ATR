@@ -21,6 +21,11 @@ namespace
 		S.FindLastChar(TEXT(':'), Idx);
 		return Idx != INDEX_NONE ? S.Mid(Idx + 1) : S;
 	}
+
+	// Technical constants — NOT behavior tuning (those live in UATR_EchoSettings).
+	constexpr int32 GBodyConditionSeedMul = 9781; // per-row deterministic RNG seed mix
+	constexpr int32 GBodyConditionSeedAdd = 4243;
+	constexpr float GMinStrengthScalarDiv = 0.1f; // divide-by-strength guard in barge power
 }
 
 // ─── Construction ─────────────────────────────────────────────────────────────
@@ -149,7 +154,9 @@ void AATR_ActiveEcho::EnterPool()
 	SourceIndex      = INDEX_NONE;
 	AnimStateCache   = 0;
 	ReplicatedIntent = EATR_EchoIntent::Idle;
-	CurrentGrip      = EATR_EchoGripType::None;
+	CurrentGrip             = EATR_EchoGripType::None;
+	BargeStaggeredUntilTime = -1.f;   // pooled echoes carry no stagger into their next life
+	LastBargeTime           = -1000.f;
 }
 
 void AATR_ActiveEcho::InitFromSoA(const UATR_EchoSubsystem* Sub, int32 Index)
@@ -169,6 +176,27 @@ void AATR_ActiveEcho::InitFromSoA(const UATR_EchoSubsystem* Sub, int32 Index)
 	}
 
 	AnimStateCache = Sub->AnimState[Index];
+
+	// Roll body condition — deterministic per SoA row so the same horde member keeps its missing
+	// fingers/arm across promote→demote→promote cycles. Distribution and strength range are
+	// tuned in Project Settings > Echo|Combat (remainder after the three chances = NoArms).
+	{
+		const UATR_EchoSettings* S = GetDefault<UATR_EchoSettings>();
+		const FRandomStream Rng(Index * GBodyConditionSeedMul + GBodyConditionSeedAdd);
+		const float ConditionRoll = Rng.FRand();
+
+		const float HealthyUpTo        = S->BodyHealthyChance;
+		const float MissingFingersUpTo = HealthyUpTo + S->BodyMissingFingersChance;
+		const float MissingHandUpTo    = MissingFingersUpTo + S->BodyMissingHandChance;
+
+		BodyCondition.ArmCondition =
+			ConditionRoll < HealthyUpTo        ? EATR_EchoArmCondition::Healthy :
+			ConditionRoll < MissingFingersUpTo ? EATR_EchoArmCondition::MissingFingers :
+			ConditionRoll < MissingHandUpTo    ? EATR_EchoArmCondition::MissingHand :
+			                                     EATR_EchoArmCondition::NoArms;
+		BodyCondition.StrengthScalar = Rng.FRandRange(S->BodyStrengthScalarMin, S->BodyStrengthScalarMax);
+	}
+
 
 	SetActorHiddenInGame(false);
 	SetActorEnableCollision(true);
@@ -496,5 +524,96 @@ void AATR_ActiveEcho::ApplyStructuralStateToMovement()
 		// for any cosmetic twitch. Just floor the speed.
 		CMC->MaxWalkSpeed = S ? FMath::Max(10.f, S->CrawlSpeed * 0.25f) : 15.f;
 	}
+}
+
+void AATR_ActiveEcho::NotifyHit(UPrimitiveComponent* MyComp, AActor* Other, UPrimitiveComponent* OtherComp,
+	bool bSelfMoved, FVector HitLocation, FVector HitNormal, FVector NormalImpulse, const FHitResult& Hit)
+{
+	Super::NotifyHit(MyComp, Other, OtherComp, bSelfMoved, HitLocation, HitNormal, NormalImpulse, Hit);
+
+	// Server-side shoulder-barge resolution against a player character running into us.
+	if (!HasAuthority()) return;
+
+	const ACharacter* OtherChar = Cast<ACharacter>(Other);
+	if (!OtherChar || !OtherChar->IsPlayerControlled()) return;
+
+	const UWorld* W = GetWorld();
+	const float Now = W ? W->GetTimeSeconds() : 0.f;
+
+	const UATR_EchoSettings* S = GetDefault<UATR_EchoSettings>();
+	if (!S || (Now - LastBargeTime) < S->BargeCooldownSeconds) return;
+
+	// 1) Speed gate — a stroll into an echo is not a barge.
+	const FVector  PlayerVel = OtherChar->GetVelocity();
+	const FVector2D V2D(PlayerVel.X, PlayerVel.Y);
+	const float Speed = V2D.Size();
+	if (Speed < S->BargeMinSpeed) return;
+	const FVector2D VDir = V2D / Speed;
+
+	// 2) Must actually be running INTO us, not brushing past.
+	const FVector2D ToEcho2D(GetActorLocation().X - OtherChar->GetActorLocation().X,
+	                         GetActorLocation().Y - OtherChar->GetActorLocation().Y);
+	const float DistToEcho = ToEcho2D.Size();
+	if (DistToEcho < 1.f) return;
+	const FVector2D ToEchoDir = ToEcho2D / DistToEcho;
+	if (FVector2D::DotProduct(VDir, ToEchoDir) < S->BargeMinApproachDot) return;
+
+	// 3) ANGLE OF ATTACK — lateral offset of this echo's center from the player's movement
+	//    line, normalized by the combined capsule radii. 0 = dead-center torso hit (hardest),
+	//    1 = clipping the shoulder/arm at the capsule edge (easiest to power through).
+	const float MyR    = GetCapsuleComponent()->GetScaledCapsuleRadius();
+	const float OtherR = OtherChar->GetCapsuleComponent()->GetScaledCapsuleRadius();
+
+	const float LateralCm  = FMath::Abs(VDir.X * ToEcho2D.Y - VDir.Y * ToEcho2D.X); // |cross| = perpendicular offset
+	const float OffsetNorm = FMath::Clamp(LateralCm / FMath::Max(MyR + OtherR, 1.f), 0.f, 1.f);
+	const float Glancing   = FMath::Lerp(S->BargeCenterEffectiveness, 1.f, OffsetNorm);
+
+	// 4) WEIGHT — player mass vs echo mass (CMC mass), clamped to keep extremes sane.
+	const float MyMass    = FMath::Max(GetCharacterMovement()->Mass, 1.f);
+	const float OtherMass = FMath::Max(OtherChar->GetCharacterMovement()->Mass, 1.f);
+	const float MassRatio = FMath::Clamp(OtherMass / MyMass, S->BargeMassRatioMin, S->BargeMassRatioMax);
+
+	// 5) Resolve. Strong echoes (high StrengthScalar) hold their ground better.
+	const float Power = (Speed / S->BargeReferenceSpeed) * MassRatio * Glancing
+		/ FMath::Max(BodyCondition.StrengthScalar, GMinStrengthScalarDiv);
+
+	LastBargeTime = Now;
+
+	if (Power < S->BargeSuccessPowerThreshold)
+	{
+		UE_LOGFMT(LogATR_EchoCombat, Verbose,
+			"Barge Echo={Echo} Instigator={Inst} Outcome=Held Power={Power} Speed={Speed} Offset={Offset} MassRatio={MassRatio}",
+			SourceIndex, GetNameSafe(Other), Power, Speed, OffsetNorm, MassRatio);
+		return; // the echo holds its ground — capsule keeps blocking
+	}
+
+	// SUCCESS — knock the echo sideways out of the player's path (with some carry-through),
+	// stagger it (melee task drops the grip and can't re-grab), and bleed player speed —
+	// more for a dead-center hit, almost nothing for a shoulder clip.
+	const float     SideSign  = (VDir.X * ToEcho2D.Y - VDir.Y * ToEcho2D.X) >= 0.f ? 1.f : -1.f;
+	const FVector2D Perp      = FVector2D(-VDir.Y, VDir.X) * SideSign; // push AWAY from the path line
+	FVector2D KnockDir2D = (Perp * S->BargeKnockbackSideMix + VDir * S->BargeKnockbackForwardMix).GetSafeNormal();
+	if (KnockDir2D.IsNearlyZero()) KnockDir2D = VDir;
+
+	const float CappedPower = FMath::Min(Power, S->BargePowerCap);
+	const float KnockSpeed  = S->BargeKnockbackSpeed * CappedPower;
+	LaunchCharacter(FVector(KnockDir2D.X, KnockDir2D.Y, 0.f) * KnockSpeed + FVector(0.f, 0.f, S->BargeKnockbackUpSpeed),
+		/*bXYOverride=*/true, /*bZOverride=*/true);
+
+	BargeStaggeredUntilTime = Now + S->BargeStaggerSeconds * CappedPower;
+
+	// Speed cost: lowering the shoulder through center mass costs momentum; edge clips are cheap.
+	if (UCharacterMovementComponent* MutableOtherCMC = OtherChar->GetCharacterMovement())
+	{
+		const float Loss = S->BargePlayerSpeedLossAtCenter * (1.f - OffsetNorm);
+		MutableOtherCMC->Velocity *= FMath::Clamp(1.f - Loss, 0.f, 1.f);
+	}
+
+	UE_LOGFMT(LogATR_EchoCombat, Log,
+		"Barge Echo={Echo} Instigator={Inst} Outcome=KnockedAside Power={Power} Speed={Speed} Offset={Offset} Glancing={Glancing} MassRatio={MassRatio} Strength={Strength} StaggerUntil={StaggerUntil}",
+		SourceIndex, GetNameSafe(Other), Power, Speed, OffsetNorm, Glancing, MassRatio,
+		BodyCondition.StrengthScalar, BargeStaggeredUntilTime);
+
+	BP_OnBarged(Other, Power);
 }
 

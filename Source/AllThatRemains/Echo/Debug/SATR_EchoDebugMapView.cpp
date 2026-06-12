@@ -2,6 +2,9 @@
 
 #include "SATR_EchoDebugMapView.h"
 #include "../ATR_EchoSubsystem.h"
+#include "../ATR_EchoSettings.h"
+#include "../ATR_EchoAcoustics.h"
+#include "../ATR_ActiveEcho.h"
 #include "Rendering/DrawElements.h"
 #include "Styling/CoreStyle.h"
 #include "Fonts/SlateFontInfo.h"
@@ -100,7 +103,7 @@ FLinearColor SATR_EchoDebugMapView::IntentColor(uint8 Intent)
 		case 8:  return FLinearColor(0.90f, 0.30f, 0.90f);          // FanSearchArea
 		case 9:  return FLinearColor(0.20f, 1.00f, 0.30f);          // JoinHordePressure
 		case 10: return FLinearColor(1.00f, 0.00f, 0.00f);          // Attack
-		case 11: return FLinearColor(0.60f, 0.30f, 1.00f);          // HandleObstacle
+		case 11: return FLinearColor(0.60f, 0.30f, 1.00f);          // EngageBarrier
 		case 12: return FLinearColor(0.50f, 0.50f, 0.50f);          // ReturnToIdle
 		default: return FLinearColor::White;
 	}
@@ -329,7 +332,9 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 		const int32 N = FMath::Min(Sub->ActiveEntities, Sub->Positions.Num());
 		for (int32 i = 0; i < N; ++i)
 		{
-			const FVector3f& P = Sub->Positions[i];
+			// Query position resolves promoted (live-actor) echoes to their ACTUAL actor
+			// location — the SoA row is stale while an actor drives the echo.
+			const FVector3f P = Sub->GetEchoQueryPosition(i);
 			const FVector2D W(P.X, P.Y);
 			if (!InView(W) || !Sub->RuntimeStates.IsValidIndex(i)) continue;
 
@@ -362,13 +367,19 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 	}
 
 	// ── Echoes (dots, optional movement-direction arrows) ──
+	// Promoted (LIVE ACTOR) echoes resolve to their actual actor position via
+	// GetEchoQueryPosition — the SoA row is stale while a full Character drives the echo —
+	// and are ringed in white so the active tier is visible at a glance.
 	int32 DrawnEchoes = 0;
+	int32 DrawnLive   = 0;
 	if (bShowEchoes)
 	{
 		const int32 N = FMath::Min(Sub->ActiveEntities, Sub->Positions.Num());
 		for (int32 i = 0; i < N; ++i)
 		{
-			const FVector3f& P = Sub->Positions[i];
+			const AATR_ActiveEcho* LiveActor = Sub->IndexToActor.IsValidIndex(i) ? Sub->IndexToActor[i] : nullptr;
+
+			const FVector3f P = Sub->GetEchoQueryPosition(i);
 			const FVector2D W(P.X, P.Y);
 			if (!InView(W)) continue;
 
@@ -380,15 +391,38 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 			Box(LEcho, S - FVector2D(DotR, DotR), FVector2D(DotR * 2.f, DotR * 2.f), C);
 			++DrawnEchoes;
 
-			if (bShowMoveArrows && Sub->Velocities.IsValidIndex(i))
+			if (LiveActor)
 			{
-				// Only draw when genuinely moving (speed > ~5 cm/s). No yaw/facing fallback —
-				// a stationary echo (idle / no target) shows no arrow instead of pointing at its
-				// default facing direction.
-				const FVector3f& V = Sub->Velocities[i];
-				if (V.X * V.X + V.Y * V.Y > 25.f)
+				// White ring (square outline) marking a promoted, fully-simulated actor.
+				const float R = DotR + 2.f;
+				const FLinearColor Ring(1.f, 1.f, 1.f, 0.95f);
+				const FVector2D TL = S + FVector2D(-R, -R), TR2 = S + FVector2D(R, -R);
+				const FVector2D BR2 = S + FVector2D(R, R),  BL  = S + FVector2D(-R, R);
+				Line(LEcho, TL, TR2, Ring, 1.5f); Line(LEcho, TR2, BR2, Ring, 1.5f);
+				Line(LEcho, BR2, BL, Ring, 1.5f); Line(LEcho, BL, TL, Ring, 1.5f);
+				++DrawnLive;
+			}
+
+			if (bShowMoveArrows)
+			{
+				// Only draw when genuinely moving (speed > ~5 cm/s). Promoted echoes read their
+				// actor's real velocity (SoA velocity is not integrated while promoted); horde
+				// echoes read the SoA row. No yaw/facing fallback — a stationary echo shows no
+				// arrow instead of pointing at its default facing direction.
+				FVector2D V2D = FVector2D::ZeroVector;
+				if (LiveActor)
 				{
-					const FVector2D Dir = FVector2D(V.X, V.Y).GetSafeNormal();
+					const FVector V = LiveActor->GetVelocity();
+					V2D = FVector2D(V.X, V.Y);
+				}
+				else if (Sub->Velocities.IsValidIndex(i))
+				{
+					const FVector3f& V = Sub->Velocities[i];
+					V2D = FVector2D(V.X, V.Y);
+				}
+				if (V2D.SizeSquared() > 25.f)
+				{
+					const FVector2D Dir = V2D.GetSafeNormal();
 					const FVector2D DirScreen(Dir.X, -Dir.Y); // +Y world = up
 					Arrow(LArrow, S, S + DirScreen * MoveLen, FLinearColor(0.95f, 0.95f, 1.0f, 0.9f), 1.5f);
 				}
@@ -396,13 +430,17 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 		}
 	}
 
-	// ── Players (distinct cyan triangles, oriented by facing) ──
+	// ── Players (SOLID yellow triangles, oriented by facing) ──
+	// Yellow + filled so players never read as the cyan momentum/flow arrows.
 	if (bShowPlayers)
 	{
 		if (UWorld* World = Sub->GetWorld())
 		{
 			const float PR = FMath::Clamp(GPlayerSizeCm * 0.5f * PixelsPerCm, 9.f, 26.f);
-			auto Marker = [&](const FVector2D& C, const FVector2D& Facing, float Size, const FLinearColor& Col, float Th)
+
+			// Filled triangle: fan of thick lines from the tip across the base edge. Slate has
+			// no arbitrary-polygon fill primitive, so sweep the interior with overlapping lines.
+			auto FilledMarker = [&](const FVector2D& C, const FVector2D& Facing, float Size, const FLinearColor& Col)
 			{
 				FVector2D F = Facing.GetSafeNormal();
 				if (F.IsNearlyZero()) F = FVector2D(0, -1);
@@ -410,9 +448,14 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 				const FVector2D Tip = C + F * Size;
 				const FVector2D B1  = C - F * (Size * 0.7f) + Perp * (Size * 0.75f);
 				const FVector2D B2  = C - F * (Size * 0.7f) - Perp * (Size * 0.75f);
-				Line(LPlayer, Tip, B1, Col, Th);
-				Line(LPlayer, B1, B2, Col, Th);
-				Line(LPlayer, B2, Tip, Col, Th);
+
+				const int32 Segs = FMath::Clamp(FMath::CeilToInt(Size), 10, 28);
+				for (int32 s = 0; s <= Segs; ++s)
+					Line(LPlayer, Tip, FMath::Lerp(B1, B2, (float)s / Segs), Col, 2.f);
+				// Crisp outline on top of the fill.
+				Line(LPlayer, Tip, B1, Col, 1.5f);
+				Line(LPlayer, B1, B2, Col, 1.5f);
+				Line(LPlayer, B2, Tip, Col, 1.5f);
 			};
 
 			for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
@@ -427,8 +470,8 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 				const float Yr = FMath::DegreesToRadians((float)Pawn->GetActorRotation().Yaw);
 				const FVector2D FacingScreen(FMath::Cos(Yr), -FMath::Sin(Yr));
 
-				Marker(S, FacingScreen, PR + 1.5f, FLinearColor(0.02f, 0.02f, 0.04f, 0.95f), 4.0f); // dark backing
-				Marker(S, FacingScreen, PR,        FLinearColor(0.20f, 0.95f, 1.00f, 1.00f), 2.5f); // bright cyan
+				FilledMarker(S, FacingScreen, PR + 2.f, FLinearColor(0.02f, 0.02f, 0.04f, 0.95f)); // dark backing
+				FilledMarker(S, FacingScreen, PR,       FLinearColor(1.00f, 0.85f, 0.05f, 1.00f)); // solid yellow
 			}
 		}
 	}
@@ -454,17 +497,26 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 	}
 
 	if (bEmitSoundMode)
+	{
+		const UATR_EchoSettings* AS = GetDefault<UATR_EchoSettings>();
+		const float AudibleM = ATR_EchoAcoustics::ComputeAudibleRadiusCm(
+			SoundLoudnessDb,
+			AS ? AS->EchoHearingThresholdDb      : 35.f,
+			AS ? AS->AcousticReferenceDistanceCm : 100.f,
+			AS ? AS->AirAbsorptionDbPer100m      : 0.5f,
+			AS ? AS->MaxAudibleRangeCm           : 30000.f) / 100.f;
 		Text(LText, FVector2D(10, LS.Y - 40),
-			FString::Printf(TEXT("EMIT SOUND: click map to drop  [type %d  strength %.2f  radius %.0f]"),
-				(int32)SoundType, SoundStrength, SoundRadius),
+			FString::Printf(TEXT("EMIT SOUND: click map to drop  [type %d  %.0f dB @ 1 m  ->  audible ~%.0f m]"),
+				(int32)SoundType, SoundLoudnessDb, AudibleM),
 			Font10, FLinearColor(1.f, 0.85f, 0.25f));
+	}
 
 	// ── HUD stat line ──
 	{
 		const float CmPerPixel = (PixelsPerCm > KINDA_SMALL_NUMBER) ? 1.f / PixelsPerCm : 0.f;
 		Text(LText, FVector2D(10, LS.Y - 24),
-			FString::Printf(TEXT("Zoom: 1px = %.0f cm   |   Echoes drawn: %d / %d   |   Momentum cells: %d   |   Abstract cells: %d   |   Wheel = zoom, Drag = pan"),
-				CmPerPixel, DrawnEchoes, Sub->ActiveEntities, Sub->MomentumField.Num(), Sub->AbstractCells.Num()),
+			FString::Printf(TEXT("Zoom: 1px = %.0f cm   |   Echoes drawn: %d / %d (live actors: %d)   |   Momentum cells: %d   |   Abstract cells: %d   |   Wheel = zoom, Drag = pan"),
+				CmPerPixel, DrawnEchoes, Sub->ActiveEntities, DrawnLive, Sub->MomentumField.Num(), Sub->AbstractCells.Num()),
 			Font10, FLinearColor(0.85f, 0.85f, 0.9f));
 	}
 
@@ -483,6 +535,7 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 		if (bShowArrows || bShowFlowField)        Rows += 1;          // flow arrows note
 		if (bShowTargetLines)                     Rows += 2;          // sees / remembered
 		if (bShowPlayers)                         Rows += 1;
+		if (bShowEchoes)                          Rows += 1;          // live-actor ring
 		if (bShowMoveArrows)                      Rows += 1;
 		if (bShowIntentColors)                    Rows += 7;          // intent swatches
 		const float PanelH = Pad * 2.f + Rows * Row;
@@ -523,7 +576,8 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 			Swatch(FLinearColor(1.0f, 0.22f, 0.18f), TEXT("target line: sees player"));
 			Swatch(FLinearColor(1.0f, 0.62f, 0.12f), TEXT("target line: remembered loc"));
 		}
-		if (bShowPlayers)   Swatch(FLinearColor(0.20f, 0.95f, 1.00f), TEXT("player"));
+		if (bShowPlayers)   Swatch(FLinearColor(1.00f, 0.85f, 0.05f), TEXT("player"));
+		if (bShowEchoes)    Swatch(FLinearColor(1.00f, 1.00f, 1.00f), TEXT("white ring: live actor"));
 		if (bShowMoveArrows) Swatch(FLinearColor(0.95f, 0.95f, 1.00f), TEXT("echo move direction"));
 
 		if (bShowIntentColors)
@@ -534,7 +588,7 @@ int32 SATR_EchoDebugMapView::OnPaint(const FPaintArgs& Args, const FGeometry& Al
 			Swatch(IntentColor(5),  TEXT("Chase (sees)"));
 			Swatch(IntentColor(6),  TEXT("Chase last-seen / search"));
 			Swatch(IntentColor(9),  TEXT("Join horde pressure"));
-			Swatch(IntentColor(11), TEXT("Handle obstacle"));
+			Swatch(IntentColor(11), TEXT("Engage barrier"));
 		}
 	}
 
@@ -574,13 +628,21 @@ void SATR_EchoDebugMapView::EmitSoundAtWorld(const FVector2D& WorldXY)
 	FATR_StimulusEvent E;
 	E.Type        = static_cast<EATR_StimulusType>(SoundType);
 	E.Location    = FVector(WorldXY.X, WorldXY.Y, Z);
-	E.Strength    = SoundStrength;
-	E.Radius      = SoundRadius;
+	E.LoudnessDb  = SoundLoudnessDb; // real units — audible radius derives from propagation
 	E.Direction   = FVector::ZeroVector;
 	E.TimeSeconds = W ? W->GetTimeSeconds() : 0.f;
 
 	Sub->EmitWorldStimulus(E);
-	RecentEmits.Add({ WorldXY, FPlatformTime::Seconds(), SoundRadius });
+
+	// Feedback ring expands to the DERIVED audible radius so what you see is what they hear.
+	const UATR_EchoSettings* S = GetDefault<UATR_EchoSettings>();
+	const float AudibleRadius = ATR_EchoAcoustics::ComputeAudibleRadiusCm(
+		SoundLoudnessDb,
+		S ? S->EchoHearingThresholdDb       : 35.f,
+		S ? S->AcousticReferenceDistanceCm  : 100.f,
+		S ? S->AirAbsorptionDbPer100m       : 0.5f,
+		S ? S->MaxAudibleRangeCm            : 30000.f);
+	RecentEmits.Add({ WorldXY, FPlatformTime::Seconds(), AudibleRadius });
 }
 
 FReply SATR_EchoDebugMapView::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
