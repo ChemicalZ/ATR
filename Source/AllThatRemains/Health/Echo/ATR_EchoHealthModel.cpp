@@ -162,7 +162,8 @@ void FATR_EchoHealthModel::RecomputeCapabilities(const int32 EchoIndex)
 
 	if (Brain == 0 || !(Parts & HeadPresent))
 	{
-		Flags = IsDead;
+		// Qualified: the IsDead(int32) member function shadows the enum here.
+		Flags = ATR_EchoCapability::IsDead;
 	}
 	else
 	{
@@ -210,7 +211,7 @@ void FATR_EchoHealthModel::RecomputeCapabilities(const int32 EchoIndex)
 	SoA.CapabilityFlags[EchoIndex] = Flags;
 
 	// A fresh death outranks a plain capability delta.
-	const bool bJustDied = (Flags & IsDead) && !(OldFlags & IsDead);
+	const bool bJustDied = (Flags & ATR_EchoCapability::IsDead) && !(OldFlags & ATR_EchoCapability::IsDead);
 	EmitDelta(EchoIndex, bJustDied ? EATR_EchoHealthDeltaType::EchoKilled : EATR_EchoHealthDeltaType::CapabilityChanged);
 
 	if (GetDefault<UATR_HealthSettings>()->bLogEchoStructuralChanges)
@@ -346,7 +347,4 @@ FString FATR_EchoHealthModel::GetDebugString(const int32 EchoIndex) const
 		Flags, SoA.HealthSequence[EchoIndex],
 		(Flags & ATR_EchoCapability::IsDead) ? TEXT(" DEAD") : TEXT(""),
 		(Flags & ATR_EchoCapability::CanWalk) ? TEXT(" walk") : TEXT(""),
-		(Flags & ATR_EchoCapability::CanCrawl) ? TEXT(" crawl") : TEXT(""),
-		(Flags & ATR_EchoCapability::IsImmobile) ? TEXT(" immobile") : TEXT(""),
-		PendingDeltas.Num());
-}
+		(Flags & ATR_EchoCapability::CanCraw
