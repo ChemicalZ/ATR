@@ -1,21 +1,35 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
 #include "ATR_EchoAIController.h"
+#include "ATR_EchoAILog.h"
+#include "../ATR_EchoSubsystem.h"
+#include "../ATR_EchoSettings.h"
+#include "../ATR_ActiveEcho.h"
 #include "Perception/AISenseConfig_Sight.h"
 #include "Perception/AISenseConfig_Hearing.h"
 #include "Perception/AISense_Sight.h"
+#include "Perception/AISense_Hearing.h"
+#include "Navigation/PathFollowingComponent.h"
+
+DEFINE_LOG_CATEGORY(LogATR_EchoAI);
 
 // ─── Construction ─────────────────────────────────────────────────────────────
 
 AATR_EchoAIController::AATR_EchoAIController()
 {
+	// Perception tuning comes from Project Settings (Echo|Sight, Echo|Hearing) — no hardcoded
+	// behavior numbers. The settings CDO is available during CDO construction.
+	const UATR_EchoSettings* Settings = GetDefault<UATR_EchoSettings>();
+	HearingRange         = Settings ? Settings->ActiveHearingRange        : HearingRange;
+	ObstacleTraceDistance = Settings ? Settings->ObstacleForwardTraceLength : ObstacleTraceDistance;
+
 	AIPerception = CreateDefaultSubobject<UAIPerceptionComponent>(TEXT("AIPerception"));
 
 	UAISenseConfig_Sight* SightConfig = CreateDefaultSubobject<UAISenseConfig_Sight>(TEXT("SightConfig"));
-	SightConfig->SightRadius                              = 2000.f;
-	SightConfig->LoseSightRadius                         = 2500.f;
-	SightConfig->PeripheralVisionAngleDegrees             = 90.f;
-	SightConfig->SetMaxAge(5.f);
+	SightConfig->SightRadius                              = Settings ? Settings->ActiveSightRadius : 2000.f;
+	SightConfig->LoseSightRadius                          = Settings ? Settings->ActiveLoseSightRadius : 2500.f;
+	SightConfig->PeripheralVisionAngleDegrees             = Settings ? Settings->ActivePeripheralVisionAngleDegrees : 90.f;
+	SightConfig->SetMaxAge(Settings ? Settings->ActiveSightMaxAgeSeconds : 5.f);
 	SightConfig->DetectionByAffiliation.bDetectEnemies    = true;
 	SightConfig->DetectionByAffiliation.bDetectNeutrals   = true;
 	SightConfig->DetectionByAffiliation.bDetectFriendlies = false;
@@ -23,7 +37,8 @@ AATR_EchoAIController::AATR_EchoAIController()
 	AIPerception->SetDominantSense(SightConfig->GetSenseImplementation());
 
 	UAISenseConfig_Hearing* HearingConfig = CreateDefaultSubobject<UAISenseConfig_Hearing>(TEXT("HearingConfig"));
-	HearingConfig->HearingRange                              = 3000.f;
+	HearingConfig->HearingRange                             = HearingRange;
+	HearingConfig->SetMaxAge(Settings ? Settings->ActiveHearingMaxAgeSeconds : 5.f);
 	HearingConfig->DetectionByAffiliation.bDetectEnemies    = true;
 	HearingConfig->DetectionByAffiliation.bDetectNeutrals   = true;
 	HearingConfig->DetectionByAffiliation.bDetectFriendlies = false;
@@ -36,113 +51,340 @@ AATR_EchoAIController::AATR_EchoAIController()
 
 void AATR_EchoAIController::OnPossess(APawn* InPawn)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_OnPossess);
 	Super::OnPossess(InPawn);
+
+	// Resolve the canonical-state bridge once. EchoId is stable for the Echo's lifetime,
+	// so caching it here is safe even though the underlying SoA index can move.
+	CachedSubsystem = GetWorld() ? GetWorld()->GetSubsystem<UATR_EchoSubsystem>() : nullptr;
+	CachedEchoId    = INDEX_NONE;
+	if (CachedSubsystem)
+	{
+		if (const AATR_ActiveEcho* Echo = Cast<AATR_ActiveEcho>(InPawn))
+			CachedEchoId = CachedSubsystem->GetEchoIdForIndex(Echo->SourceIndex);
+	}
 
 	if (AIPerception)
 	{
+		SetSensesEnabled(true); // explicit re-enable on possess (paired with pool disable)
 		AIPerception->SetComponentTickEnabled(true);
-		AIPerception->OnPerceptionUpdated.AddDynamic(this, &AATR_EchoAIController::HandlePerceptionUpdated);
+		// Guard against double-binding if a lifecycle bug ever possesses without an
+		// intervening unpossess. AddUnique is a no-op when already bound.
+		AIPerception->OnPerceptionUpdated.AddUniqueDynamic(this, &AATR_EchoAIController::HandlePerceptionUpdated);
 	}
 
+	// Classified move results flow back to the subsystem through this callback.
+	ReceiveMoveCompleted.AddUniqueDynamic(this, &AATR_EchoAIController::HandleMoveCompleted);
+
 	if (StateTreeComp) StateTreeComp->StartLogic();
-	UE_LOG(LogTemp, Warning, TEXT("Possessed %s"),
-	*InPawn->GetName());
+
+	UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("OnPossess — %s possessed %s (EchoId %d)"),
+		*GetName(), InPawn ? *InPawn->GetName() : TEXT("null"), CachedEchoId);
 }
 
 void AATR_EchoAIController::OnUnPossess()
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_OnUnPossess);
 	StopMovement(); // must be before Super — Super clears the pawn reference
-	CurrentTarget.Reset();
+	PrevVisibleActor.Reset();
+	PrevVisibleTime = -1.f;
 
 	if (StateTreeComp) StateTreeComp->StopLogic(TEXT("Pooled"));
 
 	if (AIPerception)
 	{
 		AIPerception->OnPerceptionUpdated.RemoveDynamic(this, &AATR_EchoAIController::HandlePerceptionUpdated);
+		SetSensesEnabled(false); // disable senses + forget memory so no stale stimuli carry over
 		AIPerception->SetComponentTickEnabled(false);
 	}
+
+	ReceiveMoveCompleted.RemoveDynamic(this, &AATR_EchoAIController::HandleMoveCompleted);
+	ActiveMoveRequestId = FAIRequestID::InvalidRequest;
+	CachedEchoId    = INDEX_NONE;
+	CachedSubsystem = nullptr;
 
 	Super::OnUnPossess();
 }
 
 void AATR_EchoAIController::EnterPool()
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_EnterPool);
+
 	// Safety net — normally OnUnPossess already cleaned up.
 	// RemoveDynamic on an unbound delegate is a no-op.
-	CurrentTarget.Reset();
+	PrevVisibleActor.Reset();
+	PrevVisibleTime = -1.f;
 
 	if (StateTreeComp) StateTreeComp->StopLogic(TEXT("Pooled"));
 
 	if (AIPerception)
 	{
 		AIPerception->OnPerceptionUpdated.RemoveDynamic(this, &AATR_EchoAIController::HandlePerceptionUpdated);
+		SetSensesEnabled(false); // disable senses + forget perception memory
 		AIPerception->SetComponentTickEnabled(false);
 	}
+
+	ReceiveMoveCompleted.RemoveDynamic(this, &AATR_EchoAIController::HandleMoveCompleted);
+	ActiveMoveRequestId = FAIRequestID::InvalidRequest;
+	CachedEchoId    = INDEX_NONE;
+	CachedSubsystem = nullptr;
 }
 
 // ─── Perception ───────────────────────────────────────────────────────────────
 
 void AATR_EchoAIController::HandlePerceptionUpdated(const TArray<AActor*>& UpdatedActors)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_HandlePerceptionUpdated);
 	if (!HasAuthority()) return;
-	CurrentTarget = SelectBestTarget();
+
+	// Perception only FEEDS the subsystem's canonical awareness; the subsystem owns "what this
+	// Echo knows" and selects intent. The controller no longer holds its own target.
+	ReportPerceptionFacts(UpdatedActors);
 }
 
-AActor* AATR_EchoAIController::SelectBestTarget() const
+void AATR_EchoAIController::ReportPerceptionFacts(const TArray<AActor*>& UpdatedActors)
 {
-	if (!AIPerception) return nullptr;
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_ReportPerceptionFacts);
 
-	APawn* MyPawn = GetPawn();
-	
-	if (!MyPawn) return nullptr;
+	if (!AIPerception || !CachedSubsystem || CachedEchoId == INDEX_NONE) return;
 
+	const float       Now       = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+	const FAISenseID  SightID   = UAISense::GetSenseID<UAISense_Sight>();
+	const FAISenseID  HearingID = UAISense::GetSenseID<UAISense_Hearing>();
+	const APawn*      MyPawn    = GetPawn();
 
-	// Only evaluate sight — hearing is used for alerting, not targeting.
-	TArray<AActor*> KnownActors;
-	AIPerception->GetKnownPerceivedActors(UAISense_Sight::StaticClass(), KnownActors);
-	if (KnownActors.IsEmpty()) return nullptr;
-
-	AActor* BestActor = nullptr;
-	float   BestScore = -1.f;
-
-	for (AActor* Actor : KnownActors)
+	for (AActor* Actor : UpdatedActors)
 	{
-
-		
 		if (!IsValid(Actor) || Actor == MyPawn) continue;
 
-		// Check whether we currently have line of sight or are working from memory.
 		FActorPerceptionBlueprintInfo Info;
 		AIPerception->GetActorsPerception(Actor, Info);
 
-		bool bCurrentlySensed = false;
 		for (const FAIStimulus& Stim : Info.LastSensedStimuli)
 		{
-			if (Stim.Type == UAISense::GetSenseID<UAISense_Sight>() && Stim.WasSuccessfullySensed())
+			if (Stim.Type == SightID)
 			{
-				bCurrentlySensed = true;
-				break;
+				if (Stim.WasSuccessfullySensed())
+				{
+					// Currently visible. Derive observed velocity from the delta of successive
+					// VISIBLE positions rather than Actor->GetVelocity(), so the Echo never reads
+					// motion it could not have seen. First sighting (or a different actor) yields
+					// zero velocity until a second visible sample arrives.
+					const FVector CurLoc = Actor->GetActorLocation();
+					FVector ObservedVelocity = FVector::ZeroVector;
+					if (PrevVisibleActor.Get() == Actor && PrevVisibleTime >= 0.f)
+					{
+						const float Dt = Now - PrevVisibleTime;
+						if (Dt > KINDA_SMALL_NUMBER)
+							ObservedVelocity = (CurLoc - PrevVisibleLocation) / Dt;
+					}
+					PrevVisibleActor    = Actor;
+					PrevVisibleLocation = CurLoc;
+					PrevVisibleTime     = Now;
+
+					CachedSubsystem->ReportEchoSawActor(CachedEchoId, Actor, CurLoc, ObservedVelocity, Now);
+				}
+				else
+				{
+					// Sight just lost — hand off to memory. No location/velocity is sampled here:
+					// the subsystem keeps the values it observed while the target was visible.
+					CachedSubsystem->ReportEchoLostSight(CachedEchoId, Actor, Now);
+
+					if (PrevVisibleActor.Get() == Actor)
+					{
+						PrevVisibleActor.Reset();
+						PrevVisibleTime = -1.f;
+					}
+				}
+			}
+			else if (Stim.Type == HearingID && Stim.WasSuccessfullySensed())
+			{
+				// Location-only. Model the noise as a Noise stimulus event with distance
+				// falloff applied; the source actor is carried ONLY as debug metadata and is
+				// never consumed as behavioral target knowledge.
+				const FVector PawnLoc = MyPawn ? MyPawn->GetActorLocation() : Stim.StimulusLocation;
+				const float   Dist    = FVector::Dist(PawnLoc, Stim.StimulusLocation);
+				const float   Falloff = FMath::Clamp(1.f - Dist / FMath::Max(HearingRange, 1.f), 0.f, 1.f);
+
+				FATR_StimulusEvent Noise;
+				Noise.Type                 = EATR_StimulusType::Noise;
+				Noise.Location             = Stim.StimulusLocation;
+				Noise.Direction            = (Stim.StimulusLocation - PawnLoc).GetSafeNormal();
+				Noise.Strength             = Stim.Strength * Falloff;
+				Noise.Radius               = 0.f;
+				Noise.TimeSeconds          = Now;
+				Noise.SourceActor_DebugOnly = Actor; // metadata only — not a target
+
+				CachedSubsystem->ReportEchoStimulus(CachedEchoId, Noise);
 			}
 		}
+	}
+}
 
-		// Base score: inverse squared distance (closer = higher).
-		const float DistSq = MyPawn->GetSquaredDistanceTo(Actor);
-		float Score = 1.f / (DistSq + 1.f);
+void AATR_EchoAIController::SetSensesEnabled(bool bEnabled)
+{
+	if (!AIPerception) return;
 
-		// Heavily favour targets we can currently see over stale memory.
-		if (bCurrentlySensed)
-			Score *= 2.f;
+	AIPerception->SetSenseEnabled(UAISense_Sight::StaticClass(),   bEnabled);
+	AIPerception->SetSenseEnabled(UAISense_Hearing::StaticClass(), bEnabled);
 
-		// Loyalty bonus: current target needs to be significantly beaten before we switch.
-		if (Actor == CurrentTarget.Get())
-			Score *= LoyaltyBonusMultiplier;
+	if (!bEnabled)
+		AIPerception->ForgetAll(); // drop stale stimuli so a recycled controller starts clean
+}
 
-		if (Score > BestScore)
+// ─── Movement Execution ───────────────────────────────────────────────
+
+EPathFollowingRequestResult::Type AATR_EchoAIController::IssueMoveRequest(const FATR_EchoMoveRequest& Request)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_IssueMoveRequest);
+
+	const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+
+	// Build an explicit, typed move request. None/invalid is rejected up front so movement
+	// can never silently fall back to FVector::ZeroVector.
+	FAIMoveRequest MoveReq;
+	MoveReq.SetAcceptanceRadius(Request.AcceptanceRadius);
+	MoveReq.SetUsePathfinding(true);
+	MoveReq.SetReachTestIncludesAgentRadius(true);
+
+	switch (Request.Type)
+	{
+		case EATR_EchoMoveTargetType::Actor:
+			if (!Request.Actor.IsValid())
+			{
+				ReportMoveResultToSubsystem(false, EATR_MoveFailureReason::InvalidTarget, Now, nullptr);
+				return EPathFollowingRequestResult::Failed;
+			}
+			MoveReq.SetGoalActor(Request.Actor.Get());
+			break;
+
+		case EATR_EchoMoveTargetType::Location:
+			MoveReq.SetGoalLocation(Request.Location);
+			break;
+
+		case EATR_EchoMoveTargetType::None:
+		default:
+			ReportMoveResultToSubsystem(false, EATR_MoveFailureReason::InvalidTarget, Now, nullptr);
+			return EPathFollowingRequestResult::Failed;
+	}
+
+	const FPathFollowingRequestResult Result = MoveTo(MoveReq);
+	ActiveMoveRequestId = Result.MoveId;
+
+	if (CachedSubsystem && CachedEchoId != INDEX_NONE)
+	{
+		if (FATR_EchoRuntimeState* State = CachedSubsystem->GetMutableEchoState(CachedEchoId))
 		{
-			BestScore = Score;
-			BestActor = Actor;
+			// New monotonic serial for this issued request. The move/obstacle task records the
+			// serial and resolves only when the matching completion is reported — so a path that
+			// merely goes Idle is not treated as success.
+			State->Movement.MoveRequestSerial += 1;
+			State->Movement.bMoveInProgress     = true;
+			State->Movement.bLastMoveSucceeded  = false;
+			LastIssuedMoveSerial = State->Movement.MoveRequestSerial;
 		}
 	}
 
-	return BestActor;
+	// Immediate terminal codes are reported now; Running results are reported later via
+	// HandleMoveCompleted when path following finishes.
+	if (Result.Code == EPathFollowingRequestResult::AlreadyAtGoal)
+		ReportMoveResultToSubsystem(true, EATR_MoveFailureReason::None, Now, nullptr);
+	else if (Result.Code == EPathFollowingRequestResult::Failed)
+		ReportMoveResultToSubsystem(false, EATR_MoveFailureReason::NoPath, Now, nullptr);
+
+	return Result.Code;
+}
+
+void AATR_EchoAIController::HandleMoveCompleted(FAIRequestID RequestID, EPathFollowingResult::Type Result)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_HandleMoveCompleted);
+	if (!HasAuthority()) return;
+
+	// Ignore completions for superseded requests.
+	if (ActiveMoveRequestId.IsValid() && !RequestID.IsEquivalent(ActiveMoveRequestId)) return;
+
+	const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+
+	bool                   bSuccess = false;
+	EATR_MoveFailureReason Reason   = EATR_MoveFailureReason::None;
+
+	AActor* Blocker = nullptr;
+
+	switch (Result)
+	{
+		case EPathFollowingResult::Success: bSuccess = true; break;
+		// Blocked → trace forward to identify and classify the obstacle (door/window/fence).
+		case EPathFollowingResult::Blocked: Reason = ClassifyBlockingObstacle(Blocker);         break;
+		case EPathFollowingResult::OffPath: Reason = EATR_MoveFailureReason::TargetUnreachable;  break;
+		case EPathFollowingResult::Aborted: Reason = EATR_MoveFailureReason::AbortedByNewIntent; break;
+		case EPathFollowingResult::Invalid: Reason = EATR_MoveFailureReason::InvalidTarget;      break;
+		default:                            Reason = EATR_MoveFailureReason::NoPath;             break;
+	}
+
+	if (!bSuccess)
+	{
+		UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("Move blocked — EchoId %d reason %d blocker %s"),
+			CachedEchoId, static_cast<int32>(Reason), Blocker ? *Blocker->GetName() : TEXT("none"));
+	}
+
+	ReportMoveResultToSubsystem(bSuccess, Reason, Now, Blocker);
+}
+
+EATR_MoveFailureReason AATR_EchoAIController::ClassifyBlockingObstacle(AActor*& OutBlocker) const
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(EchoAI_ClassifyBlockingObstacle);
+
+	// Tag contract — designers tag breakable obstacle actors so the AI can classify them
+	// without hard class dependencies. Unknown blockers fall back to a generic dynamic block.
+	static const FName TagDoor  (TEXT("Echo.Obstacle.Door"));
+	static const FName TagWindow(TEXT("Echo.Obstacle.Window"));
+	static const FName TagFence (TEXT("Echo.Obstacle.Fence"));
+
+	OutBlocker = nullptr;
+
+	const APawn* P = GetPawn();
+	const UWorld* W = GetWorld();
+	if (!P || !W) return EATR_MoveFailureReason::BlockedByDynamicActor;
+
+	const FVector Start = P->GetActorLocation();
+	const FVector End   = Start + P->GetActorForwardVector() * ObstacleTraceDistance;
+
+	FHitResult Hit;
+	FCollisionQueryParams Params(TEXT("EchoObstacleTrace"), /*bTraceComplex=*/false, P);
+	if (!W->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params) || !Hit.GetActor())
+		return EATR_MoveFailureReason::BlockedByDynamicActor;
+
+	OutBlocker = Hit.GetActor();
+	if (OutBlocker->ActorHasTag(TagDoor))   return EATR_MoveFailureReason::BlockedByDoor;
+	if (OutBlocker->ActorHasTag(TagWindow)) return EATR_MoveFailureReason::BlockedByWindow;
+	if (OutBlocker->ActorHasTag(TagFence))  return EATR_MoveFailureReason::BlockedByFence;
+	return EATR_MoveFailureReason::BlockedByDynamicActor;
+}
+
+void AATR_EchoAIController::ReportMoveResultToSubsystem(bool bSuccess, EATR_MoveFailureReason Reason, float TimeSeconds, AActor* BlockingActor)
+{
+	if (!CachedSubsystem || CachedEchoId == INDEX_NONE) return;
+
+	const FVector Loc = GetPawn() ? GetPawn()->GetActorLocation() : FVector::ZeroVector;
+	CachedSubsystem->ReportEchoMoveResult(CachedEchoId, bSuccess, Reason, Loc, BlockingActor, TimeSeconds);
+}
+
+AATR_EchoAIController::EEchoMoveOutcome AATR_EchoAIController::GetMoveOutcomeForSerial(uint32 Serial) const
+{
+	if (!CachedSubsystem || CachedEchoId == INDEX_NONE) return EEchoMoveOutcome::Failed;
+
+	const FATR_EchoRuntimeState* State = CachedSubsystem->GetEchoState(CachedEchoId);
+	if (!State) return EEchoMoveOutcome::Failed;
+
+	const FATR_EchoMovementIntent& M = State->Movement;
+
+	// A newer request has superseded the one this task issued — abandon this state.
+	if (M.MoveRequestSerial != Serial) return EEchoMoveOutcome::Failed;
+
+	// The matching completion has been recorded → resolve by its classified result.
+	if (M.LastCompletedMoveRequestSerial == Serial)
+		return M.bLastMoveSucceeded ? EEchoMoveOutcome::Succeeded : EEchoMoveOutcome::Failed;
+
+	// Still the outstanding request, not yet completed.
+	return EEchoMoveOutcome::Pending;
 }

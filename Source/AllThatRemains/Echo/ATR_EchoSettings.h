@@ -9,6 +9,8 @@
 class AATR_EchoManager;
 class AATR_ActiveEcho;
 class AATR_EchoAIController;
+class UATR_EchoSearchPatternDataAsset;
+class UATR_EchoObstacleBehaviorDataAsset;
 
 // Project Settings > AllThatRemains > Echo Horde
 //
@@ -340,4 +342,495 @@ public:
 		ToolTip="Minimum yaw change before an echo is marked transform-dirty. Higher values reduce update frequency but can make turning less accurate."
 	))
 	float YawDirtyThresholdDegrees = 2.f;
+
+	// ── Echo|Awareness ─────────────────────────────────────────────────────────
+	// Memory decay and stimulus→behavior thresholds. These drive how long an Echo
+	// holds knowledge after a stimulus and how aggressively it acts on it.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Awareness", meta=(ClampMin="0.0",
+		ToolTip="How fast sight confidence fades per second when the target is not currently visible. Higher = forgets a lost target faster."))
+	float ConfidenceDecayPerSecond = 0.15f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Awareness", meta=(ClampMin="0.0",
+		ToolTip="How fast pursuit urgency fades per second. Higher = calms down faster after a stimulus."))
+	float UrgencyDecayPerSecond = 0.20f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Awareness", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Confidence below this forgets the target and falls through to idle/wander/horde. Higher = gives up sooner."))
+	float LostSightMemoryThreshold = 0.05f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Awareness", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="How long a heard location stays actionable for investigation. Higher = investigates older noises."))
+	float HeardMemorySeconds = 8.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Awareness", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Urgency at/above which a heard noise causes InvestigateLocation; below this the Echo only turns toward it."))
+	float HeardInvestigateUrgency = 0.40f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Awareness", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="How long a smell/blood location stays actionable. Higher = follows older trails."))
+	float SmellMemorySeconds = 12.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Awareness", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Urgency at/above which a smell stimulus causes investigation rather than mild orientation."))
+	float SmellInvestigateUrgency = 0.35f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Awareness", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Confidence restored when sight is reacquired on a previously lost target."))
+	float ReacquireSightConfidence = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Awareness", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Grace period after sight is first lost before the Echo commits to memory/search. Smooths brief occlusions."))
+	float SightLossGraceSeconds = 0.5f;
+
+	// ── Echo|Sight ─────────────────────────────────────────────────────────────
+	// Active perception sight config + last-seen projection. Applied to the active
+	// controller's sight sense; projection clamps keep prediction non-supernatural.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Sight", meta=(ClampMin="1.0", ForceUnits="cm",
+		ToolTip="Active sight radius. Targets are confirmed visible within this range with line of sight."))
+	float ActiveSightRadius = 2000.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Sight", meta=(ClampMin="1.0", ForceUnits="cm",
+		ToolTip="Active lose-sight radius. Must be >= ActiveSightRadius; the gap provides sight hysteresis."))
+	float ActiveLoseSightRadius = 2500.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Sight", meta=(ClampMin="0.0", ClampMax="180.0", ForceUnits="deg",
+		ToolTip="Half-angle of peripheral vision. 90 = 180-degree forward cone."))
+	float ActivePeripheralVisionAngleDegrees = 90.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Sight", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Max age of a sight stimulus before perception forgets it."))
+	float ActiveSightMaxAgeSeconds = 5.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Sight", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Lead time used to project the last observed travel into a search anchor."))
+	float LastSeenProjectionSeconds = 2.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Sight", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Clamp on projected-direction distance so prediction can never be supernatural."))
+	float MaxLastSeenProjectionDistance = 800.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Sight", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Smoothing for stored observed velocity. 1 = snap to newest observation; lower = smoother. Only updates while the target is actually visible."))
+	float LastSeenVelocitySmoothingAlpha = 0.5f;
+
+	// ── Echo|Hearing ───────────────────────────────────────────────────────────
+	// Hearing is location-only. These scale noise strength into urgency/agitation and
+	// gate whether a noise causes a turn or a full investigation.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Hearing", meta=(ClampMin="1.0", ForceUnits="cm",
+		ToolTip="Active hearing range. Single source of truth for the hearing sense and the distance falloff applied to heard noises."))
+	float ActiveHearingRange = 3000.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Hearing", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Max age of a hearing stimulus before perception forgets it."))
+	float ActiveHearingMaxAgeSeconds = 5.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Hearing", meta=(ClampMin="0.0",
+		ToolTip="Scale from noise strength (post-falloff) to urgency."))
+	float NoiseStrengthToUrgencyScale = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Hearing", meta=(ClampMin="0.0",
+		ToolTip="Scale from noise strength to local agitation contribution."))
+	float NoiseStrengthToAgitationScale = 0.25f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Hearing", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Below this post-falloff strength a noise only turns the Echo toward it."))
+	float WeakNoiseTurnOnlyThreshold = 0.20f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Hearing", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="At/above this post-falloff strength a noise triggers a move-to investigation."))
+	float StrongNoiseInvestigateThreshold = 0.40f;
+
+	// ── Echo|Search ────────────────────────────────────────────────────────────
+	// Lost-sight search tuning. Search points are nav-projected before becoming moves.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Arrival tolerance for memory/search points."))
+	float ReachLocationRadius = 120.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Default search radius used when no velocity projection is available."))
+	float SearchDefaultRadius = 600.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Maximum time a search persists before giving up."))
+	float SearchMaxDurationSeconds = 12.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Acceptance radius for advancing to the next fan step."))
+	float SearchStepAcceptanceRadius = 120.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Navmesh projection radius for generated search points. A point that cannot project within this radius is skipped."))
+	float SearchPointNavProjectionRadius = 500.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(ClampMin="0.0", ForceUnits="deg",
+		ToolTip="Per-Echo angular jitter applied to the search direction so a group fans out."))
+	float SearchRandomAngleDegrees = 20.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(ClampMin="1",
+		ToolTip="Maximum number of fan steps before a search is considered exhausted."))
+	int32 MaxSearchSteps = 5;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Search", meta=(
+		ToolTip="Default search pattern asset. Leave empty to use the built-in standard directional fan."))
+	TSoftObjectPtr<UATR_EchoSearchPatternDataAsset> DefaultSearchPattern;
+
+	// ── Echo|Agitation ─────────────────────────────────────────────────────────
+	// Indirect horde field. Sources deposit a scalar + direction; never a target actor.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="1.0", ForceUnits="cm",
+		ToolTip="World size of one agitation cell. Larger = coarser, cheaper horde field."))
+	float MomentumCellSize = 2000.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0",
+		ToolTip="How fast deposited field pressure fades per second."))
+	float AgitationFieldDecayPerSecond = 0.25f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0",
+		ToolTip="How fast an individual Echo's personal agitation fades per second."))
+	float EchoPersonalAgitationDecayPerSecond = 0.10f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Agitation at/above which an Echo becomes curious and orients toward the hotspot."))
+	float HordeCuriosityThreshold = 0.20f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Agitation at/above which an Echo migrates with horde pressure."))
+	float AgitationJoinThreshold = 0.50f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0",
+		ToolTip="Scale from noise strength to agitation deposited into the field."))
+	float NoiseAgitationAmountScale = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Agitation deposited by combat events."))
+	float CombatAgitationAmount = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Distance an Echo moves per step when migrating under horde pressure."))
+	float HordePressureMoveDistance = 800.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Smoothing for an Echo's horde pressure direction. 1 = snap; lower = smoother turns."))
+	float HordePressureDirectionSmoothingAlpha = 0.5f;
+
+	// Field diffusion + gradient shaping. Spread pressure across cells and steer by the smooth
+	// pressure gradient (toward hotspots) instead of the raw deposited direction, so hordes react
+	// from a distance and movement isn't snapped to cell/grid lines.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(
+		ToolTip="Spread agitation into neighbouring cells every tick so pressure forms a smooth gradient instead of staying in the deposit cell. Turn OFF to see the old grid-locked behaviour."))
+	bool bEnableMomentumDiffusion = true;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="20.0",
+		ToolTip="How fast agitation propagates outward, in cells-worth of exchange per second. Higher = pressure reaches far echoes sooner and the 'doesn't leave the grid' look disappears. 0 disables spread."))
+	float MomentumDiffusionRate = 3.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Agitation", meta=(ClampMin="0.0", ClampMax="180.0", ForceUnits="deg",
+		ToolTip="Per-Echo random angular jitter added to field-driven movement so a group fans out instead of marching in lockstep along identical directions. 0 = no jitter (sharper patterns)."))
+	float HordeDirectionJitterDegrees = 25.f;
+
+	// ── Echo|HordeShaping ──────────────────────────────────────────────────────
+	// Boids-style separation + approach jitter so echoes form an organic mass rather than a
+	// perfect circle packed onto the player's exact location.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(
+		ToolTip="Enable short-range separation so nearby echoes push apart instead of converging on one point. Turn OFF to see the old perfect-ring packing."))
+	bool bEnableHordeSeparation = true;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Echoes within this distance of each other push apart. Roughly one to two body widths works well."))
+	float HordeSeparationRadius = 160.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ClampMax="4.0",
+		ToolTip="Strength of separation relative to the seek/flow direction. Higher = looser, more spread-out crowd; too high becomes jittery and stops them closing in."))
+	float HordeSeparationStrength = 0.85f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ClampMax="180.0", ForceUnits="deg",
+		ToolTip="Per-Echo random angular jitter on the direct player-seek direction so close echoes approach from spread angles instead of forming a perfect circle."))
+	float HordeApproachJitterDegrees = 20.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="1", ClampMax="64",
+		ToolTip="Maximum neighbours considered when computing an echo's separation (performance cap)."))
+	int32 HordeSeparationMaxNeighbors = 12;
+
+	// Detachment — echoes peel off a horde from the edges, the tail, and as a constant trickle, so
+	// hordes erode and eventually break up rather than persisting forever.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(
+		ToolTip="Enable echoes detaching/peeling off a moving horde (edge, tail, and random trickle). Off = once aligned, echoes follow momentum until it decays."))
+	bool bEnableHordeDetachment = true;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0", ClampMax="32",
+		ToolTip="An echo with fewer nearby neighbours than this counts as being on the EDGE of the horde and detaches more easily."))
+	int32 DetachEdgeNeighborCount = 3;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="-1.0", ClampMax="1.0",
+		ToolTip="An echo is at the BACK of the horde when the local crowd centre lies ahead of it along the momentum direction by at least this dot value. Lower = more echoes count as 'back'."))
+	float DetachBackDot = 0.25f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ClampMax="5.0",
+		ToolTip="Per-second probability that an EDGE echo detaches and wanders off."))
+	float DetachChanceEdgePerSec = 0.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ClampMax="5.0",
+		ToolTip="Per-second probability that a BACK (tail) echo detaches and wanders off."))
+	float DetachChanceBackPerSec = 0.6f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ClampMax="5.0",
+		ToolTip="Constant per-second detach probability for ANY horde echo, so hordes always shed a few stragglers."))
+	float DetachChanceRandomPerSec = 0.05f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeShaping", meta=(ClampMin="0.0", ForceUnits="cm/s",
+		ToolTip="Speed a detached echo drifts outward (away from the crowd) as it peels off."))
+	float DetachDriftSpeed = 70.f;
+
+	// ── Echo|HordeMomentum ─────────────────────────────────────────────────────
+	// Movement-momentum model. Echoes don't share targets or deposit 'I saw the player' pressure;
+	// instead, MOVING echoes build a momentum field that nearby echoes align to. Aligned movement
+	// self-reinforces (more movers = stronger, longer-lived momentum) and a loud sound kicks a group
+	// into motion to seed it. Sight only makes that one echo chase — its movement can still drag a
+	// horde along via momentum, but it never reveals the player's location to others.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(
+		ToolTip="Master switch for the movement-momentum horde model. Off = no horde alignment (echoes act individually)."))
+	bool bEnableHordeMomentum = true;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ClampMax="10.0",
+		ToolTip="How fast aligned movement builds a cell's momentum per second. Higher = hordes coalesce faster."))
+	float MomentumBuildRate = 1.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ClampMax="10.0",
+		ToolTip="Base momentum decay per second. Higher = hordes peter out sooner."))
+	float MomentumDecayPerSecond = 0.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="How much strong momentum resists its own decay (0..1). Higher = big, coherent hordes take much longer to dissipate than weak ones."))
+	float MomentumPersistence = 0.7f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ForceUnits="cm/s",
+		ToolTip="Minimum speed for an echo's movement to count toward building momentum. Filters out idle jitter."))
+	float MomentumMoverSpeedThreshold = 30.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="1.0", ClampMax="200.0",
+		ToolTip="Number of aligned movers in a cell for full-strength momentum build. This is why a loud sound that starts 30 moving builds far stronger momentum than 3 wandering echoes."))
+	float MomentumRefMoverCount = 12.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Minimum local momentum strength before an echo will align/join the horde. Below this it acts on its own."))
+	float MomentumAlignThreshold = 0.12f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.1", ClampMax="4.0",
+		ToolTip="Maximum momentum magnitude a cell can hold."))
+	float MomentumMaxStrength = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Earshot radius of a loud sound: echoes within this start moving toward it (seeding a horde)."))
+	float SoundImpulseRadius = 4000.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ForceUnits="cm/s",
+		ToolTip="Initial speed an echo moves toward a heard sound (scaled by loudness & distance falloff)."))
+	float SoundImpulseSpeed = 150.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|HordeMomentum", meta=(ClampMin="0.0", ClampMax="4.0",
+		ToolTip="Scales the sound movement impulse by event strength."))
+	float SoundImpulseStrengthScale = 1.0f;
+
+	// ── Echo|LowerTierSimulation ───────────────────────────────────────────────
+	// Budgets and speeds for LowDetail individual simulation and Abstract cell simulation.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="0.1", ClampMax="60.0", ForceUnits="Hz",
+		ToolTip="Update frequency for budgeted LowDetail individual Echoes."))
+	float LowDetailUpdateHz = 8.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="0.1", ClampMax="60.0", ForceUnits="Hz",
+		ToolTip="Update frequency for Abstract cell-level simulation."))
+	float AbstractUpdateHz = 1.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="1",
+		ToolTip="Max LowDetail Echoes updated per tick (budget cap)."))
+	int32 LowDetailMaxUpdatesPerTick = 256;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="1",
+		ToolTip="Max Abstract cells updated per tick (budget cap)."))
+	int32 AbstractMaxCellsPerTick = 64;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Radius a LowDetail Echo queries for nearby stimuli/field each update."))
+	float LowDetailStimulusQueryRadius = 3000.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="0.0", ForceUnits="cm/s",
+		ToolTip="Movement speed for a LowDetail Echo investigating a location."))
+	float LowDetailInvestigateSpeed = 150.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="0.0", ForceUnits="cm/s",
+		ToolTip="Movement speed for a LowDetail Echo wandering/drifting."))
+	float LowDetailWanderSpeed = 60.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="0.0", ForceUnits="cm/s",
+		ToolTip="Movement speed for a LowDetail Echo running a simplified search."))
+	float LowDetailSearchSpeed = 120.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Search radius for the simplified LowDetail search."))
+	float LowDetailSearchRadius = 600.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Duration of the simplified LowDetail search before giving up."))
+	float LowDetailSearchDurationSeconds = 12.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="0.0",
+		ToolTip="Promotion-score weight applied per unit of urgency for LowDetail Echoes."))
+	float LowDetailPromotionUrgencyBoost = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="0.0",
+		ToolTip="Promotion-score weight applied per unit of agitation for LowDetail Echoes."))
+	float LowDetailPromotionAgitationBoost = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Fraction of an Abstract cell's population that migrates toward high-pressure neighbors per update."))
+	float AbstractCellMigrationRate = 0.05f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="0.0",
+		ToolTip="Scale from cell noise memory to migration attraction."))
+	float AbstractCellNoiseAttractionScale = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|LowerTierSimulation", meta=(ClampMin="0.0",
+		ToolTip="Scale from cell agitation to migration attraction."))
+	float AbstractCellAgitationAttractionScale = 1.0f;
+
+	// ── Echo|ObstacleHooks ─────────────────────────────────────────────────────
+	// Obstacle classification + sidestep/repath tuning. Break/climb behavior lives in the
+	// obstacle behavior DataAsset (future seam); only sidestep/repath is active today.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Forward trace length used to identify what physically blocked a move."))
+	float ObstacleForwardTraceLength = 200.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Sphere-trace radius used when classifying a blocking obstacle. 0 = line trace."))
+	float ObstacleTraceRadius = 34.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="How long a fresh block forces HandleObstacle before falling through to other intents."))
+	float ObstacleHandleTimeoutSeconds = 2.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Lateral sidestep distance used by the obstacle fallback."))
+	float ObstacleSidestepDistance = 300.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Forward nudge applied alongside the sidestep so the Echo presses the obstacle."))
+	float ObstacleForwardNudgeDistance = 100.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Cooldown before retrying a failed obstacle handling attempt."))
+	float ObstacleRetryCooldownSeconds = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|ObstacleHooks", meta=(
+		ToolTip="Default obstacle behavior asset. Leave empty for sidestep/repath only."))
+	TSoftObjectPtr<UATR_EchoObstacleBehaviorDataAsset> DefaultObstacleBehavior;
+
+	// ── Echo|Combat ────────────────────────────────────────────────────────────
+	// Melee grab → bite → pull. Promoted echoes keep moving forward (momentum preserved) and, when
+	// within reach, attempt to grab; once grabbed they bite on a cadence and pull the target in.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(
+		ToolTip="Master switch for melee grab/bite. Off = promoted echoes only chase, never attack."))
+	bool bEnableMeleeAttack = true;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="A seen target within this range flips the echo's intent from Chase to Attack (engages the melee task). Keep >= GrabRange so the attack state is active a little before arm's length."))
+	float MeleeAttackRange = 220.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Arm's length — within this the echo attempts a grab (while still moving forward)."))
+	float GrabRange = 160.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Minimum seconds between grab attempts."))
+	float GrabCooldownSeconds = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="1.0",
+		ToolTip="The grab releases if the target gets farther than GrabRange * this multiplier."))
+	float GrabReleaseMultiplier = 1.6f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="cm",
+		ToolTip="Once grabbed, the echo bites when the target is within this range. Clamped to <= GrabRange."))
+	float BiteRange = 110.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Minimum seconds between bites."))
+	float BiteCooldownSeconds = 1.2f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0",
+		ToolTip="Strength passed to the pawn's PullTarget hook while grabbed (your pull/root-motion logic scales off this)."))
+	float MeleePullStrength = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="deg",
+		ToolTip="Yaw turn rate (deg/sec) for the TurnTowardStimulus orient task."))
+	float OrientTurnRateDegPerSec = 240.f;
+
+	// ── Echo|Demotion ──────────────────────────────────────────────────────────
+	// Guards that keep an actively engaged Echo from being demoted out of the active pool.
+	// MinTimeInTierSeconds (hysteresis) lives in Echo|Promotion and is shared with promotion.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Demotion", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Block demotion while confidence is at/above this."))
+	float DemotionConfidenceBlockThreshold = 0.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Demotion", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Block demotion while urgency is at/above this."))
+	float DemotionUrgencyBlockThreshold = 0.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Demotion", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="A search younger than this counts as fresh and blocks demotion."))
+	float DemotionSearchBlockSeconds = 5.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Demotion", meta=(
+		ToolTip="Block demotion while the Echo currently sees its target."))
+	bool bBlockDemotionDuringVisibleChase = true;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Demotion", meta=(
+		ToolTip="Block demotion while the Echo is in a fresh lost-sight search."))
+	bool bBlockDemotionDuringFreshSearch = true;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Demotion", meta=(
+		ToolTip="Block demotion while the Echo is handling a fresh obstacle."))
+	bool bBlockDemotionDuringObstacleHandling = true;
+
+	// ── Echo|Promotion (scoring weights) ───────────────────────────────────────
+	// Promotion is score-based, not purely distance-based, so an agitated/searching Echo just
+	// outside the nearest ring can still earn a slot. All weights additive into the score.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Promotion", meta=(ClampMin="0.0",
+		ToolTip="Bonus added to promotion score for Echoes inside MustPromoteRadius."))
+	float MustPromoteScoreBonus = 1000.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Promotion", meta=(ClampMin="0.0",
+		ToolTip="Promotion-score weight per unit of urgency."))
+	float PromotionUrgencyBoost = 200.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Promotion", meta=(ClampMin="0.0",
+		ToolTip="Promotion-score weight per unit of confidence."))
+	float PromotionConfidenceBoost = 150.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Promotion", meta=(ClampMin="0.0",
+		ToolTip="Promotion-score weight per unit of agitation."))
+	float PromotionAgitationBoost = 150.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Promotion", meta=(ClampMin="0.0",
+		ToolTip="Promotion-score weight for an Echo in the player's forward hemisphere (visibility relevance)."))
+	float PromotionPlayerFacingBoost = 100.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Promotion", meta=(ClampMin="0.0",
+		ToolTip="Promotion-score penalty subtracted from a recently demoted Echo, decaying over RecentlyDemotedSeconds."))
+	float RecentlyDemotedPenalty = 300.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Promotion", meta=(ClampMin="0.0", ForceUnits="s",
+		ToolTip="Window over which the recently-demoted penalty applies and decays."))
+	float RecentlyDemotedSeconds = 3.f;
 };

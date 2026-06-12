@@ -50,6 +50,20 @@ void AATR_ActiveEcho::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutL
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	DOREPLIFETIME(AATR_ActiveEcho, SourceIndex);
 	DOREPLIFETIME(AATR_ActiveEcho, AnimStateCache);
+	DOREPLIFETIME(AATR_ActiveEcho, ReplicatedIntent);
+}
+
+void AATR_ActiveEcho::SetEchoIntentForPresentation(EATR_EchoIntent NewIntent)
+{
+	// Server authority only — replicates to clients on change for animation/FX.
+	if (ReplicatedIntent != NewIntent)
+		ReplicatedIntent = NewIntent;
+}
+
+void AATR_ActiveEcho::OnRep_EchoIntent()
+{
+	// AnimBP/FX can poll ReplicatedIntent directly each frame, or override this in a Blueprint
+	// subclass for event-driven intent transitions. No gameplay decision is made here.
 }
 
 void AATR_ActiveEcho::OnRep_SourceIndex()
@@ -107,9 +121,10 @@ void AATR_ActiveEcho::EnterPool()
 		CMC->SetComponentTickEnabled(false);
 	}
 
-	bBlockDemotion = false; // safety net — StateTree (on controller) should clear this in ExitState
-	SourceIndex    = INDEX_NONE;
-	AnimStateCache = 0;
+	bBlockDemotion   = false; // safety net — StateTree (on controller) should clear this in ExitState
+	SourceIndex      = INDEX_NONE;
+	AnimStateCache   = 0;
+	ReplicatedIntent = EATR_EchoIntent::Idle;
 }
 
 void AATR_ActiveEcho::InitFromSoA(const UATR_EchoSubsystem* Sub, int32 Index)
@@ -149,3 +164,25 @@ void AATR_ActiveEcho::WriteBackToSoA(UATR_EchoSubsystem* Sub) const
 	if (const UCharacterMovementComponent* CMC = GetCharacterMovement())
 		Sub->Velocities[SourceIndex] = FVector3f(CMC->Velocity);
 }
+
+// --- Combat hooks (native defaults; override in Blueprint for real effects) ---
+
+bool AATR_ActiveEcho::TryGrabTarget_Implementation(AActor* Target)
+{
+	// Default: the grab "takes" as long as there's a valid target. Override to gate on facing,
+	// animation windows, or anti-spam and to attach/begin the grab montage.
+	return IsValid(Target);
+}
+
+bool AATR_ActiveEcho::TryBiteTarget_Implementation(AActor* Target)
+{
+	// Default: the bite lands. Override to apply damage / play the bite montage.
+	return IsValid(Target);
+}
+
+void AATR_ActiveEcho::PullTarget_Implementation(AActor* /*Target*/, float /*Strength*/)
+{
+	// Default: no-op. Override to pull the target in (root motion, physics constraint, or a
+	// movement nudge). Left empty so the default melee flow never moves the player unexpectedly.
+}
+
