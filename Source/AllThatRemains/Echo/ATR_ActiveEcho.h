@@ -6,9 +6,12 @@
 #include "GenericTeamAgentInterface.h"
 #include "GameFramework/Character.h"
 #include "ATR_EchoRuntimeTypes.h"
+#include "ATR_EchoCombatTypes.h"
+#include "../Health/ATR_HealthTypes.h"
 #include "ATR_ActiveEcho.generated.h"
 
 class UATR_EchoSubsystem;
+class UATR_WeaponDamageProfile;
 
 // Fully-realized Echo actor. Pooled — spawned only near players or for scripted sequences.
 // Owns only movement (CMC) and anim state. All AI lives on AATR_EchoAIController.
@@ -62,23 +65,41 @@ public:
 
 	// --- Combat hooks ---
 	// Called by the melee StateTree task (FATR_EchoMeleeTask). BlueprintNativeEvent so designers can
-	// override the real effect (anim montage, attach, damage, root-motion pull). The native defaults
-	// are intentionally minimal so the grab→bite→pull flow works before art/gameplay is wired.
+	// override/extend (anim montage, attach, FX). The native implementations resolve REAL combat
+	// server-side through the Echo structural health model and UATR_EchoSettings (Echo|Combat):
+	// no arms = no grab, missing fingers = weak grip, no jaw = no bite.
 
-	// Attempt to grab Target. Return true if the grab "takes" (the task then holds the grab, bites,
-	// and pulls). Default: succeeds. Override to gate on facing/animation/anti-spam.
+	// Attempt to grab Target. Resolves capability → facing cone → miss roll; a whiffed grab can
+	// still rake a scratch across the target. On success CurrentGrip is set (weak/strong) and the
+	// task holds the grab, bites, and pulls. Server-side only — returns false elsewhere.
 	UFUNCTION(BlueprintNativeEvent, Category = "Echo|Combat")
 	bool TryGrabTarget(AActor* Target);
 
-	// Attempt a bite on Target (already grabbed, within bite range). Return true if it landed.
-	// Default: succeeds. Override to apply damage / play the bite montage.
+	// Attempt a bite on Target (already grabbed, within bite range). Rolls a wound tier
+	// (scratch/deep scratch/laceration — weighted by grip strength) and applies it to the
+	// target's UATR_HumanHealthComponent as a contaminated Bite damage event.
 	UFUNCTION(BlueprintNativeEvent, Category = "Echo|Combat")
 	bool TryBiteTarget(AActor* Target);
 
-	// Pull Target toward this echo while grabbed. Default: no-op. Override to apply your pull /
-	// root motion / physics constraint. Strength comes from Echo|Combat.MeleePullStrength.
+	// Pull Target toward this echo while grabbed: a per-second velocity drag toward the echo,
+	// scaled by Strength (Echo|Combat.MeleePullStrength), MeleePullSpeed, and grip strength.
 	UFUNCTION(BlueprintNativeEvent, Category = "Echo|Combat")
 	void PullTarget(AActor* Target, float Strength);
+
+	// --- Combat state ---
+
+	// Grip currently held on the melee target. Server-resolved; replicated so client
+	// anim/FX can show weak vs strong holds. None when not grabbing.
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Echo|Combat")
+	EATR_EchoGripType CurrentGrip = EATR_EchoGripType::None;
+
+	// Called by the melee task whenever its grab releases (slip-away, task exit).
+	void NotifyGrabReleased();
+
+	// Re-derive CMC speed from the health model's cached capability flags:
+	// run = full speed, walk-only = limp (LimpSpeedScale), crawl = CrawlSpeed,
+	// immobile/dead = 0. Called on promotion and after surviving structural damage.
+	void ApplyStructuralStateToMovement();
 
 	// --- Lifecycle ---
 
@@ -105,9 +126,33 @@ protected:
 	UFUNCTION() void OnRep_SourceIndex();
 	UFUNCTION() void OnRep_AnimStateCache();
 	UFUNCTION() void OnRep_EchoIntent();
-	
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Team")
 	uint8 TeamNumber = 2;
+
+	// --- Combat internals (server-side resolution) ---
+
+	// Resolve one grab attempt: capability → facing cone → miss roll. May apply
+	// a failed-grab scratch as a side effect (Result.bScratchedTarget).
+	FATR_GrabResult ResolveGrabAttempt(AActor* Target);
+
+	// Apply a resolved wound tier to the target's UATR_HumanHealthComponent.
+	// Returns true if at least one wound was created (false = no component,
+	// fully mitigated, or already dead).
+	bool ApplyWoundToTarget(AActor* Target, EATR_BiteWound Tier);
+
+	// Weighted bite-target selection (code-default table — forearms favored;
+	// promote to a DataAsset if designers need per-archetype variation).
+	static EATR_BodyRegion PickBiteRegion();
+
+	// Echo|Combat.BiteDamageProfile resolved once on first bite (server only).
+	UPROPERTY(Transient)
+	TObjectPtr<UATR_WeaponDamageProfile> ResolvedBiteProfile;
+	bool bBiteProfileResolved = false;
+
+	// MaxWalkSpeed captured at BeginPlay (Blueprint-tuned baseline) so structural
+	// speed effects (limp/crawl) always scale from the undamaged value.
+	float BaseMaxWalkSpeed = 0.f;
 
 public:
 	virtual void Tick(float DeltaTime) override;

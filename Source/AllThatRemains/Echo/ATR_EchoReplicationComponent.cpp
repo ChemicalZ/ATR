@@ -108,6 +108,7 @@ int32 UATR_EchoReplicationComponent::BuildAndSendBand(UATR_EchoSubsystem* Sub,
 	// These cannot be parallelized — TSet/TMap are not thread-safe, CMC requires game thread.
 	struct FEncodeInput { FVector3f Pos; float Yaw; uint8 Anim; int32 Index; };
 	TArray<FEncodeInput> ToEncode;
+	TArray<int32> NewlyKnown; // first-time-relevant this band — may need a health refresh
 	bool bAnyNew = false;
 
 	{
@@ -139,6 +140,7 @@ int32 UATR_EchoReplicationComponent::BuildAndSendBand(UATR_EchoSubsystem* Sub,
 			{
 				KnownEchoes.Add(i);
 				EchoLastHandledVersion.Add(i, CurrentVersion);
+				NewlyKnown.Add(i);
 				bAnyNew = true;
 			}
 
@@ -204,6 +206,26 @@ int32 UATR_EchoReplicationComponent::BuildAndSendBand(UATR_EchoSubsystem* Sub,
 				Chunk.Snapshots.Add(SnapshotScratch[j]);
 
 			Client_EchoSnapshotChunk(Chunk);
+		}
+	}
+
+	// Newly-relevant echoes that already carry structural damage get a full
+	// health refresh so this client doesn't render them pristine (it missed
+	// the original deltas). Clean echoes need nothing — clean is the default.
+	if (NewlyKnown.Num() > 0)
+	{
+		const FATR_EchoHealthModel& Model = Sub->GetHealthModel();
+		TArray<FATR_EchoHealthDelta> Refresh;
+		for (const int32 i : NewlyKnown)
+		{
+			if (Model.IsRowDamaged(i))
+			{
+				Refresh.Add(Model.MakeFullRefreshDelta(i));
+			}
+		}
+		if (Refresh.Num() > 0)
+		{
+			Client_EchoHealthDeltas(Refresh);
 		}
 	}
 
@@ -360,6 +382,27 @@ void UATR_EchoReplicationComponent::Server_RequestFullResync_Implementation(int3
 	NextNearReplicationTime = NowSeconds;
 	NextMidReplicationTime  = NowSeconds;
 	NextFarReplicationTime  = NowSeconds;
+}
+
+// ─── Structural health deltas (client apply) ──────────────────────────────────
+
+void UATR_EchoReplicationComponent::Client_EchoHealthDeltas_Implementation(const TArray<FATR_EchoHealthDelta>& Deltas)
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	// Listen-server host: the local model IS the authoritative one — applying
+	// our own deltas back would be redundant. Skip.
+	if (World->GetNetMode() != NM_Client) return;
+
+	UATR_EchoSubsystem* Sub = World->GetSubsystem<UATR_EchoSubsystem>();
+	if (!Sub || !Sub->IsInitialized()) return;
+
+	FATR_EchoHealthModel& Model = Sub->GetHealthModel();
+	for (const FATR_EchoHealthDelta& Delta : Deltas)
+	{
+		Model.ApplyDeltaFromServer(Delta);
+	}
 }
 
 // ─── Apply ────────────────────────────────────────────────────────────────────

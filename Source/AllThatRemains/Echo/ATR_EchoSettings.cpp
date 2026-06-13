@@ -173,7 +173,24 @@ void UATR_EchoSettings::ValidateAndClamp()
 	BiteRange              = FMath::Clamp(BiteRange, 0.f, GrabRange);
 	BiteCooldownSeconds    = FMath::Max(0.f, BiteCooldownSeconds);
 	MeleePullStrength      = FMath::Max(0.f, MeleePullStrength);
+	MaxGrabHoldSeconds     = FMath::Clamp(MaxGrabHoldSeconds, 0.5f, 120.f);
 	OrientTurnRateDegPerSec = FMath::Max(0.f, OrientTurnRateDegPerSec);
+
+	// Combat resolution
+	GrabFacingConeDegrees  = FMath::Clamp(GrabFacingConeDegrees, 0.f, 360.f);
+	GrabMissChance         = FMath::Clamp(GrabMissChance, 0.f, 1.f);
+	ScratchOnMissChance    = FMath::Clamp(ScratchOnMissChance, 0.f, 1.f);
+	MeleePullSpeed         = FMath::Max(0.f, MeleePullSpeed);
+	WeakGripPullScale      = FMath::Clamp(WeakGripPullScale, 0.f, 1.f);
+	BiteLacerationChanceStrongGrip  = FMath::Clamp(BiteLacerationChanceStrongGrip, 0.f, 1.f);
+	BiteDeepScratchChanceStrongGrip = FMath::Clamp(BiteDeepScratchChanceStrongGrip, 0.f, 1.f);
+	BiteLacerationChanceWeakGrip    = FMath::Clamp(BiteLacerationChanceWeakGrip, 0.f, 1.f);
+	BiteDeepScratchChanceWeakGrip   = FMath::Clamp(BiteDeepScratchChanceWeakGrip, 0.f, 1.f);
+	ScratchTierScale       = FMath::Clamp(ScratchTierScale, 0.f, 1.f);
+	DeepScratchTierScale   = FMath::Clamp(DeepScratchTierScale, 0.f, 1.f);
+	LacerationTierScale    = FMath::Clamp(LacerationTierScale, 0.f, 1.f);
+	LimpSpeedScale         = FMath::Clamp(LimpSpeedScale, 0.f, 1.f);
+	CrawlSpeed             = FMath::Max(0.f, CrawlSpeed);
 
 	// Demotion
 	DemotionConfidenceBlockThreshold = FMath::Clamp(DemotionConfidenceBlockThreshold, 0.f, 1.f);

@@ -9,6 +9,8 @@
 #include "ATR_EchoSettings.h"
 #include "Data/ATR_EchoSearchPatternDataAsset.h"
 #include "Data/ATR_EchoObstacleBehaviorDataAsset.h"
+#include "../Health/ATR_HealthSettings.h"
+#include "../Health/Data/ATR_WeaponDamageProfile.h"
 #include "Engine/World.h"
 #include "NavigationSystem.h"
 #include "Async/ParallelFor.h"
@@ -198,6 +200,11 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 	PositionDirtyThresholdSq = FMath::Square(Settings->PositionDirtyThreshold);
 	YawDirtyThresholdDeg     = Settings->YawDirtyThresholdDegrees;
+
+	// Structural health rows — index-parallel to the SoA, allocated once.
+	// Server writes via ApplyDamageToEcho; clients mirror via replicated deltas.
+	GetMutableDefault<UATR_HealthSettings>()->ValidateAndClamp();
+	HealthModel.Init(InitializeCount);
 
 	ServerReplicationBudgetMs      = Settings->ServerReplicationBudgetMs;
 	MaxReplicationJobsPerFrame     = Settings->MaxReplicationJobsPerFrame;
@@ -412,6 +419,7 @@ void UATR_EchoSubsystem::Tick(float DeltaTime)
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(Echo_ServerReplication);
 		TickReplicationScheduler(DeltaTime);
+		ReplicateEchoHealthDeltas(); // structural health deltas ride after snapshots
 	}
 }
 
@@ -605,6 +613,13 @@ int32 UATR_EchoSubsystem::AddEcho(FVector3f Position)
 	RuntimeStates[Idx].Tier     = EATR_EchoSimulationTier::Abstract;
 	EchoIdToIndex.Add(NewEchoId, Idx);
 
+	// Defensive: rows are reset on removal (HandleSwapRemove), so a reused row
+	// should already be the healthy baseline. Reset (and re-announce) if not.
+	if (HealthModel.IsRowDamaged(Idx))
+	{
+		HealthModel.ResetEcho(Idx);
+	}
+
 	if (CoarseGrid.IsInitialized())
 		RegisterEntityToCoarseGrid(Idx);
 
@@ -630,6 +645,11 @@ void UATR_EchoSubsystem::RemoveEcho(int32 Index)
 	const int32 RemovedEchoId = EchoIds.IsValidIndex(Index) ? EchoIds[Index] : INDEX_NONE;
 
 	const int32 Last = ActiveEntities - 1; // capture before decrement
+
+	// Mirror the swap in the structural health rows BEFORE the SoA swap below
+	// (the model handles its own row move, delta cleanup, and re-announce).
+	// Server only — client mirrors are corrected by the emitted refresh deltas.
+	HealthModel.HandleSwapRemove(Index, Last);
 
 	// Patch LastLocalEntityScratch to mirror the swap-remove.
 	// Index is deleted; Last moves into Index. If Last was tracked as local, re-add it as Index.
@@ -1560,10 +1580,17 @@ void UATR_EchoSubsystem::UpdateEchoIntent(int32 Index, float Now, float DeltaTim
 		Move.AcceptanceRadius = ReachLocationRadius;
 		S.bSearchActive     = false; // reacquired — abandon any search
 
-		// Within reach → engage melee.
+		// Within reach → engage melee. Structurally gated: an Echo that can
+		// neither grab nor bite (no arms, no jaw) never enters Attack — it just
+		// keeps pressing the chase. FAIL-OPEN: Caps == 0 means the row is
+		// unknown/uninitialized, never a reason to disable attacking.
 		const bool  bMelee   = !CachedSettings || CachedSettings->bEnableMeleeAttack;
 		const float AtkRange = CachedSettings ? CachedSettings->MeleeAttackRange : 220.f;
-		if (bMelee)
+		const uint16 Caps    = HealthModel.GetCapabilityFlags(Index);
+		const bool bCanAttack = Caps == 0
+			|| (Caps & (ATR_EchoCapability::CanAttackStanding |
+			            ATR_EchoCapability::CanAttackCrawling)) != 0;
+		if (bMelee && bCanAttack)
 		{
 			if (const AActor* Tgt = A.ConfirmedVisibleActor.Get())
 			{
@@ -2717,6 +2744,154 @@ void UATR_EchoSubsystem::ForceDestroyEcho(AATR_ActiveEcho* Actor)
 	if (!ensureAlways(IndexToActor[Idx] == nullptr)) return;
 
 	RemoveEcho(Idx);
+}
+
+// ─── Structural Health ───────────────────────────────────────────────────────
+
+bool UATR_EchoSubsystem::ApplyDamageToEcho(int32 SoAIndex, const FATR_DamageEvent& Event)
+{
+	// Server authority only. Clients hold a read-only replicated mirror.
+	if (!GetWorld() || GetWorld()->GetNetMode() == NM_Client) return false;
+	if (SoAIndex < 0 || SoAIndex >= ActiveEntities) return false;
+	if (HealthModel.IsDead(SoAIndex)) return false;
+	if (Event.Region == EATR_BodyRegion::None) return false;
+
+	const UATR_HealthSettings* HS = GetDefault<UATR_HealthSettings>();
+
+	// Resolve damage components: profile preferred (data-driven), explicit
+	// fields otherwise — same convention as the human pipeline.
+	struct FResolved { EATR_DamageType Type; float Severity; };
+	TArray<FResolved, TInlineAllocator<4>> Resolved;
+	float DismemberChance = 0.f;
+
+	if (const UATR_WeaponDamageProfile* Profile = Event.WeaponProfile)
+	{
+		for (const FATR_WeaponDamageComponent& C : Profile->DamageComponents)
+		{
+			Resolved.Add({ C.DamageType, FMath::Clamp(C.Severity01 * Event.EventScale01, 0.f, 1.f) });
+		}
+		DismemberChance = Profile->DismemberChance01;
+	}
+	else if (Event.DamageType != EATR_DamageType::None)
+	{
+		Resolved.Add({ Event.DamageType, FMath::Clamp(Event.Severity01 * Event.EventScale01, 0.f, 1.f) });
+		// Profile-less events carry no dismember data — limb severing requires
+		// a profile (gun/axe/etc.) so debug melee MUST set DebugMeleeProfile to
+		// dismember anything; raw explicit damage just erodes brain / cosmetics.
+		DismemberChance = 0.f;
+	}
+
+	if (Resolved.IsEmpty()) return false;
+	DismemberChance = FMath::Clamp(DismemberChance * HS->EchoDismemberScale, 0.f, 1.f);
+
+	const uint32 PartBit = ATR_EchoParts::PartBitsForBodyRegion(Event.Region);
+
+	for (const FResolved& C : Resolved)
+	{
+		if (C.Severity <= 0.f) continue;
+
+		switch (Event.Region)
+		{
+		case EATR_BodyRegion::Head:
+			// The ONLY path to Echo death: erode the brain. A severing hit can
+			// also take the head outright (which zeroes the brain — rule).
+			HealthModel.ApplyBrainDamage(SoAIndex, C.Severity * HS->EchoBrainDamageScale);
+			if (DismemberChance > 0.f && FMath::FRand() < DismemberChance * C.Severity)
+			{
+				HealthModel.SeverParts(SoAIndex, ATR_EchoParts::HeadPresent);
+			}
+			break;
+
+		case EATR_BodyRegion::Chest:
+		case EATR_BodyRegion::Abdomen:
+		case EATR_BodyRegion::Pelvis:
+		{
+			// Deep torso trauma can destroy spine function (crawler/twitcher per
+			// UATR_HealthSettings). Slashes never reach the spine; pressure does.
+			const bool bSpineCapable =
+				C.Type == EATR_DamageType::Ballistic ||
+				C.Type == EATR_DamageType::Crush     ||
+				C.Type == EATR_DamageType::Explosion;
+			if (bSpineCapable && C.Severity >= HS->EchoSpineDestroySeverity)
+			{
+				HealthModel.DestroyFunction(SoAIndex, ATR_EchoParts::SpineFunctional);
+			}
+			break;
+		}
+
+		default:
+			// Neck and limb regions: severing roll. Distal parts go with it.
+			if (PartBit != 0 && DismemberChance > 0.f && FMath::FRand() < DismemberChance * C.Severity)
+			{
+				HealthModel.SeverParts(SoAIndex, PartBit);
+			}
+			break;
+		}
+
+		// Cosmetic accumulation for gore presentation (decals/exposed bone).
+		FATR_EchoDetailedDamageRecord& Detail = HealthModel.GetOrCreateDetailRecord(SoAIndex);
+		Detail.AccumulatedDamage = static_cast<uint8>(
+			FMath::Min(255, static_cast<int32>(Detail.AccumulatedDamage) + FMath::RoundToInt(C.Severity * 64.f)));
+	}
+
+	if (HS->bLogDamageEvents)
+	{
+		UE_LOGFMT(LogATR_Health, Log, "EchoDamage Index={Index} Region={Region} Brain={Brain} Caps={Caps} Dead={Dead}",
+			("Index", SoAIndex),
+			("Region", static_cast<int32>(Event.Region)),
+			("Brain", HealthModel.GetBrainIntegrity(SoAIndex)),
+			("Caps", HealthModel.GetCapabilityFlags(SoAIndex)),
+			("Dead", HealthModel.IsDead(SoAIndex)));
+	}
+
+	if (HealthModel.IsDead(SoAIndex))
+	{
+		// Flush the EchoKilled delta to clients NOW — RemoveEcho recycles this
+		// SoA row and would otherwise invalidate the queued kill notification.
+		ReplicateEchoHealthDeltas(/*bFlushAll =*/ true);
+		ForceDestroyEcho(SoAIndex);
+		return true;
+	}
+
+	// Surviving structural damage: promoted actors re-derive movement from the
+	// fresh capability flags (limp/crawl/immobile) immediately.
+	if (AATR_ActiveEcho* Actor = IndexToActor.IsValidIndex(SoAIndex) ? IndexToActor[SoAIndex] : nullptr)
+	{
+		Actor->ApplyStructuralStateToMovement();
+	}
+
+	return true;
+}
+
+void UATR_EchoSubsystem::ReplicateEchoHealthDeltas(const bool bFlushAll)
+{
+	if (HealthModel.NumPendingDeltas() == 0) return;
+	if (!GetWorld() || GetWorld()->GetNetMode() == NM_Client) return;
+
+	const int32 MaxPerUpdate = GetDefault<UATR_HealthSettings>()->MaxStructuralDeltasPerUpdate;
+
+	// Components are (re)gathered here because flush calls can arrive outside
+	// the scheduler (death path) when the scratch list may be stale.
+	GatherReplicationClients();
+
+	do
+	{
+		HealthDeltaScratch.Reset();
+		HealthModel.DrainPendingDeltas(HealthDeltaScratch, MaxPerUpdate);
+		if (HealthDeltaScratch.IsEmpty()) break;
+
+		// Reliable broadcast: structural changes are rare, small, and must
+		// arrive ordered. Standalone has no remote clients — drained deltas
+		// simply expire (the local model is already authoritative).
+		for (UATR_EchoReplicationComponent* Comp : ReplicationClientsScratch)
+		{
+			if (Comp)
+			{
+				Comp->Client_EchoHealthDeltas(HealthDeltaScratch);
+			}
+		}
+	}
+	while (bFlushAll && HealthModel.NumPendingDeltas() > 0);
 }
 
 // ─── Replication Scheduler ───────────────────────────────────────────────────

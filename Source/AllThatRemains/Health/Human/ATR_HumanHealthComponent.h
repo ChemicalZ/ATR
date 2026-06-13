@@ -85,9 +85,12 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE(FATR_OnDerivedStatsChangedSignature);
 //   severity/depth/penetration → wound(s) → immediate conditions/organ damage
 //   → pain/shock spike → derived stats recalc → log.
 //
-// Server-authoritative; simulation only runs with authority. Replication of
-// human state is deliberately deferred to the linking pass (see design
-// amendments doc).
+// Server-authoritative; simulation only runs with authority. The linking pass
+// replicates the OBSERVABLE state (vitals, survival, derived stats, blood,
+// wounds, conditions, impairments, death/consciousness) so client HUD/anim can
+// read the same getters as the server. Diseases and substances stay
+// server-only (they carry definition pointers and drive simulation, not
+// presentation). All mutation APIs remain authority-gated.
 //
 // All tunables: UATR_HealthSettings + DataAssets. Nothing hardcoded except
 // code-default data rows used when no DataAsset is assigned.
@@ -102,6 +105,7 @@ public:
 
 	virtual void BeginPlay() override;
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	// ── Combat entry point ─────────────────────────────────────────────────
 
@@ -265,16 +269,19 @@ private:
 	bool HasImpairment(EATR_ImpairmentType Type, EATR_BodyRegion Region) const;
 
 	// ── State ──────────────────────────────────────────────────────────────
+	// Observable state replicates (server writes, clients read via the public
+	// getters). Property replication only ships deltas on change, and the slow
+	// containers (wounds/conditions) mutate at tick-bucket cadence, not per frame.
 
-	UPROPERTY() FATR_HumanVitals Vitals;
-	UPROPERTY() FATR_HumanSurvivalStats Survival;
-	UPROPERTY() FATR_BloodState Blood;
-	UPROPERTY() FATR_DerivedCombatStats Derived;
-	UPROPERTY() TArray<FATR_Wound> Wounds;
-	UPROPERTY() TArray<FATR_Condition> Conditions;
-	UPROPERTY() TArray<FATR_ActiveDisease> Diseases;
-	UPROPERTY() TArray<FATR_ActiveSubstance> Substances;
-	UPROPERTY() TArray<FATR_PermanentImpairment> Impairments;
+	UPROPERTY(Replicated) FATR_HumanVitals Vitals;
+	UPROPERTY(Replicated) FATR_HumanSurvivalStats Survival;
+	UPROPERTY(Replicated) FATR_BloodState Blood;
+	UPROPERTY(Replicated) FATR_DerivedCombatStats Derived;
+	UPROPERTY(Replicated) TArray<FATR_Wound> Wounds;
+	UPROPERTY(Replicated) TArray<FATR_Condition> Conditions;
+	UPROPERTY() TArray<FATR_ActiveDisease> Diseases;       // server-only (definition ptrs)
+	UPROPERTY() TArray<FATR_ActiveSubstance> Substances;   // server-only (definition ptrs)
+	UPROPERTY(Replicated) TArray<FATR_PermanentImpairment> Impairments;
 
 	UPROPERTY() FATR_EnvironmentState Environment;
 
@@ -294,8 +301,17 @@ private:
 	};
 	FSubstanceTotals SubstanceTotals;
 
+	// Death/consciousness replicate with RepNotify so the client-side delegates
+	// (OnDeath / OnConsciousnessChanged) fire for HUD/anim, mirroring the server.
+	UPROPERTY(ReplicatedUsing = OnRep_DeathCause)
 	EATR_DeathCause DeathCause = EATR_DeathCause::None;
+
+	UPROPERTY(ReplicatedUsing = OnRep_Unconscious)
 	bool bUnconscious = false;
+
+	UFUNCTION() void OnRep_DeathCause();
+	UFUNCTION() void OnRep_Unconscious();
+
 	bool bSleeping = false;
 	bool bShivering = false;
 	float Exertion01 = 0.f;
@@ -307,4 +323,19 @@ private:
 
 	// Bucket accumulators.
 	float FastAcc = 0.f;
-	
+	float MediumAcc = 0.f;
+	float SlowAcc = 0.f;
+
+	int32 NextWoundId = 0;
+
+	// Cached settings (read once at BeginPlay; settings are DefaultConfig).
+	UPROPERTY() TObjectPtr<const UATR_HealthSettings> Settings;
+
+	// Data tables resolved once at BeginPlay (may stay null — code defaults).
+	UPROPERTY() TObjectPtr<const UATR_BodyRegionDefinition> RegionDef;
+	UPROPERTY() TObjectPtr<const UATR_DamageTypeDefinition> DamageTypeDef;
+	UPROPERTY() TObjectPtr<const UATR_ConditionDefinition> ConditionDef;
+
+	// Last damage event summary for the debug requirements.
+	FString LastDamageDebug;
+};

@@ -34,8 +34,14 @@ void UATR_HealthSettings::ValidateAndClamp()
 	SepsisThreshold = FMath::Clamp(SepsisThreshold, 0.f, FatalInfection);
 
 	MinFingersForStrongGrab = FMath::Clamp(MinFingersForStrongGrab, 0, 5);
+	EchoBrainDamageScale = FMath::Clamp(EchoBrainDamageScale, 0.f, 1.f);
+	EchoDismemberScale = FMath::Clamp(EchoDismemberScale, 0.f, 4.f);
+	EchoSpineDestroySeverity = FMath::Clamp(EchoSpineDestroySeverity, 0.f, 1.f);
 	MaxStructuralDeltasPerUpdate = FMath::Clamp(MaxStructuralDeltasPerUpdate, 1, 1024);
 	MaxPendingDeltas = FMath::Clamp(MaxPendingDeltas, 16, 65536);
+
+	// Debug melee ray. Damage payload lives on DebugMeleeProfile asset.
+	DebugMeleeRange = FMath::Clamp(DebugMeleeRange, 10.f, 100000.f);
 }
 
 #if WITH_EDITOR

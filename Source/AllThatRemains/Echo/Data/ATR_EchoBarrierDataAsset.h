@@ -4,7 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
-#include "../ATR_EchoRuntimeTypes.h"
+#include "AllThatRemains/Echo/ATR_EchoRuntimeTypes.h"
 #include "ATR_EchoBarrierDataAsset.generated.h"
 
 // Per-barrier-type interaction description (design doc: Data Asset Guidance). Make one

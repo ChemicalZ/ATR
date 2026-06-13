@@ -21,6 +21,7 @@ struct FATR_EchoMeleeTaskInstanceData
 	UPROPERTY(Transient) bool  bGrabbed     = false;
 	UPROPERTY(Transient) float LastGrabTime = -1000.f;
 	UPROPERTY(Transient) float LastBiteTime = -1000.f;
+	UPROPERTY(Transient) float GrabStartTime = -1.f; // server-time when current grab began
 };
 
 // Melee grab → bite → pull, layered ON TOP of the chase. This task NEVER stops (always Running) so

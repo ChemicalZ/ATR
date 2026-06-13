@@ -6,6 +6,7 @@
 #include "Containers/BitArray.h"
 #include "Subsystems/WorldSubsystem.h"
 #include "ATR_EchoRuntimeTypes.h"
+#include "../Health/Echo/ATR_EchoHealthModel.h"
 #include "ATR_EchoSubsystem.generated.h"
 
 class UATR_EchoReplicationComponent;
@@ -325,6 +326,25 @@ public:
 	void ReportEchoMoveResult(int32 EchoId, bool bSuccess, EATR_MoveFailureReason Reason,
 	                          const FVector& Location, AActor* BlockingActor, float TimeSeconds);
 
+	// --- Structural health (linking pass) ---
+	// One FATR_EchoHealthModel row per SoA row, index-parallel. The SERVER is
+	// the only writer (damage entry point below); clients hold a mirror that is
+	// fed exclusively by FATR_EchoHealthDelta RPCs (see the replication
+	// component) and must never call the damage API.
+
+	FATR_EchoHealthModel&       GetHealthModel()       { return HealthModel; }
+	const FATR_EchoHealthModel& GetHealthModel() const { return HealthModel; }
+
+	// The single combat entry point for damage AGAINST an Echo (debug melee
+	// ray, weapons, explosions). Maps the shared damage vocabulary
+	// (FATR_DamageEvent: region + profile/explicit fields) onto structural
+	// damage: head hits erode the brain, severe hits sever parts, deep torso
+	// trauma can destroy the spine. Brain destruction = death (the only Echo
+	// death) → the Echo is force-destroyed. Server only — returns false on
+	// clients. Returns true if the hit was applied.
+	UFUNCTION(BlueprintCallable, Category = "Echo|Health")
+	bool ApplyDamageToEcho(int32 SoAIndex, const FATR_DamageEvent& Event);
+
 	// --- Public API ---
 
 	int32 AddEcho(FVector3f Position);
@@ -630,6 +650,18 @@ public:
 	void TickReplicationScheduler(float DeltaTime);
 
 private:
+	// Server-authoritative structural health rows (clients: replicated mirror).
+	FATR_EchoHealthModel HealthModel;
+
+	// Scratch for draining health deltas each replication pass.
+	TArray<FATR_EchoHealthDelta> HealthDeltaScratch;
+
+	// Drain up to MaxStructuralDeltasPerUpdate pending health deltas and send
+	// them to every connected client (reliable — structural changes are rare
+	// and must arrive in order). Standalone drains and drops (no clients).
+	// bFlushAll forces a complete drain (used just before a killed Echo's SoA
+	// row is recycled, so the EchoKilled delta can't be invalidated by reuse).
+	void ReplicateEchoHealthDeltas(bool bFlushAll = false);
 	void RegisterEntityToCoarseGrid(int32 EntityIndex);
 	void UnregisterEntityFromCoarseGrid(int32 EntityIndex);
 	void MoveEntityCoarseCell(int32 EntityIndex, int32 NewCellId);

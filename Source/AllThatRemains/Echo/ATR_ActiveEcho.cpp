@@ -2,9 +2,13 @@
 
 #include "ATR_ActiveEcho.h"
 #include "ATR_EchoSubsystem.h"
+#include "ATR_EchoSettings.h"
+#include "../Health/Human/ATR_HumanHealthComponent.h"
+#include "../Health/Data/ATR_WeaponDamageProfile.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Net/UnrealNetwork.h"
 #include "Components/CapsuleComponent.h"
+#include "Logging/StructuredLog.h"
 
 // ─── Construction ─────────────────────────────────────────────────────────────
 
@@ -36,6 +40,12 @@ AATR_ActiveEcho::AATR_ActiveEcho()
 void AATR_ActiveEcho::BeginPlay()
 {
 	Super::BeginPlay();
+
+	// Capture the Blueprint-tuned baseline so limp/crawl scaling never compounds.
+	if (const UCharacterMovementComponent* CMC = GetCharacterMovement())
+	{
+		BaseMaxWalkSpeed = CMC->MaxWalkSpeed;
+	}
 }
 
 void AATR_ActiveEcho::Tick(float DeltaTime)
@@ -51,6 +61,7 @@ void AATR_ActiveEcho::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutL
 	DOREPLIFETIME(AATR_ActiveEcho, SourceIndex);
 	DOREPLIFETIME(AATR_ActiveEcho, AnimStateCache);
 	DOREPLIFETIME(AATR_ActiveEcho, ReplicatedIntent);
+	DOREPLIFETIME(AATR_ActiveEcho, CurrentGrip);
 }
 
 void AATR_ActiveEcho::SetEchoIntentForPresentation(EATR_EchoIntent NewIntent)
@@ -125,6 +136,7 @@ void AATR_ActiveEcho::EnterPool()
 	SourceIndex      = INDEX_NONE;
 	AnimStateCache   = 0;
 	ReplicatedIntent = EATR_EchoIntent::Idle;
+	CurrentGrip      = EATR_EchoGripType::None;
 }
 
 void AATR_ActiveEcho::InitFromSoA(const UATR_EchoSubsystem* Sub, int32 Index)
@@ -148,6 +160,13 @@ void AATR_ActiveEcho::InitFromSoA(const UATR_EchoSubsystem* Sub, int32 Index)
 	SetActorHiddenInGame(false);
 	SetActorEnableCollision(true);
 	SetActorTickEnabled(true);
+
+	// SourceIndex is set by PromoteToActive before this call on the promotion
+	// path, but seed it defensively so the structural lookup below can't miss.
+	SourceIndex = Index;
+
+	// A damaged Echo promotes with its limp/crawl speed already applied.
+	ApplyStructuralStateToMovement();
 	// AI starts via controller OnPossess — subsystem calls Possess() after InitFromSoA().
 }
 
@@ -165,24 +184,326 @@ void AATR_ActiveEcho::WriteBackToSoA(UATR_EchoSubsystem* Sub) const
 		Sub->Velocities[SourceIndex] = FVector3f(CMC->Velocity);
 }
 
-// --- Combat hooks (native defaults; override in Blueprint for real effects) ---
+// --- Combat hooks (server-side resolution through the Echo structural health model) ---
 
 bool AATR_ActiveEcho::TryGrabTarget_Implementation(AActor* Target)
 {
-	// Default: the grab "takes" as long as there's a valid target. Override to gate on facing,
-	// animation windows, or anti-spam and to attach/begin the grab montage.
-	return IsValid(Target);
+	if (!HasAuthority() || !IsValid(Target))
+	{
+		return false;
+	}
+
+	const FATR_GrabResult Result = ResolveGrabAttempt(Target);
+	CurrentGrip = Result.Grip;
+
+	UE_LOGFMT(LogATR_EchoCombat, Log, "Grab Echo={Echo} Target={Target} Outcome={Outcome} Grip={Grip} Scratched={Scratched}",
+		("Echo", SourceIndex),
+		("Target", GetNameSafe(Target)),
+		("Outcome", static_cast<int32>(Result.Outcome)),
+		("Grip", static_cast<int32>(Result.Grip)),
+		("Scratched", Result.bScratchedTarget));
+
+	return Result.IsGrabbed();
+}
+
+FATR_GrabResult AATR_ActiveEcho::ResolveGrabAttempt(AActor* Target)
+{
+	FATR_GrabResult Result;
+
+	const UATR_EchoSettings* S = GetDefault<UATR_EchoSettings>();
+	UATR_EchoSubsystem* Sub = GetWorld() ? GetWorld()->GetSubsystem<UATR_EchoSubsystem>() : nullptr;
+	if (!S || !Sub || SourceIndex == INDEX_NONE)
+	{
+		Result.Outcome = EATR_GrabOutcome::Missed;
+		return Result;
+	}
+
+	const FATR_EchoHealthModel& Model = Sub->GetHealthModel();
+
+	// Physically incapable — no arms/hands left at all. FAIL-OPEN on unknown
+	// rows (flags 0): missing data must never disarm a healthy Echo.
+	const uint16 Caps = Model.GetCapabilityFlags(SourceIndex);
+	if (Caps != 0 && !(Caps & ATR_EchoCapability::CanGrabAny))
+	{
+		Result.Outcome = EATR_GrabOutcome::NoGrip;
+		return Result;
+	}
+
+	// Facing cone — lunging at someone behind you doesn't connect.
+	const FVector ToTarget = (Target->GetActorLocation() - GetActorLocation()).GetSafeNormal2D();
+	const float CosHalfCone = FMath::Cos(FMath::DegreesToRadians(S->GrabFacingConeDegrees * 0.5f));
+	if (FVector::DotProduct(GetActorForwardVector().GetSafeNormal2D(), ToTarget) < CosHalfCone)
+	{
+		Result.Outcome = EATR_GrabOutcome::BadAngle;
+		return Result;
+	}
+
+	// Whiff roll — clumsy dead hands. A miss can still rake a scratch.
+	if (FMath::FRand() < S->GrabMissChance)
+	{
+		Result.Outcome = EATR_GrabOutcome::Missed;
+		if (FMath::FRand() < S->ScratchOnMissChance)
+		{
+			Result.bScratchedTarget = ApplyWoundToTarget(Target, EATR_BiteWound::Scratch);
+		}
+		return Result;
+	}
+
+	// Grip strength: any hand with enough fingers (UATR_HealthSettings.
+	// MinFingersForStrongGrab) holds strong; otherwise the grab takes weak.
+	const bool bStrong = Model.CanGrabStrong(SourceIndex, /*bLeftHand =*/ true)
+	                  || Model.CanGrabStrong(SourceIndex, /*bLeftHand =*/ false);
+	Result.Outcome = bStrong ? EATR_GrabOutcome::GrabbedStrong : EATR_GrabOutcome::GrabbedWeak;
+	Result.Grip    = bStrong ? EATR_EchoGripType::Strong : EATR_EchoGripType::Weak;
+	return Result;
 }
 
 bool AATR_ActiveEcho::TryBiteTarget_Implementation(AActor* Target)
 {
-	// Default: the bite lands. Override to apply damage / play the bite montage.
-	return IsValid(Target);
+	if (!HasAuthority() || !IsValid(Target))
+	{
+		return false;
+	}
+
+	const UATR_EchoSettings* S = GetDefault<UATR_EchoSettings>();
+	UATR_EchoSubsystem* Sub = GetWorld() ? GetWorld()->GetSubsystem<UATR_EchoSubsystem>() : nullptr;
+	if (!S || !Sub || SourceIndex == INDEX_NONE)
+	{
+		return false;
+	}
+
+	// No jaw (or no neck function) = no bite. The grab can still hold.
+	// FAIL-OPEN on unknown rows (flags 0) — see ResolveGrabAttempt.
+	const uint16 BiteCaps = Sub->GetHealthModel().GetCapabilityFlags(SourceIndex);
+	if (BiteCaps != 0 && !(BiteCaps & ATR_EchoCapability::CanBite))
+	{
+		UE_LOGFMT(LogATR_EchoCombat, Verbose, "Bite Echo={Echo} blocked: no jaw/neck", ("Echo", SourceIndex));
+		return false;
+	}
+
+	// Wound tier — a strong grip holds the victim still for a real laceration.
+	const bool  bStrongGrip = CurrentGrip == EATR_EchoGripType::Strong;
+	const float LacChance   = bStrongGrip ? S->BiteLacerationChanceStrongGrip : S->BiteLacerationChanceWeakGrip;
+	const float DeepChance  = bStrongGrip ? S->BiteDeepScratchChanceStrongGrip : S->BiteDeepScratchChanceWeakGrip;
+
+	const float Roll = FMath::FRand();
+	const EATR_BiteWound Tier =
+		(Roll < LacChance)              ? EATR_BiteWound::Laceration :
+		(Roll < LacChance + DeepChance) ? EATR_BiteWound::DeepScratch :
+		                                  EATR_BiteWound::Scratch;
+
+	const bool bLanded = ApplyWoundToTarget(Target, Tier);
+
+	UE_LOGFMT(LogATR_EchoCombat, Log, "Bite Echo={Echo} Target={Target} Grip={Grip} Tier={Tier} Landed={Landed}",
+		("Echo", SourceIndex),
+		("Target", GetNameSafe(Target)),
+		("Grip", static_cast<int32>(CurrentGrip)),
+		("Tier", static_cast<int32>(Tier)),
+		("Landed", bLanded));
+
+	return bLanded;
 }
 
-void AATR_ActiveEcho::PullTarget_Implementation(AActor* /*Target*/, float /*Strength*/)
+void AATR_ActiveEcho::PullTarget_Implementation(AActor* Target, float Strength)
 {
-	// Default: no-op. Override to pull the target in (root motion, physics constraint, or a
-	// movement nudge). Left empty so the default melee flow never moves the player unexpectedly.
+	if (!HasAuthority() || !IsValid(Target) || CurrentGrip == EATR_EchoGripType::None)
+	{
+		return;
+	}
+
+	const UATR_EchoSettings* S = GetDefault<UATR_EchoSettings>();
+	const UWorld* World = GetWorld();
+	if (!S || !World)
+	{
+		return;
+	}
+
+	const float GripScale = CurrentGrip == EATR_EchoGripType::Weak ? S->WeakGripPullScale : 1.f;
+	const float PullSpeed = S->MeleePullSpeed * FMath::Max(Strength, 0.f) * GripScale;
+	if (PullSpeed <= 0.f)
+	{
+		return;
+	}
+
+	const FVector Dir = (GetActorLocation() - Target->GetActorLocation()).GetSafeNormal2D();
+	if (Dir.IsNearlyZero())
+	{
+		return;
+	}
+
+	// Per-second velocity drag: PullTarget is called every melee-task tick, so
+	// scale by frame time — sustained pulling accelerates at ~PullSpeed cm/s².
+	const float Dt = World->GetDeltaSeconds();
+
+	if (const ACharacter* Char = Cast<ACharacter>(Target))
+	{
+		if (UCharacterMovementComponent* CMC = Char->GetCharacterMovement())
+		{
+			CMC->AddImpulse(Dir * PullSpeed * Dt, /*bVelocityChange =*/ true);
+			UE_LOGFMT(LogATR_EchoCombat, VeryVerbose, "Pull Echo={Echo} Target={Target} Speed={Speed}",
+				("Echo", SourceIndex), ("Target", GetNameSafe(Target)), ("Speed", PullSpeed));
+		}
+		return;
+	}
+
+	// Non-character fallback: physics-simulated roots get a velocity-change impulse.
+	if (UPrimitiveComponent* Prim = Cast<UPrimitiveComponent>(Target->GetRootComponent()))
+	{
+		if (Prim->IsSimulatingPhysics())
+		{
+			Prim->AddImpulse(Dir * PullSpeed * Dt, NAME_None, /*bVelChange =*/ true);
+		}
+	}
+}
+
+void AATR_ActiveEcho::NotifyGrabReleased()
+{
+	if (CurrentGrip != EATR_EchoGripType::None)
+	{
+		UE_LOGFMT(LogATR_EchoCombat, Verbose, "GrabReleased Echo={Echo}", ("Echo", SourceIndex));
+		CurrentGrip = EATR_EchoGripType::None;
+	}
+}
+
+bool AATR_ActiveEcho::ApplyWoundToTarget(AActor* Target, const EATR_BiteWound Tier)
+{
+	if (Tier == EATR_BiteWound::Miss || !IsValid(Target))
+	{
+		return false;
+	}
+
+	UATR_HumanHealthComponent* Health = Target->FindComponentByClass<UATR_HumanHealthComponent>();
+	if (!Health)
+	{
+		return false; // not a simulated human — nothing to wound
+	}
+
+	const UATR_EchoSettings* S = GetDefault<UATR_EchoSettings>();
+	if (!S)
+	{
+		return false;
+	}
+
+	// Tier scale: laceration is the full bite, lower tiers are partial. Knobs live
+	// on the EchoSettings so designers tune tier strength without touching code.
+	const float TierScale = Tier == EATR_BiteWound::Laceration  ? S->LacerationTierScale
+	                      : Tier == EATR_BiteWound::DeepScratch ? S->DeepScratchTierScale
+	                      :                                       S->ScratchTierScale;
+
+	// Resolve the data-driven bite profile once (server only). Profile is the
+	// SINGLE source of truth for bite damage payload (severity/penetration/
+	// contamination). No profile = no damage applied (linking pass keeps the
+	// system content-free without baking duplicate fallback values).
+	if (!bBiteProfileResolved)
+	{
+		ResolvedBiteProfile  = S->BiteDamageProfile.LoadSynchronous();
+		bBiteProfileResolved = true;
+	}
+	if (!ResolvedBiteProfile)
+	{
+		UE_LOGFMT(LogATR_EchoCombat, Warning, "Bite Echo={Echo} skipped: Echo|Combat.BiteDamageProfile not assigned",
+			("Echo", SourceIndex));
+		return false;
+	}
+
+	FATR_DamageEvent Event;
+	Event.Instigator    = this;
+	Event.Region        = PickBiteRegion();
+	Event.WeaponProfile = ResolvedBiteProfile;
+	Event.EventScale01  = TierScale;
+
+	return Health->ApplyDamageEvent(Event).Num() > 0;
+}
+
+EATR_BodyRegion AATR_ActiveEcho::PickBiteRegion()
+{
+	// Code-default bite-target weighting: an echo latches onto whatever is
+	// nearest while dragging someone in — forearms first, then upper arms and
+	// shoulders/chest, hands, neck. Promote to a DataAsset if designers need
+	// per-archetype tables.
+	struct FWeighted { EATR_BodyRegion Region; float Weight; };
+	static constexpr FWeighted Table[] =
+	{
+		{ EATR_BodyRegion::LeftForearm,   16.f },
+		{ EATR_BodyRegion::RightForearm,  16.f },
+		{ EATR_BodyRegion::LeftUpperArm,  12.f },
+		{ EATR_BodyRegion::RightUpperArm, 12.f },
+		{ EATR_BodyRegion::Chest,         12.f },
+		{ EATR_BodyRegion::LeftHand,       8.f },
+		{ EATR_BodyRegion::RightHand,      8.f },
+		{ EATR_BodyRegion::Neck,           8.f },
+		{ EATR_BodyRegion::Abdomen,        5.f },
+		{ EATR_BodyRegion::Head,           3.f },
+	};
+
+	float Total = 0.f;
+	for (const FWeighted& W : Table) { Total += W.Weight; }
+
+	float Roll = FMath::FRand() * Total;
+	for (const FWeighted& W : Table)
+	{
+		Roll -= W.Weight;
+		if (Roll <= 0.f) { return W.Region; }
+	}
+	return EATR_BodyRegion::Chest;
+}
+
+void AATR_ActiveEcho::ApplyStructuralStateToMovement()
+{
+	UCharacterMovementComponent* CMC = GetCharacterMovement();
+	UATR_EchoSubsystem* Sub = GetWorld() ? GetWorld()->GetSubsystem<UATR_EchoSubsystem>() : nullptr;
+	if (!CMC || !Sub || SourceIndex == INDEX_NONE)
+	{
+		return;
+	}
+
+	if (BaseMaxWalkSpeed <= 0.f)
+	{
+		BaseMaxWalkSpeed = CMC->MaxWalkSpeed;
+	}
+
+	const FATR_EchoHealthModel& Model = Sub->GetHealthModel();
+	const uint16 Caps = Model.GetCapabilityFlags(SourceIndex);
+
+	// FAIL-OPEN: an undamaged row (or one whose flags aren't known on this
+	// machine, Caps == 0) must behave exactly like pre-linking — restore the
+	// baseline and never constrain. This also heals pool actors that last
+	// hosted a crawler/immobile Echo and would otherwise keep its 0 speed.
+	using namespace ATR_EchoCapability;
+	if (Caps == 0 || !Model.IsRowDamaged(SourceIndex))
+	{
+		if (BaseMaxWalkSpeed > 0.f)
+		{
+			CMC->MaxWalkSpeed = BaseMaxWalkSpeed;
+		}
+		return;
+	}
+
+	const UATR_EchoSettings* S = GetDefault<UATR_EchoSettings>();
+
+	if (Caps & IsDead)
+	{
+		CMC->MaxWalkSpeed = 0.f;
+		CMC->StopMovementImmediately();
+	}
+	else if (Caps & CanRun)
+	{
+		CMC->MaxWalkSpeed = BaseMaxWalkSpeed; // locomotion chain intact
+	}
+	else if (Caps & CanWalk)
+	{
+		CMC->MaxWalkSpeed = BaseMaxWalkSpeed * (S ? S->LimpSpeedScale : 0.6f); // one bad leg — limp
+	}
+	else if (Caps & CanCrawl)
+	{
+		CMC->MaxWalkSpeed = S ? S->CrawlSpeed : 60.f; // dragging by the arms
+	}
+	else
+	{
+		// Immobile (live brain, but no walk and no crawl). Don't StopMovementImmediately —
+		// the capsule stays so the player can still push past, and AI velocity stays valid
+		// for any cosmetic twitch. Just floor the speed.
+		CMC->MaxWalkSpeed = S ? FMath::Max(10.f, S->CrawlSpeed * 0.25f) : 15.f;
+	}
 }
 

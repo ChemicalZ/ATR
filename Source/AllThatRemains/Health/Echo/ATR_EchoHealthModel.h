@@ -36,6 +36,16 @@ public:
 	// Reuse a row for a newly spawned Echo (pooling); emits a refresh delta.
 	void ResetEcho(int32 EchoIndex);
 
+	// Mirror the subsystem's swap-remove (RemoveEcho): row LastIndex moves into
+	// RemovedIndex. Pending deltas for both rows are dropped (the removed Echo
+	// despawns via snapshots; the moved Echo gets a FullStructuralRefresh under
+	// its new index if it carries damage). Server-side only.
+	void HandleSwapRemove(int32 RemovedIndex, int32 LastIndex);
+
+	// True when this row differs from the healthy baseline (worth replicating
+	// to a newly-relevant client).
+	bool IsRowDamaged(int32 EchoIndex) const;
+
 	// ── Structural damage entry points (all server-side, event-driven) ─────
 
 	// Brain damage 0..1 of total integrity. The ONLY path to death.
@@ -84,6 +94,10 @@ public:
 	// Full-state delta for newly-relevant or out-of-sync clients.
 	FATR_EchoHealthDelta MakeFullRefreshDelta(int32 EchoIndex) const;
 
+	// CLIENT-side apply of a server delta. Drops stale/out-of-order deltas via
+	// the per-Echo sequence (serial-number wrap-aware). Never emits new deltas.
+	void ApplyDeltaFromServer(const FATR_EchoHealthDelta& Delta);
+
 	// ── Debug ──────────────────────────────────────────────────────────────
 
 	FString GetDebugString(int32 EchoIndex) const;
@@ -104,4 +118,9 @@ private:
 	TMap<int32, FATR_EchoDetailedDamageRecord> DetailRecords;
 
 	TArray<FATR_EchoHealthDelta> PendingDeltas;
+
+	// True only while Init() computes the healthy baseline for the whole
+	// population — there is nothing to replicate, so EmitDelta is a no-op
+	// (otherwise 10k rows flood and overflow-collapse the queue at startup).
+	bool bSuppressDeltaEmission = false;
 };

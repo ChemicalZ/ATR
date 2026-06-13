@@ -99,4 +99,6 @@ materials, body regions) is in DataAssets as the doc requires.
 | Base + derived stats | `Health/Human/ATR_HumanStats.h` |
 | Human simulation component (combat pipeline, tick buckets, treatment, healing, death) | `Health/Human/ATR_HumanHealthComponent.h/.cpp` |
 | Tunables (rates, fatal thresholds, tick Hz, Echo rules, debug toggles) | `Health/ATR_HealthSettings.h/.cpp` |
-| Content DataAssets | `Health/Data/AT
+| Content DataAssets | `Health/Data/ATR_*Definition.h`, `ATR_WeaponDamageProfile.h` |
+| Echo SoA, masks, capability flags, deltas | `Health/Echo/ATR_EchoHealthTypes.h` |
+| Echo structural model (damage, recompute, delta queue) | `Health/Echo/ATR_EchoHealthModel.h/.cpp` |

@@ -11,6 +11,7 @@ class AATR_ActiveEcho;
 class AATR_EchoAIController;
 class UATR_EchoSearchPatternDataAsset;
 class UATR_EchoObstacleBehaviorDataAsset;
+class UATR_WeaponDamageProfile;
 
 // Project Settings > AllThatRemains > Echo Horde
 //
@@ -769,6 +770,76 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0",
 		ToolTip="Strength passed to the pawn's PullTarget hook while grabbed (your pull/root-motion logic scales off this)."))
 	float MeleePullStrength = 1.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.5", ClampMax="120.0", ForceUnits="s",
+		ToolTip="Maximum seconds a single grab can persist before forced release. Prevents bBlockDemotion from stranding when target stays in a BadAngle/cone-fail loop close to the echo."))
+	float MaxGrabHoldSeconds = 15.f;
+
+	// ── Echo|Combat — resolution (grab/bite outcomes, server-side C++) ─────────
+	// Resolved entirely on the server through the Echo health model: missing
+	// arms can't grab, missing fingers grab weak, no jaw = no bite.
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="360.0", ForceUnits="deg",
+		ToolTip="Full facing cone for a grab attempt — target outside it = BadAngle (no grab, no scratch)."))
+	float GrabFacingConeDegrees = 140.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Chance a physically possible, well-angled grab still whiffs (clumsy dead hands)."))
+	float GrabMissChance = 0.25f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Chance a whiffed grab still rakes fingers across the target (scratch wound)."))
+	float ScratchOnMissChance = 0.35f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="cm/s",
+		ToolTip="Sustained pull acceleration toward the echo (velocity gained per second of pulling) at MeleePullStrength 1 with a strong grip. Weak grips scale by WeakGripPullScale."))
+	float MeleePullSpeed = 220.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Pull-speed scale when the grip is weak (missing fingers / one hand)."))
+	float WeakGripPullScale = 0.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(
+		ToolTip="Weapon profile for Echo bites (DamageType Bite + contamination). REQUIRED: no profile = no bite damage applied. Severity/penetration/contamination live on the profile; tier roll only scales severity via EventScale."))
+	TSoftObjectPtr<UATR_WeaponDamageProfile> BiteDamageProfile;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Bite tier roll with a STRONG grip: chance the bite is a full laceration."))
+	float BiteLacerationChanceStrongGrip = 0.45f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Bite tier roll with a STRONG grip: chance of a deep scratch (rolled after laceration)."))
+	float BiteDeepScratchChanceStrongGrip = 0.35f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Bite tier roll with a WEAK grip: chance the bite is a full laceration."))
+	float BiteLacerationChanceWeakGrip = 0.15f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Bite tier roll with a WEAK grip: chance of a deep scratch (rolled after laceration)."))
+	float BiteDeepScratchChanceWeakGrip = 0.35f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="EventScale applied to BiteDamageProfile for a Scratch tier (failed-grab rake or weakest bite). Damage values come from the profile; this only scales."))
+	float ScratchTierScale = 0.3f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="EventScale applied to BiteDamageProfile for a Deep Scratch tier."))
+	float DeepScratchTierScale = 0.6f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="EventScale applied to BiteDamageProfile for a Laceration tier (full bite)."))
+	float LacerationTierScale = 1.0f;
+
+	// ── Echo|Combat — structural movement effects ─────────────────────────────
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="MaxWalkSpeed scale for a promoted echo that can walk but not run (one bad leg — limp)."))
+	float LimpSpeedScale = 0.6f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="cm/s",
+		ToolTip="MaxWalkSpeed for a promoted echo that can only crawl."))
+	float CrawlSpeed = 60.f;
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Combat", meta=(ClampMin="0.0", ForceUnits="deg",
 		ToolTip="Yaw turn rate (deg/sec) for the TurnTowardStimulus orient task."))

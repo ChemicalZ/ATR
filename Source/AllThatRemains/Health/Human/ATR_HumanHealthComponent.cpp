@@ -12,6 +12,7 @@
 #include "../Data/ATR_WeaponDamageProfile.h"
 #include "GameFramework/Actor.h"
 #include "Misc/StringBuilder.h"
+#include "Net/UnrealNetwork.h"
 
 namespace
 {
@@ -34,6 +35,38 @@ UATR_HumanHealthComponent::UATR_HumanHealthComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
 	PrimaryComponentTick.bStartWithTickEnabled = true;
+
+	// Server simulates; clients receive observable state (see header notes).
+	SetIsReplicatedByDefault(true);
+}
+
+void UATR_HumanHealthComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+
+	DOREPLIFETIME(UATR_HumanHealthComponent, Vitals);
+	DOREPLIFETIME(UATR_HumanHealthComponent, Survival);
+	DOREPLIFETIME(UATR_HumanHealthComponent, Blood);
+	DOREPLIFETIME(UATR_HumanHealthComponent, Derived);
+	DOREPLIFETIME(UATR_HumanHealthComponent, Wounds);
+	DOREPLIFETIME(UATR_HumanHealthComponent, Conditions);
+	DOREPLIFETIME(UATR_HumanHealthComponent, Impairments);
+	DOREPLIFETIME(UATR_HumanHealthComponent, DeathCause);
+	DOREPLIFETIME(UATR_HumanHealthComponent, bUnconscious);
+}
+
+void UATR_HumanHealthComponent::OnRep_DeathCause()
+{
+	// Client mirror of Die(): fire the death event for HUD/anim/ragdoll hooks.
+	if (DeathCause != EATR_DeathCause::None)
+	{
+		OnDeath.Broadcast(DeathCause);
+	}
+}
+
+void UATR_HumanHealthComponent::OnRep_Unconscious()
+{
+	OnConsciousnessChanged.Broadcast(IsConscious());
 }
 
 void UATR_HumanHealthComponent::BeginPlay()
@@ -1453,4 +1486,7 @@ FString UATR_HumanHealthComponent::GetDebugString() const
 	Sb.Appendf(TEXT("Derived: gripL=%.2f gripR=%.2f melee=%.2f aim=%.2f move=%.2f sprint=%d limp=%d 2h=%d\n"),
 		Derived.GripStrengthLeft01, Derived.GripStrengthRight01, Derived.MeleePower01, Derived.AimStability01,
 		Derived.MoveSpeedMult, Derived.bCanSprint ? 1 : 0, Derived.bIsLimping ? 1 : 0, Derived.bCanUseTwoHandedWeapons ? 1 : 0);
-	Sb.Appendf(TEXT("LastDamage: %s\n"), *LastDamageDeb
+	Sb.Appendf(TEXT("LastDamage: %s\n"), *LastDamageDebug);
+
+	return Sb.ToString();
+}

@@ -4,11 +4,13 @@
 
 #include "CoreMinimal.h"
 #include "Engine/DeveloperSettings.h"
+#include "ATR_HealthTypes.h"
 #include "ATR_HealthSettings.generated.h"
 
 class UATR_BodyRegionDefinition;
 class UATR_DamageTypeDefinition;
 class UATR_ConditionDefinition;
+class UATR_WeaponDamageProfile;
 
 // Project Settings > AllThatRemains > Health & Survival
 //
@@ -265,6 +267,31 @@ public:
 		ToolTip="Severity scale converting human-weapon severity into Echo brain integrity loss on head hits."))
 	float EchoBrainDamageScale = 1.f;
 
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Structure", meta=(ClampMin="0.0", ClampMax="4.0",
+		ToolTip="Global scale on weapon DismemberChance when resolving severing hits against Echo parts."))
+	float EchoDismemberScale = 1.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Echo|Structure", meta=(ClampMin="0.0", ClampMax="1.0",
+		ToolTip="Resolved severity at/above which a Ballistic/Crush/Explosion torso or pelvis hit destroys the Echo's spine function."))
+	float EchoSpineDestroySeverity = 0.85f;
+
+	// ── Debug|Melee ────────────────────────────────────────────────────────
+	// Player debug melee ray (development tool). DAMAGE values are authoritative
+	// on the profile asset — assign one or the swing does no damage. Only behavior
+	// knobs (range, debug draw) live here so there is exactly one place per concern.
+
+	UPROPERTY(Config, EditAnywhere, Category="Debug|Melee", meta=(
+		ToolTip="Weapon profile used by the player's debug melee ray. REQUIRED: no profile = trace-only (no damage applied)."))
+	TSoftObjectPtr<UATR_WeaponDamageProfile> DebugMeleeProfile;
+
+	UPROPERTY(Config, EditAnywhere, Category="Debug|Melee", meta=(ClampMin="10.0", ClampMax="100000.0", ForceUnits="cm",
+		ToolTip="Trace length of the player's debug melee ray."))
+	float DebugMeleeRange = 250.f;
+
+	UPROPERTY(Config, EditAnywhere, Category="Debug|Melee", meta=(
+		ToolTip="Draw a debug line/point for each debug melee trace."))
+	bool bDrawDebugMeleeTrace = true;
+
 	// ── Echo|Replication ───────────────────────────────────────────────────
 
 	UPROPERTY(Config, EditAnywhere, Category="Echo|Replication", meta=(ClampMin="1", ClampMax="1024",
@@ -283,4 +310,13 @@ public:
 
 	UPROPERTY(Config, EditAnywhere, Category="Debug",
 		meta=(ToolTip="Log condition add/remove/stage transitions."))
-	bool bL
+	bool bLogConditionChanges = true;
+
+	UPROPERTY(Config, EditAnywhere, Category="Debug",
+		meta=(ToolTip="Verbose: log vital deltas every fast tick (spammy — VeryVerbose channel)."))
+	bool bLogVitalDeltas = false;
+
+	UPROPERTY(Config, EditAnywhere, Category="Debug",
+		meta=(ToolTip="Log Echo structural mask/capability changes and delta queue stats."))
+	bool bLogEchoStructuralChanges = false;
+};

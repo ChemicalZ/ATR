@@ -310,4 +310,12 @@ struct FATR_PermanentImpairment
 {
 	GENERATED_BODY()
 
-	UPROPERTY(BlueprintReadOnly, Category = "Health|Impairments") EATR_BodyRegion 
+	UPROPERTY(BlueprintReadOnly, Category = "Health|Impairments") EATR_BodyRegion Region = EATR_BodyRegion::None;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Health|Impairments") EATR_BodyDetailKind DetailKind = EATR_BodyDetailKind::None;
+	UPROPERTY(BlueprintReadOnly, Category = "Health|Impairments") uint8 DetailIndex = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Health|Impairments") EATR_ImpairmentType Type = EATR_ImpairmentType::None;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Health|Impairments") float Severity01 = 1.f;
+};

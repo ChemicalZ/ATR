@@ -2,6 +2,8 @@
 
 #include "ATR_HealthTypes.h"
 
+#include "GameFramework/Actor.h"
+
 DEFINE_LOG_CATEGORY(LogATR_Health);
 
 namespace ATR_Health
@@ -53,5 +55,53 @@ namespace ATR_Health
 		default:
 			return false;
 		}
+	}
+
+	EATR_BodyRegion RegionFromHitLocation(const AActor* Victim, const FVector& WorldHitLocation)
+	{
+		if (!Victim)
+		{
+			return EATR_BodyRegion::None;
+		}
+
+		// Resolve in actor space so facing doesn't matter. Height is normalized
+		// over the actor's collision bounds (origin = center, extent = half size).
+		FVector BoundsOrigin, BoundsExtent;
+		Victim->GetActorBounds(true, BoundsOrigin, BoundsExtent);
+		const float HalfHeight = FMath::Max(BoundsExtent.Z, 1.f);
+
+		// 0 = feet, 1 = top of head.
+		const float Height01 = FMath::Clamp(
+			(WorldHitLocation.Z - (BoundsOrigin.Z - HalfHeight)) / (2.f * HalfHeight), 0.f, 1.f);
+
+		// Left/right from the victim's local Y (his left = negative Y).
+		const FVector Local = Victim->GetActorTransform().InverseTransformPosition(WorldHitLocation);
+		const bool bLeft = Local.Y < 0.f;
+
+		// Lateral hits on the torso band resolve to arms instead of the trunk.
+		// "Wide" = beyond ~55% of the lateral extent.
+		const float LateralExtent = FMath::Max(FMath::Max(BoundsExtent.X, BoundsExtent.Y), 1.f);
+		const bool bWide = FMath::Abs(Local.Y) > LateralExtent * 0.55f;
+
+		if (Height01 >= 0.88f) { return EATR_BodyRegion::Head; }
+		if (Height01 >= 0.82f) { return EATR_BodyRegion::Neck; }
+		if (Height01 >= 0.62f)
+		{
+			if (bWide) { return bLeft ? EATR_BodyRegion::LeftUpperArm : EATR_BodyRegion::RightUpperArm; }
+			return EATR_BodyRegion::Chest;
+		}
+		if (Height01 >= 0.50f)
+		{
+			if (bWide) { return bLeft ? EATR_BodyRegion::LeftForearm : EATR_BodyRegion::RightForearm; }
+			return EATR_BodyRegion::Abdomen;
+		}
+		if (Height01 >= 0.42f)
+		{
+			if (bWide) { return bLeft ? EATR_BodyRegion::LeftHand : EATR_BodyRegion::RightHand; }
+			return EATR_BodyRegion::Pelvis;
+		}
+		if (Height01 >= 0.22f) { return bLeft ? EATR_BodyRegion::LeftThigh : EATR_BodyRegion::RightThigh; }
+		if (Height01 >= 0.06f) { return bLeft ? EATR_BodyRegion::LeftShin : EATR_BodyRegion::RightShin; }
+		return bLeft ? EATR_BodyRegion::LeftFoot : EATR_BodyRegion::RightFoot;
 	}
 }

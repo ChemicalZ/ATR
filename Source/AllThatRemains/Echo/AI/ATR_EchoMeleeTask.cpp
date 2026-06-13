@@ -13,6 +13,15 @@ EStateTreeRunStatus FATR_EchoMeleeTask::EnterState(FStateTreeExecutionContext& C
 	Data.bGrabbed     = false;
 	Data.LastGrabTime = -1000.f;
 	Data.LastBiteTime = -1000.f;
+	Data.GrabStartTime = -1.f;
+
+	// Safety net: a prior task instance may have leaked bBlockDemotion=true
+	// (e.g. StateTree force-exited without ExitState firing cleanly). Clear it
+	// on every fresh enter so the demotion guard never strands across attempts.
+	if (AATR_EchoAIController* AIC = Cast<AATR_EchoAIController>(Context.GetOwner()))
+		if (AATR_ActiveEcho* Pawn = Cast<AATR_ActiveEcho>(AIC->GetPawn()))
+			Pawn->bBlockDemotion = false;
+
 	return EStateTreeRunStatus::Running;
 }
 
@@ -29,7 +38,12 @@ EStateTreeRunStatus FATR_EchoMeleeTask::Tick(FStateTreeExecutionContext& Context
 
 	auto ReleaseGrab = [&]()
 	{
-		if (Data.bGrabbed) { Data.bGrabbed = false; Pawn->bBlockDemotion = false; }
+		if (Data.bGrabbed)
+		{
+			Data.bGrabbed = false;
+			Pawn->bBlockDemotion = false;
+			Pawn->NotifyGrabReleased(); // clears CurrentGrip (replicated)
+		}
 	};
 
 	AActor* Target = Data.Target;
@@ -57,13 +71,31 @@ EStateTreeRunStatus FATR_EchoMeleeTask::Tick(FStateTreeExecutionContext& Context
 		if (Pawn->TryGrabTarget(Target))
 		{
 			Data.bGrabbed = true;
+			Data.GrabStartTime = Now;
 			Pawn->bBlockDemotion = true; // don't demote mid-grab
 		}
 	}
 
-	// While grabbed — pull the target in and bite on a cadence; release if it slips away.
+	// While grabbed — pull the target in and bite on a cadence; release if it slips away,
+	// the grip got cleared externally (e.g. structural damage broke both arms), or the
+	// grab has been held too long (anti-strand: max grab duration).
 	if (Data.bGrabbed)
 	{
+		// External grip loss (capability change cleared CurrentGrip): bail out cleanly.
+		if (Pawn->CurrentGrip == EATR_EchoGripType::None)
+		{
+			ReleaseGrab();
+			return EStateTreeRunStatus::Running;
+		}
+
+		// Anti-strand: cap any single grab to MaxGrabHoldSeconds so a stuck grab can't
+		// hold bBlockDemotion forever (e.g. target stays in BadAngle/cone-fail loop).
+		if (Data.GrabStartTime > 0.f && (Now - Data.GrabStartTime) > S->MaxGrabHoldSeconds)
+		{
+			ReleaseGrab();
+			return EStateTreeRunStatus::Running;
+		}
+
 		Pawn->PullTarget(Target, S->MeleePullStrength);
 
 		if (Dist <= S->BiteRange && (Now - Data.LastBiteTime) >= S->BiteCooldownSeconds)
@@ -86,7 +118,10 @@ void FATR_EchoMeleeTask::ExitState(FStateTreeExecutionContext& Context, const FS
 	{
 		if (AATR_EchoAIController* AIC = Cast<AATR_EchoAIController>(Context.GetOwner()))
 			if (AATR_ActiveEcho* Pawn = Cast<AATR_ActiveEcho>(AIC->GetPawn()))
+			{
 				Pawn->bBlockDemotion = false; // always release the demotion block on exit
+				Pawn->NotifyGrabReleased();   // clears CurrentGrip (replicated)
+			}
 		Data.bGrabbed = false;
 	}
 }

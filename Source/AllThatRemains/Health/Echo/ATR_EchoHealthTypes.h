@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "../ATR_HealthTypes.h"
 #include "ATR_EchoHealthTypes.generated.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,6 +54,12 @@ namespace ATR_EchoParts
 	// (Forearm gone -> hand gone; thigh gone -> shin+foot gone; head gone ->
 	// jaw gone and the Echo is dead — see FATR_EchoHealthModel.)
 	ALLTHATREMAINS_API uint32 WithDistalParts(uint32 PartBits);
+
+	// Hit-location → structural-part mapping used by the linking layer (combat
+	// hits arrive as EATR_BodyRegion; the Echo model works in part bits).
+	// Chest/Abdomen map to TorsoFunctional; Pelvis to SpineFunctional; Head/Neck
+	// and limb regions map 1:1. Returns 0 for None/unmappable regions.
+	ALLTHATREMAINS_API uint32 PartBitsForBodyRegion(EATR_BodyRegion Region);
 }
 
 // DigitMask bits. 1 = present/functioning.

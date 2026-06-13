@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "ATR_EchoManager.h"
+#include "../Health/Echo/ATR_EchoHealthTypes.h"
 #include "ATR_EchoReplicationComponent.generated.h"
 
 class UATR_EchoSubsystem;
@@ -37,6 +38,15 @@ public:
 
 	UFUNCTION(Client, Unreliable)
 	void Client_EchoSnapshotChunk(const FEchoSnapshotChunk& Chunk);
+
+	// Structural health delta stream (brain/parts/digits/capabilities). RELIABLE
+	// by design: structural changes are rare, tiny, and order-sensitive (an
+	// EchoKilled must not be overtaken by a later refresh of a recycled index).
+	// Sent by UATR_EchoSubsystem::ReplicateEchoHealthDeltas and by the
+	// newly-relevant refresh in BuildAndSendBand. Client applies into its local
+	// subsystem health-model mirror (sequence-gated per Echo).
+	UFUNCTION(Client, Reliable)
+	void Client_EchoHealthDeltas(const TArray<FATR_EchoHealthDelta>& Deltas);
 
 	UFUNCTION(Server, Reliable)
 	void Server_RequestFullResync(int32 ViewId, uint16 LastSeq);

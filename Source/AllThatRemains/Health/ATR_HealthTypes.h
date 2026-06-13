@@ -304,4 +304,12 @@ namespace ATR_Health
 	ALLTHATREMAINS_API bool IsBloodCompatible(EATR_BloodType Donor, EATR_BloodType Recipient);
 
 	// True for the limb regions whose bleeding a tourniquet can stop.
-	ALLTHATREMAINS_API bool IsLimbRegion(EAT
+	ALLTHATREMAINS_API bool IsLimbRegion(EATR_BodyRegion Region);
+
+	// Coarse hit-location → body-region resolution for actors without per-bone
+	// hit zones (capsule hits, debug traces). Uses the victim's actor space:
+	// normalized height picks the band (legs/pelvis/abdomen/chest/neck/head),
+	// lateral sign picks left/right for limbs. Good enough for the linking pass;
+	// physics-asset hit zones can replace it per-actor later.
+	ALLTHATREMAINS_API EATR_BodyRegion RegionFromHitLocation(const AActor* Victim, const FVector& WorldHitLocation);
+}

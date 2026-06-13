@@ -28,6 +28,31 @@ namespace ATR_EchoParts
 
 		return Out;
 	}
+
+	uint32 PartBitsForBodyRegion(const EATR_BodyRegion Region)
+	{
+		switch (Region)
+		{
+		case EATR_BodyRegion::Head:          return HeadPresent;
+		case EATR_BodyRegion::Neck:          return NeckFunctional;
+		case EATR_BodyRegion::Chest:         return TorsoFunctional;
+		case EATR_BodyRegion::Abdomen:       return TorsoFunctional;
+		case EATR_BodyRegion::Pelvis:        return SpineFunctional;
+		case EATR_BodyRegion::LeftUpperArm:  return LeftUpperArm;
+		case EATR_BodyRegion::LeftForearm:   return LeftForearm;
+		case EATR_BodyRegion::LeftHand:      return LeftHand;
+		case EATR_BodyRegion::RightUpperArm: return RightUpperArm;
+		case EATR_BodyRegion::RightForearm:  return RightForearm;
+		case EATR_BodyRegion::RightHand:     return RightHand;
+		case EATR_BodyRegion::LeftThigh:     return LeftThigh;
+		case EATR_BodyRegion::LeftShin:      return LeftShin;
+		case EATR_BodyRegion::LeftFoot:      return LeftFoot;
+		case EATR_BodyRegion::RightThigh:    return RightThigh;
+		case EATR_BodyRegion::RightShin:     return RightShin;
+		case EATR_BodyRegion::RightFoot:     return RightFoot;
+		default:                             return 0;
+		}
+	}
 }
 
 namespace ATR_EchoDigits
@@ -46,11 +71,18 @@ void FATR_EchoHealthModel::Init(const int32 EchoCount)
 	DetailRecords.Empty();
 	PendingDeltas.Empty();
 
+	// Healthy-baseline capability cache for the whole population. Emission is
+	// SUPPRESSED: this is initialization, not a change — without the guard the
+	// 10k recomputes flood the pending queue past MaxPendingDeltas and the
+	// overflow collapse spams warnings / burns O(n²) at every world startup.
+	bSuppressDeltaEmission = true;
 	for (int32 i = 0; i < EchoCount; ++i)
 	{
-		RecomputeCapabilities(i); // healthy baseline cache, no deltas queued
+		RecomputeCapabilities(i);
 	}
-	PendingDeltas.Empty(); // initial recompute is not a "change" to replicate
+	bSuppressDeltaEmission = false;
+
+	checkf(PendingDeltas.IsEmpty(), TEXT("Echo health Init must not queue replication deltas"));
 }
 
 void FATR_EchoHealthModel::ResetEcho(const int32 EchoIndex)
@@ -61,6 +93,71 @@ void FATR_EchoHealthModel::ResetEcho(const int32 EchoIndex)
 	DetailRecords.Remove(EchoIndex);
 	RecomputeCapabilities(EchoIndex);
 	EmitDelta(EchoIndex, EATR_EchoHealthDeltaType::FullStructuralRefresh);
+}
+
+void FATR_EchoHealthModel::HandleSwapRemove(const int32 RemovedIndex, const int32 LastIndex)
+{
+	if (!SoA.IsValidIndex(RemovedIndex) || !SoA.IsValidIndex(LastIndex)) { return; }
+
+	// What clients currently believe each index looks like (we only ever
+	// replicated damage, so a clean row is clean on clients too).
+	const bool bDestWasDamaged = IsRowDamaged(RemovedIndex);
+	const bool bTailWasDamaged = IsRowDamaged(LastIndex);
+
+	// Deltas queued for either row are now mislabeled — drop them. The rows are
+	// re-announced below; the removed Echo despawns via the snapshot stream.
+	PendingDeltas.RemoveAll([RemovedIndex, LastIndex](const FATR_EchoHealthDelta& D)
+	{
+		return D.EchoIndex == RemovedIndex || D.EchoIndex == LastIndex;
+	});
+
+	DetailRecords.Remove(RemovedIndex);
+
+	if (RemovedIndex != LastIndex)
+	{
+		// Move row LastIndex into the vacated slot (mirrors the subsystem SoA swap).
+		SoA.BrainIntegrity[RemovedIndex]  = SoA.BrainIntegrity[LastIndex];
+		SoA.MajorPartMask[RemovedIndex]   = SoA.MajorPartMask[LastIndex];
+		SoA.DigitMask[RemovedIndex]       = SoA.DigitMask[LastIndex];
+		SoA.CapabilityFlags[RemovedIndex] = SoA.CapabilityFlags[LastIndex];
+		// Keep the DESTINATION row's sequence monotonic: clients track sequence
+		// by index, so the moved-in state must look "newer" than the slot held.
+		SoA.HealthSequence[RemovedIndex] =
+			FMath::Max(SoA.HealthSequence[RemovedIndex], SoA.HealthSequence[LastIndex]);
+
+		if (FATR_EchoDetailedDamageRecord* MovedDetail = DetailRecords.Find(LastIndex))
+		{
+			DetailRecords.Add(RemovedIndex, *MovedDetail);
+			DetailRecords.Remove(LastIndex);
+		}
+
+		// Re-announce the slot if either the moved-in Echo carries damage or the
+		// previous occupant did (clients must clear the stale damage either way).
+		if (bDestWasDamaged || IsRowDamaged(RemovedIndex))
+		{
+			EmitDelta(RemovedIndex, EATR_EchoHealthDeltaType::FullStructuralRefresh);
+		}
+	}
+
+	// Reset the vacated tail row to the healthy baseline for reuse. Sequence is
+	// deliberately preserved (SoA::ResetEcho) so post-reuse deltas read newer.
+	SoA.ResetEcho(LastIndex);
+	DetailRecords.Remove(LastIndex);
+	RecomputeCapabilities(LastIndex); // healthy baseline cache (may emit CapabilityChanged)
+	if (bTailWasDamaged)
+	{
+		// Clients last saw this index damaged (the moved row or the removed
+		// Echo) — push the clean baseline so no stale gore lingers there.
+		EmitDelta(LastIndex, EATR_EchoHealthDeltaType::FullStructuralRefresh);
+	}
+}
+
+bool FATR_EchoHealthModel::IsRowDamaged(const int32 EchoIndex) const
+{
+	if (!SoA.IsValidIndex(EchoIndex)) { return false; }
+	return SoA.BrainIntegrity[EchoIndex] != 255
+		|| SoA.MajorPartMask[EchoIndex] != ATR_EchoParts::AllParts
+		|| SoA.DigitMask[EchoIndex] != ATR_EchoDigits::AllDigits;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -282,6 +379,11 @@ FATR_EchoDetailedDamageRecord& FATR_EchoHealthModel::GetOrCreateDetailRecord(con
 
 void FATR_EchoHealthModel::EmitDelta(const int32 EchoIndex, const EATR_EchoHealthDeltaType Type)
 {
+	if (bSuppressDeltaEmission)
+	{
+		return; // Init baseline — nothing to replicate, sequences stay untouched
+	}
+
 	// Bandwidth guard: collapse a runaway queue into one refresh per Echo.
 	const int32 MaxPending = GetDefault<UATR_HealthSettings>()->MaxPendingDeltas;
 	if (PendingDeltas.Num() >= MaxPending)
@@ -321,6 +423,22 @@ FATR_EchoHealthDelta FATR_EchoHealthModel::MakeFullRefreshDelta(const int32 Echo
 	return D;
 }
 
+void FATR_EchoHealthModel::ApplyDeltaFromServer(const FATR_EchoHealthDelta& Delta)
+{
+	if (!SoA.IsValidIndex(Delta.EchoIndex)) { return; }
+
+	// Serial-number arithmetic so uint16 wrap can't wedge a long-lived client.
+	const uint16 Current = SoA.HealthSequence[Delta.EchoIndex];
+	const int16  Ahead   = static_cast<int16>(Delta.Sequence - Current);
+	if (Ahead <= 0 && Current != 0) { return; } // stale or duplicate
+
+	SoA.HealthSequence[Delta.EchoIndex]  = Delta.Sequence;
+	SoA.BrainIntegrity[Delta.EchoIndex]  = Delta.BrainIntegrity;
+	SoA.MajorPartMask[Delta.EchoIndex]   = Delta.MajorPartMask;
+	SoA.DigitMask[Delta.EchoIndex]       = Delta.DigitMask;
+	SoA.CapabilityFlags[Delta.EchoIndex] = Delta.CapabilityFlags;
+}
+
 void FATR_EchoHealthModel::DrainPendingDeltas(TArray<FATR_EchoHealthDelta>& Out, const int32 MaxCount)
 {
 	const int32 Count = FMath::Min(MaxCount, PendingDeltas.Num());
@@ -347,4 +465,7 @@ FString FATR_EchoHealthModel::GetDebugString(const int32 EchoIndex) const
 		Flags, SoA.HealthSequence[EchoIndex],
 		(Flags & ATR_EchoCapability::IsDead) ? TEXT(" DEAD") : TEXT(""),
 		(Flags & ATR_EchoCapability::CanWalk) ? TEXT(" walk") : TEXT(""),
-		(Flags & ATR_EchoCapability::CanCraw
+		(Flags & ATR_EchoCapability::CanCrawl) ? TEXT(" crawl") : TEXT(""),
+		(Flags & ATR_EchoCapability::IsImmobile) ? TEXT(" immobile") : TEXT(""),
+		PendingDeltas.Num());
+}
