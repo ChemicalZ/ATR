@@ -90,25 +90,7 @@ enum class EATR_EchoMoveTargetType : uint8
 	Location
 };
 
-// Classification of a meaningful pursuit blocker. Describes what the Echo DOES to the
-// blocker (attack/press/reach), never how it reroutes around it. Mirrors the design
-// document's EATR_EchoBarrierType.
-UENUM(BlueprintType)
-enum class EATR_EchoBarrierType : uint8
-{
-	None,
-	Door,
-	Window,
-	Fence,
-	Gate,
-	Barricade,
-	Vehicle,
-	DestructibleWall,
-	NonInteractableWall,  // press briefly → frustrated search → decay; never damaged
-	SmallProp,            // push/step around locally; not engaged
-	Crowd,                // other Echoes — local separation only; not engaged
-	Unknown
-};
+
 
 // Sub-phase of barrier engagement. Expressed as a phase (not separate intents) so the
 // single EngageBarrier StateTree state drives all three without re-wiring the asset;
@@ -137,25 +119,25 @@ enum class EATR_MoveFailureReason : uint8
 	AbortedByNewIntent
 };
 
-// Coarse barrier archetype — the C++ mirror of the Echo.Obstacle.* actor-tag
-// taxonomy (see IATR_EchoBarrier). Set on UATR_EchoBarrierDataAsset so
-// engagement code can branch by archetype (pound a door, break a window, climb
-// a fence) and apply per-type defaults without comparing tag FNames. Unknown =
-// unclassified; untagged static geometry never gets a data asset at all and is
-// treated as a non-interactable wall.
+// Classification of a meaningful pursuit blocker. Describes what the Echo DOES to the
+// blocker (attack/press/reach), never how it reroutes around it. C++ mirror of the
+// Echo.Obstacle.* actor-tag taxonomy (see IATR_EchoBarrier / UATR_EchoBarrierDataAsset).
 UENUM(BlueprintType)
 enum class EATR_EchoBarrierType : uint8
 {
-	Unknown,          // unclassified — engagement falls back to generic press/decay
-	Door,             // Echo.Obstacle.Door — hinged/sliding; pounded, pushed, broken open
-	Window,           // Echo.Obstacle.Window — glass/boarded; broken, then reached/climbed through
-	Fence,            // Echo.Obstacle.Fence — chain-link/privacy; reached through or climbed
-	Gate,             // Echo.Obstacle.Gate — fence door; pushed/pounded like a weak door
-	Barricade,        // Echo.Obstacle.Barricade — player-built; damaged until destroyed
-	Vehicle,          // Echo.Obstacle.Vehicle — pressed against/climbed over, not damaged
-	DestructibleWall  // Echo.Obstacle.DestructibleWall — breakable structure piece
+	None,
+	Door,                 // Echo.Obstacle.Door — hinged/sliding; pounded, pushed, broken open
+	Window,               // Echo.Obstacle.Window — glass/boarded; broken, then reached/climbed through
+	Fence,                // Echo.Obstacle.Fence — chain-link/privacy; reached through or climbed
+	Gate,                 // Echo.Obstacle.Gate — fence door; pushed/pounded like a weak door
+	Barricade,            // Echo.Obstacle.Barricade — player-built; damaged until destroyed
+	Vehicle,              // Echo.Obstacle.Vehicle — pressed against/climbed over, not damaged
+	DestructibleWall,     // Echo.Obstacle.DestructibleWall — breakable structure piece
+	NonInteractableWall,  // press briefly → frustrated search → decay; never damaged
+	SmallProp,            // push/step around locally; not engaged
+	Crowd,                // other Echoes — local separation only; not engaged
+	Unknown               // unclassified — engagement falls back to generic press/decay
 };
-
 // Confirmed/remembered knowledge an Echo holds about a threat. Sight confirms an
 // actor only while currently visible; once lost, behavior runs off the cached
 // locations/velocities here. Hearing only ever writes LastHeardLocation.
