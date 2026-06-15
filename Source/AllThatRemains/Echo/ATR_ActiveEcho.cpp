@@ -113,20 +113,16 @@ void AATR_ActiveEcho::OnRep_SourceIndex()
 		Sub->IndexToActor[ClientPrevSourceIndex] = nullptr;
 	}
 
-	// Register new slot (covers promotion). ActiveEntities is expanded only far
-	// enough for legacy index bounds checks; promoted actors are still excluded
-	// from client horde grids/ISM unless horde snapshots mark them relevant.
+	// Register new slot (covers promotion). Route through the canonical relevancy
+	// API so ActiveEntities expansion, the client mask, and coarse grid stay in
+	// sync — avoids the previous inline ActiveEntities write that bypassed those.
 	if (SourceIndex != INDEX_NONE
 		&& SourceIndex >= 0
 		&& SourceIndex < Sub->InitializeCount
 		&& Sub->IndexToActor.IsValidIndex(SourceIndex))
 	{
-		if (Sub->ActiveEntities <= SourceIndex)
-		{
-			Sub->ActiveEntities = SourceIndex + 1;
-		}
-
 		Sub->IndexToActor[SourceIndex] = this;
+		Sub->MarkEchoClientRelevant(SourceIndex);
 	}
 
 	ClientPrevSourceIndex = SourceIndex;

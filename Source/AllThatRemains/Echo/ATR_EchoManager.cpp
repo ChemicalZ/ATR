@@ -156,8 +156,11 @@ void AATR_EchoManager::ProcessBand(UATR_EchoSubsystem* Sub, const TArray<int32>&
 
 	for (int32 EchoIndex : Echoes)
 	{
-		if (EchoIndex < 0 || EchoIndex >= Sub->ActiveEntities) continue;
-		if (!Sub->Positions.IsValidIndex(EchoIndex))           continue;
+		// Bound by InitializeCount (population capacity), not ActiveEntities:
+		// clients receive partial relevancy and do NOT expand ActiveEntities,
+		// so a high-index relevant echo would otherwise never render here.
+		if (EchoIndex < 0 || EchoIndex >= Sub->InitializeCount) continue;
+		if (!Sub->Positions.IsValidIndex(EchoIndex))            continue;
 
 		// Promoted echoes are full Actors — never drawn as horde ISM.
 		if (Sub->IndexToActor.IsValidIndex(EchoIndex) && Sub->IndexToActor[EchoIndex]) continue;

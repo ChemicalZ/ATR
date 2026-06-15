@@ -246,8 +246,11 @@ private:
 	// ── Condition management ───────────────────────────────────────────────
 
 	FATR_Condition* FindCondition(EATR_ConditionType Type, EATR_BodyRegion Region = EATR_BodyRegion::None);
+	// bOverwriteSeverity=false (wound/condition path): existing severity rises via Max, never drops.
+	// bOverwriteSeverity=true (status-marker path): severity tracks current source value both ways.
 	void SetCondition(EATR_ConditionType Type, float Severity01, EATR_BodyRegion Region = EATR_BodyRegion::None,
-	                  int32 SourceWoundId = INDEX_NONE, float ProgressionRate = 0.f, float Duration = -1.f);
+	                  int32 SourceWoundId = INDEX_NONE, float ProgressionRate = 0.f, float Duration = -1.f,
+	                  bool bOverwriteSeverity = false);
 	void RemoveCondition(EATR_ConditionType Type, EATR_BodyRegion Region = EATR_BodyRegion::None);
 
 	// Sync derived status markers (Pain/Fever/Dehydration/.../Limping) from

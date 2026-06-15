@@ -81,6 +81,11 @@ EStateTreeRunStatus FATR_EchoHandleObstacleTask::Tick(FStateTreeExecutionContext
 	AATR_EchoAIController* AIC = Cast<AATR_EchoAIController>(Context.GetOwner());
 	if (!AIC) return EStateTreeRunStatus::Failed;
 
+	// No pawn = can't measure contact distance and a frustrated tap would fire
+	// from the barrier itself (zero-distance fallback). Suspend until possessed.
+	const APawn* PawnNow = AIC->GetPawn();
+	if (!PawnNow) return EStateTreeRunStatus::Running;
+
 	UWorld* W = AIC->GetWorld();
 	UATR_EchoSubsystem* Sub = W ? W->GetSubsystem<UATR_EchoSubsystem>() : nullptr;
 	const FATR_EchoRuntimeState* State = Sub ? Sub->GetEchoState(AIC->GetEchoId()) : nullptr;
@@ -129,8 +134,8 @@ EStateTreeRunStatus FATR_EchoHandleObstacleTask::Tick(FStateTreeExecutionContext
 		if (Data.LastHitTime < 0.f || (Now - Data.LastHitTime) >= FrustEvery)
 		{
 			// Occasional frustrated tap — only when actually at the barrier.
-			if (FVector::Dist2D(AIC->GetPawn() ? AIC->GetPawn()->GetActorLocation() : O.ObstacleLocation,
-			                    O.ObstacleLocation) <= EngageDist * S->FrustratedSearchHitRangeMultiplier)
+			if (FVector::Dist2D(PawnNow->GetActorLocation(), O.ObstacleLocation)
+				<= EngageDist * S->FrustratedSearchHitRangeMultiplier)
 			{
 				Sub->ReportBarrierImpact(AIC->GetEchoId());
 				Data.LastHitTime = Now;

@@ -1083,11 +1083,14 @@ bool UATR_HumanHealthComponent::HasCondition(const EATR_ConditionType Type) cons
 }
 
 void UATR_HumanHealthComponent::SetCondition(const EATR_ConditionType Type, const float Severity01, const EATR_BodyRegion Region,
-                                             const int32 SourceWoundId, const float ProgressionRate, const float Duration)
+                                             const int32 SourceWoundId, const float ProgressionRate, const float Duration,
+                                             const bool bOverwriteSeverity)
 {
 	if (FATR_Condition* Existing = FindCondition(Type, Region))
 	{
-		Existing->Severity01 = FMath::Max(Existing->Severity01, Saturate(Severity01));
+		Existing->Severity01 = bOverwriteSeverity
+			? Saturate(Severity01)
+			: FMath::Max(Existing->Severity01, Saturate(Severity01));
 		return;
 	}
 
@@ -1129,9 +1132,13 @@ void UATR_HumanHealthComponent::RemoveCondition(const EATR_ConditionType Type, c
 void UATR_HumanHealthComponent::UpdateStatusMarkers()
 {
 	// Threshold mirrors of vitals/stats — UI/AI visibility only, no penalties.
+	// Status markers track live source values — severity must rise AND fall, so overwrite.
 	const auto Marker = [this](const EATR_ConditionType Type, const bool bActive, const float Severity)
 	{
-		if (bActive) { SetCondition(Type, Severity); }
+		if (bActive)
+		{
+			SetCondition(Type, Severity, EATR_BodyRegion::None, INDEX_NONE, 0.f, -1.f, /*bOverwriteSeverity=*/true);
+		}
 		else { RemoveCondition(Type); }
 	};
 
