@@ -32,11 +32,11 @@ namespace
 
 AATR_EchoAIController::AATR_EchoAIController()
 {
-	// Perception tuning comes from Project Settings (Echo|Sight, Echo|Hearing) — no hardcoded
-	// behavior numbers. The settings CDO is created on demand and is available during CDO construction.
+	// Perception sense-config CDO reads stay in the ctor — AIPerception::ConfigureSense
+	// must run before the component finalizes. Scalar runtime tunables (HearingRange,
+	// ObstacleTraceDistance) are re-read in BeginPlay so a Project Settings live-edit
+	// or cooked-build CDO init order can't strand them on header defaults.
 	const UATR_EchoSettings* Settings = GetDefault<UATR_EchoSettings>();
-	HearingRange          = Settings->ActiveHearingRange;
-	ObstacleTraceDistance = Settings->ObstacleForwardTraceLength;
 
 	AIPerception = CreateDefaultSubobject<UAIPerceptionComponent>(TEXT("AIPerception"));
 
@@ -52,7 +52,7 @@ AATR_EchoAIController::AATR_EchoAIController()
 	AIPerception->SetDominantSense(SightConfig->GetSenseImplementation());
 
 	UAISenseConfig_Hearing* HearingConfig = CreateDefaultSubobject<UAISenseConfig_Hearing>(TEXT("HearingConfig"));
-	HearingConfig->HearingRange                             = HearingRange;
+	HearingConfig->HearingRange                             = Settings->ActiveHearingRange;
 	HearingConfig->SetMaxAge(Settings->ActiveHearingMaxAgeSeconds);
 	HearingConfig->DetectionByAffiliation.bDetectEnemies    = true;
 	HearingConfig->DetectionByAffiliation.bDetectNeutrals   = true;
@@ -63,6 +63,17 @@ AATR_EchoAIController::AATR_EchoAIController()
 }
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
+
+void AATR_EchoAIController::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// Re-read scalar tunables now that the world (and any live-edited Settings)
+	// is fully initialized. Ctor reads were defensive defaults only.
+	const UATR_EchoSettings* Settings = GetDefault<UATR_EchoSettings>();
+	HearingRange          = Settings->ActiveHearingRange;
+	ObstacleTraceDistance = Settings->ObstacleForwardTraceLength;
+}
 
 void AATR_EchoAIController::OnPossess(APawn* InPawn)
 {

@@ -15,6 +15,7 @@ void UATR_EchoSettings::ValidateAndClamp()
 	// Simulation
 	SimHz          = FMath::Clamp(SimHz, 1, 120);
 	HordeWalkSpeed = FMath::Max(0.f, HordeWalkSpeed);
+	HordeWalkSpeedVariation = FMath::Clamp(HordeWalkSpeedVariation, 0.f, 0.9f);
 
 	// Spatial
 	GridCellSize       = FMath::Max(100.f, GridCellSize);
@@ -221,6 +222,15 @@ void UATR_EchoSettings::ValidateAndClamp()
 	ScratchOnMissChance    = FMath::Clamp(ScratchOnMissChance, 0.f, 1.f);
 	MeleePullSpeed         = FMath::Max(0.f, MeleePullSpeed);
 	WeakGripPullScale      = FMath::Clamp(WeakGripPullScale, 0.f, 1.f);
+
+	// Grab hold + struggle — weak break threshold must not exceed strong.
+	GrabHoldSpeedScale           = FMath::Clamp(GrabHoldSpeedScale, 0.05f, 1.f);
+	GrabPullInputScale           = FMath::Clamp(GrabPullInputScale, 0.f, 1.f);
+	StruggleBreakThresholdStrong = FMath::Max(0.5f, StruggleBreakThresholdStrong);
+	StruggleBreakThresholdWeak   = FMath::Clamp(StruggleBreakThresholdWeak, 0.5f, StruggleBreakThresholdStrong);
+	StrugglePressGain            = FMath::Max(0.01f, StrugglePressGain);
+	StruggleDecayPerSecond       = FMath::Max(0.f, StruggleDecayPerSecond);
+	GrabBreakStaggerSeconds      = FMath::Max(0.f, GrabBreakStaggerSeconds);
 	BiteLacerationChanceStrongGrip  = FMath::Clamp(BiteLacerationChanceStrongGrip, 0.f, 1.f);
 	BiteDeepScratchChanceStrongGrip = FMath::Clamp(BiteDeepScratchChanceStrongGrip, 0.f, 1.f);
 	BiteLacerationChanceWeakGrip    = FMath::Clamp(BiteLacerationChanceWeakGrip, 0.f, 1.f);
@@ -279,6 +289,16 @@ void UATR_EchoSettings::ValidateAndClamp()
 	PromotionPlayerFacingBoost = FMath::Max(0.f, PromotionPlayerFacingBoost);
 	RecentlyDemotedPenalty     = FMath::Max(0.f, RecentlyDemotedPenalty);
 	RecentlyDemotedSeconds     = FMath::Max(0.f, RecentlyDemotedSeconds);
+}
+
+void UATR_EchoSettings::PostInitProperties()
+{
+	Super::PostInitProperties();
+	// Clamp at CDO init so runtime callers can trust the CDO is valid without
+	// re-validating from per-world BeginPlay. ValidateAndClamp is idempotent
+	// (it only clamps to range), so the call is safe even if UE invokes
+	// PostInitProperties more than once across the load pipeline.
+	ValidateAndClamp();
 }
 
 #if WITH_EDITOR

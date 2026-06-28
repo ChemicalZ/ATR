@@ -12,7 +12,8 @@ public class AllThatRemains : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[] { "AIModule", "StateTreeModule", "NavigationSystem", "GameplayStateTreeModule", "DeveloperSettings" });
 
-		// Echo debug map overlay (SATR_EchoDebugMap*) uses Slate directly.
+		// Echo debug map overlay (SATR_EchoDebugMap*) and the player HUD
+		// (SATR_StatusOverlay / SATR_RespawnScreen) use Slate directly.
 		PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
 		
 		// Uncomment if you are using online features

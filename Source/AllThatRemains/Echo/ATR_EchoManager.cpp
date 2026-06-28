@@ -47,10 +47,9 @@ void AATR_EchoManager::BeginPlay()
 	// ranges. Rendering and networking solve different problems (RenderThread cost
 	// vs bandwidth) and must be tuned independently. Validate first so hand-edited
 	// config cannot violate distance ordering or LocalZoneRadius invariants.
-	if (UATR_EchoSettings* Settings = GetMutableDefault<UATR_EchoSettings>())
+	// Settings CDO was clamped in UATR_EchoSettings::PostInitProperties — read only.
+	if (const UATR_EchoSettings* Settings = GetDefault<UATR_EchoSettings>())
 	{
-		Settings->ValidateAndClamp();
-
 		NearBandDistance = Settings->VisualNearDistance;
 		MidBandDistance  = Settings->VisualMidDistance;
 		FarBandDistance  = Settings->VisualFarDistance;
@@ -62,9 +61,20 @@ void AATR_EchoManager::BeginPlay()
 	ConfigureISMComponent(ISM_Far);
 
 	// Wire ourselves into the Subsystem on all machines (server sets it via SpawnActor
-	// return value; client sets it here when the replicated actor arrives).
+	// return value; client sets it here when the replicated actor arrives). A missing
+	// subsystem here means horde rendering will silently stay empty — warn instead so
+	// the failure is debuggable when an EchoManager is placed in a level without the
+	// game module mounted.
 	if (auto* Sub = GetWorld()->GetSubsystem<UATR_EchoSubsystem>())
+	{
 		Sub->SetManager(this);
+	}
+	else
+	{
+		UE_LOG(LogATR_EchoRender, Warning,
+			TEXT("EchoManager '%s' BeginPlay: no UATR_EchoSubsystem on world '%s' — ISM rendering will not run."),
+			*GetName(), GetWorld() ? *GetWorld()->GetName() : TEXT("null"));
+	}
 }
 
 // ─── ISM Update ───────────────────────────────────────────────────────────────
@@ -287,8 +297,20 @@ void AATR_EchoManager::AddEchoToISM(int32 EchoIndex, EEchoRelevancyBand Band,
 	FEchoISMTier& Tier = Tiers[static_cast<int32>(Band)];
 	const int32 InstanceIdx = ISM->AddInstance(T, /*bWorldSpace=*/true);
 
+	// ISM index MUST equal our parallel array's next slot — drift here means a
+	// previous remove path skipped its bookkeeping, or the ISM was reset by an
+	// external owner (mesh swap, level transition). Bail out and roll back the
+	// add rather than continue with permanently corrupted tier maps.
+	if (InstanceIdx != Tier.InstanceToEcho.Num())
+	{
+		UE_LOG(LogATR_EchoRender, Warning,
+			TEXT("ISM/tier index drift on AddEcho — EchoIndex=%d Band=%d ISM=%d Tier=%d. Rolling back."),
+			EchoIndex, static_cast<int32>(Band), InstanceIdx, Tier.InstanceToEcho.Num());
+		ISM->RemoveInstance(InstanceIdx);
+		return;
+	}
+
 	Tier.EchoToInstance.Add(EchoIndex, InstanceIdx);
-	ensure(InstanceIdx == Tier.InstanceToEcho.Num());
 	Tier.InstanceToEcho.Add(EchoIndex);
 	Tier.EchoISMVersion.Add(EchoIndex, Version);
 
@@ -307,18 +329,25 @@ void AATR_EchoManager::RemoveEchoFromISM(int32 EchoIndex)
 	if (!InstIdxPtr) { EchoToBand.Remove(EchoIndex); return; }
 
 	const int32 RemovedIdx = *InstIdxPtr;
+	const int32 LastIdx    = Tier.InstanceToEcho.Num() - 1;
 
 	if (ISM && ISM->GetStaticMesh())
 		ISM->RemoveInstance(RemovedIdx);
 
+	// UE ISM RemoveInstance is swap-pop: the instance at RemovedIdx becomes
+	// whatever was at LastIdx (or nothing if they're the same slot). Mirror
+	// that on our parallel arrays — O(1), single map entry to patch — instead
+	// of a linear "shift everything above down" scan.
+	if (RemovedIdx != LastIdx && LastIdx >= 0)
+	{
+		const int32 MovedEcho = Tier.InstanceToEcho[LastIdx];
+		Tier.InstanceToEcho[RemovedIdx] = MovedEcho;
+		Tier.EchoToInstance[MovedEcho]  = RemovedIdx;
+	}
+	Tier.InstanceToEcho.Pop(EAllowShrinking::No);
+
 	Tier.EchoToInstance.Remove(EchoIndex);
-	Tier.InstanceToEcho.RemoveAt(RemovedIdx);
 	Tier.EchoISMVersion.Remove(EchoIndex);
-
-	// UE RemoveInstance compacts the array — all slots above RemovedIdx shift down by 1.
-	for (auto& Pair : Tier.EchoToInstance)
-		if (Pair.Value > RemovedIdx) --Pair.Value;
-
 	EchoToBand.Remove(EchoIndex);
 }
 

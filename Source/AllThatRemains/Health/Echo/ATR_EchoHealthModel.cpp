@@ -89,10 +89,19 @@ void FATR_EchoHealthModel::ResetEcho(const int32 EchoIndex)
 {
 	if (!SoA.IsValidIndex(EchoIndex)) { return; }
 
+	// Only push a refresh if clients last saw this row as damaged. A clean row
+	// reset to a clean row is identical state — replicating it spams bandwidth
+	// every despawn-of-undamaged-Echo with no observable effect.
+	const bool bWasDamaged = IsRowDamaged(EchoIndex);
+
 	SoA.ResetEcho(EchoIndex);
 	DetailRecords.Remove(EchoIndex);
 	RecomputeCapabilities(EchoIndex);
-	EmitDelta(EchoIndex, EATR_EchoHealthDeltaType::FullStructuralRefresh);
+
+	if (bWasDamaged)
+	{
+		EmitDelta(EchoIndex, EATR_EchoHealthDeltaType::FullStructuralRefresh);
+	}
 }
 
 void FATR_EchoHealthModel::HandleSwapRemove(const int32 RemovedIndex, const int32 LastIndex)

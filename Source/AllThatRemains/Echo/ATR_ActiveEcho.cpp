@@ -5,6 +5,7 @@
 #include "ATR_EchoSettings.h"
 #include "../Health/Human/ATR_HumanHealthComponent.h"
 #include "../Health/Data/ATR_WeaponDamageProfile.h"
+#include "../Player/ATR_Player.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Net/UnrealNetwork.h"
 #include "Components/CapsuleComponent.h"
@@ -32,8 +33,10 @@ namespace
 
 AATR_ActiveEcho::AATR_ActiveEcho()
 {
-	// Start dormant — EnterPool/InitFromSoA control actual tick state.
-	PrimaryActorTick.bCanEverTick      = true;
+	// No per-frame work on the pawn itself: AI/combat run on the controller and
+	// the subsystem. CMC ticks independently. Leaving ticks enabled wastes one
+	// dispatch per echo per frame for an empty Super::Tick call.
+	PrimaryActorTick.bCanEverTick      = false;
 	PrimaryActorTick.bStartWithTickEnabled = false;
 
 	bReplicates              = true;
@@ -43,11 +46,11 @@ AATR_ActiveEcho::AATR_ActiveEcho()
 	// CMC — zombie defaults, tunable in Blueprint subclass
 	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
 	{
-		CMC->MaxWalkSpeed               = 150.f;
+		CMC->MaxWalkSpeed               = 110.f;  // shambling walker pace — player out-walks them
 		CMC->bOrientRotationToMovement  = true;
-		CMC->RotationRate               = FRotator(0.f, 360.f, 0.f);
-		CMC->MaxAcceleration            = 512.f;
-		CMC->BrakingDecelerationWalking = 512.f;
+		CMC->RotationRate               = FRotator(0.f, 90.f, 0.f);  // ponderous — no snap pivots
+		CMC->MaxAcceleration            = 200.f;  // slow to get going, slow to stop
+		CMC->BrakingDecelerationWalking = 200.f;
 		CMC->bCanWalkOffLedges          = true;
 		CMC->SetIsReplicated(true);
 	}
@@ -64,11 +67,6 @@ void AATR_ActiveEcho::BeginPlay()
 	{
 		BaseMaxWalkSpeed = CMC->MaxWalkSpeed;
 	}
-}
-
-void AATR_ActiveEcho::Tick(float DeltaTime)
-{
-	Super::Tick(DeltaTime);
 }
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
@@ -89,10 +87,11 @@ void AATR_ActiveEcho::SetEchoIntentForPresentation(EATR_EchoIntent NewIntent)
 		ReplicatedIntent = NewIntent;
 }
 
-void AATR_ActiveEcho::OnRep_EchoIntent()
+void AATR_ActiveEcho::OnRep_EchoIntent_Implementation()
 {
-	// AnimBP/FX can poll ReplicatedIntent directly each frame, or override this in a Blueprint
-	// subclass for event-driven intent transitions. No gameplay decision is made here.
+	// Native default does nothing — clients can still poll ReplicatedIntent each
+	// frame. BP subclasses override the BlueprintNativeEvent for event-driven
+	// transitions. No gameplay decision is made here.
 }
 
 void AATR_ActiveEcho::OnRep_SourceIndex()
@@ -128,10 +127,10 @@ void AATR_ActiveEcho::OnRep_SourceIndex()
 	ClientPrevSourceIndex = SourceIndex;
 }
 
-void AATR_ActiveEcho::OnRep_AnimStateCache()
+void AATR_ActiveEcho::OnRep_AnimStateCache_Implementation()
 {
-	// AnimBP polls AnimStateCache directly each frame — no push needed here.
-	// Override in Blueprint subclass if event-driven anim transitions are required.
+	// Native default does nothing — AnimBP polls AnimStateCache each frame.
+	// BP subclasses override the BlueprintNativeEvent for event-driven transitions.
 }
 
 void AATR_ActiveEcho::EnterPool()
@@ -153,6 +152,12 @@ void AATR_ActiveEcho::EnterPool()
 	CurrentGrip             = EATR_EchoGripType::None;
 	BargeStaggeredUntilTime = -1.f;   // pooled echoes carry no stagger into their next life
 	LastBargeTime           = -1000.f;
+
+	// Drop the cached bite-profile so a settings live-edit between this pool
+	// release and the next promotion can be picked up. ResolvedBiteProfile is
+	// a soft-ref resolution — re-loading is cheap and bounded once per life.
+	bBiteProfileResolved = false;
+	ResolvedBiteProfile  = nullptr;
 }
 
 void AATR_ActiveEcho::InitFromSoA(const UATR_EchoSubsystem* Sub, int32 Index)
@@ -337,6 +342,12 @@ void AATR_ActiveEcho::PullTarget_Implementation(AActor* Target, float Strength)
 	if (!HasAuthority() || !IsValid(Target) || CurrentGrip == EATR_EchoGripType::None)
 		return;
 
+	// Players run their own grab drag + pull-in + struggle (AATR_Player::ApplyGrabEffects), so the
+	// echo must NOT also shove them here: a server-side impulse on a client-predicted character is
+	// eaten by ground friction and fights prediction. This hook stays for physics props / NPCs.
+	if (Target->IsA(AATR_Player::StaticClass()))
+		return;
+
 	const UATR_EchoSettings* S = GetDefault<UATR_EchoSettings>();
 	const UWorld* World = GetWorld();
 	if (!S || !World)
@@ -378,6 +389,25 @@ void AATR_ActiveEcho::NotifyGrabReleased()
 		UE_LOGFMT(LogATR_EchoCombat, Verbose, "GrabReleased Echo={Echo}", ("Echo", SourceIndex));
 		CurrentGrip = EATR_EchoGripType::None;
 	}
+}
+
+void AATR_ActiveEcho::OnGrabBrokenByTarget()
+{
+	if (!HasAuthority())
+		return;
+
+	NotifyGrabReleased();
+
+	// Reuse the barge-stagger gate: FATR_EchoMeleeTask checks IsBargeStaggered() and both releases
+	// the grip and refuses to re-grab while staggered — exactly the post-break behaviour we want.
+	const UATR_EchoSettings* S = GetDefault<UATR_EchoSettings>();
+	const UWorld* W = GetWorld();
+	const float Now     = W ? W->GetTimeSeconds() : 0.f;
+	const float Stagger = S ? S->GrabBreakStaggerSeconds : 1.5f;
+	BargeStaggeredUntilTime = FMath::Max(BargeStaggeredUntilTime, Now + Stagger);
+
+	UE_LOGFMT(LogATR_EchoCombat, Verbose, "GrabBrokenByTarget Echo={Echo} StaggerUntil={Until}",
+		("Echo", SourceIndex), ("Until", BargeStaggeredUntilTime));
 }
 
 bool AATR_ActiveEcho::ApplyWoundToTarget(AActor* Target, const EATR_BiteWound Tier)
@@ -485,11 +515,15 @@ void AATR_ActiveEcho::ApplyStructuralStateToMovement()
 	// baseline and never constrain. This also heals pool actors that last
 	// hosted a crawler/immobile Echo and would otherwise keep its 0 speed.
 	using namespace ATR_EchoCapability;
+	// Per-echo speed variance applies to every MOVING state (not the dead/immobile floors)
+	// so a promoted walker keeps the same pace identity it had in the horde tier.
+	const float Var = FMath::Max(0.f, SpeedScalar);
+
 	if (Caps == 0 || !Model.IsRowDamaged(SourceIndex))
 	{
 		if (BaseMaxWalkSpeed > 0.f)
 		{
-			CMC->MaxWalkSpeed = BaseMaxWalkSpeed;
+			CMC->MaxWalkSpeed = BaseMaxWalkSpeed * Var;
 		}
 		return;
 	}
@@ -503,15 +537,15 @@ void AATR_ActiveEcho::ApplyStructuralStateToMovement()
 	}
 	else if (Caps & CanRun)
 	{
-		CMC->MaxWalkSpeed = BaseMaxWalkSpeed; // locomotion chain intact
+		CMC->MaxWalkSpeed = BaseMaxWalkSpeed * Var; // locomotion chain intact
 	}
 	else if (Caps & CanWalk)
 	{
-		CMC->MaxWalkSpeed = BaseMaxWalkSpeed * (S ? S->LimpSpeedScale : 0.6f); // one bad leg — limp
+		CMC->MaxWalkSpeed = BaseMaxWalkSpeed * (S ? S->LimpSpeedScale : 0.6f) * Var; // one bad leg — limp
 	}
 	else if (Caps & CanCrawl)
 	{
-		CMC->MaxWalkSpeed = S ? S->CrawlSpeed : 60.f; // dragging by the arms
+		CMC->MaxWalkSpeed = (S ? S->CrawlSpeed : 60.f) * Var; // dragging by the arms
 	}
 	else
 	{

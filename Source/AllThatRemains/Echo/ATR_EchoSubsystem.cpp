@@ -148,10 +148,7 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
 
-	// Defensive runtime clamp — editor PostEditChangeProperty handles in-editor edits,
-	// but config files can be hand-edited, so re-validate invariants before reading.
-	GetMutableDefault<UATR_EchoSettings>()->ValidateAndClamp();
-
+	// Settings CDOs are clamped in their own PostInitProperties — read only here.
 	const UATR_EchoSettings* Settings = GetDefault<UATR_EchoSettings>();
 	InitializeCount = Settings->InitializeCount;
 	SpawnCount      = Settings->SpawnCount;
@@ -202,7 +199,7 @@ void UATR_EchoSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 	// Structural health rows — index-parallel to the SoA, allocated once.
 	// Server writes via ApplyDamageToEcho; clients mirror via replicated deltas.
-	GetMutableDefault<UATR_HealthSettings>()->ValidateAndClamp();
+	// HealthSettings CDO already clamped in its PostInitProperties.
 	HealthModel.Init(InitializeCount);
 
 	ServerReplicationBudgetMs      = Settings->ServerReplicationBudgetMs;
@@ -2290,9 +2287,28 @@ void UATR_EchoSubsystem::DemoteToHorde(AATR_ActiveEcho* Actor)
 
 	// Stamp the demotion time for the recently-demoted promotion penalty. Awareness/search state
 	// is intentionally left intact so the demoted Echo continues its search at the LowDetail tier.
+	//
+	// EXCEPTION — death-demote: a dead Echo's preserved Intent/Awareness/Movement would otherwise
+	// keep it "ghost-chasing" the target it had at the moment of death (e.g. an Attack(Player)
+	// Echo whose actor is killed continues moving toward Player as ISM via heard-location or any
+	// future abstract-tier movement pass). Reset behavior state on death-demote; the Echo stays
+	// in SoA as a dead-flagged Echo with no plans of its own. Identity (Tier, LastDemotedTime,
+	// Location) is preserved so promotion penalties and despawn bookkeeping still resolve.
 	if (FATR_EchoRuntimeState* State = GetMutableEchoStateByIndex(Idx))
 	{
-		State->LastDemotedTime = GetWorld() ? GetWorld()->GetTimeSeconds() : -1.f;
+		const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : -1.f;
+
+		if (HealthModel.IsDead(Idx))
+		{
+			State->Intent     = EATR_EchoIntent::Dormant;
+			State->Awareness  = FATR_EchoAwarenessState{};
+			State->Search     = FATR_EchoSearchState{};
+			State->Movement   = FATR_EchoMovementIntent{};
+			State->Obstacle   = FATR_EchoObstacleIntent{};
+			State->Agitation  = 0.f;
+		}
+
+		State->LastDemotedTime = Now;
 		State->Tier            = EATR_EchoSimulationTier::LowDetail;
 	}
 
@@ -2325,6 +2341,13 @@ AATR_ActiveEcho* UATR_EchoSubsystem::PromoteEcho(int32 SoAIndex)
 	// Wire the canonical-state bridge and flip tier to Active before the controller wakes,
 	// so OnPossess (and later-phase intent reads) can resolve this Echo's runtime state.
 	RegisterActiveEcho(GetEchoIdForIndex(SoAIndex), Controller, Actor);
+
+	// Carry the same STABLE per-echo speed variance the horde tier uses (same EchoId + salt),
+	// so a walker keeps its pace identity across promote/demote cycles.
+	{
+		const float Var = FMath::Clamp(CachedSettings ? CachedSettings->HordeWalkSpeedVariation : 0.f, 0.f, 0.9f);
+		Actor->SpeedScalar = 1.f + (EchoHash01(GetEchoIdForIndex(SoAIndex), 0x59A1u) * 2.f - 1.f) * Var;
+	}
 
 	Actor->InitFromSoA(this, SoAIndex);  // teleport to SoA position + seed velocity first
 	Controller->Possess(Actor);          // OnPossess → AI wakes at correct world position
@@ -2634,6 +2657,7 @@ void UATR_EchoSubsystem::RunSteeringPass(float DeltaTime)
 	// Personal-stimulus steering params (Echo|Agitation / Echo|HordeShaping).
 	const float HeardSteerMinFrac  = CachedSettings->HeardSteerMinSpeedFraction;
 	const float SepOnlySpeedFrac   = CachedSettings->HordeSeparationOnlySpeedFraction;
+	const float WalkSpeedVar       = FMath::Clamp(CachedSettings->HordeWalkSpeedVariation, 0.f, 0.9f);
 
 	// Single pass over all local entities — each aligns to local horde momentum (with separation,
 	// jitter, and edge/back/random detachment), or seeks a very-near player.
@@ -2672,6 +2696,10 @@ void UATR_EchoSubsystem::RunSteeringPass(float DeltaTime)
 		}
 
 		const int32 EchoId = GetEchoIdForIndex(EntityIndex);
+
+		// Per-echo STABLE walk-speed variance: walkers don't all shuffle at the same pace.
+		// Hash → [1-var, 1+var] so a herd shows mixed paces instead of marching in lockstep.
+		const float EchoWalkSpeed = HordeWalkSpeed * (1.f + (EchoHash01(EchoId, 0x59A1u) * 2.f - 1.f) * WalkSpeedVar);
 
 		float BestSq          = MustPromoteSq;
 		int32 BestPlayerIndex = INDEX_NONE;
@@ -2714,7 +2742,7 @@ void UATR_EchoSubsystem::RunSteeringPass(float DeltaTime)
 						if (!Steer.IsNearlyZero())
 						{
 							Steer.Normalize();
-							const float Speed = HordeWalkSpeed
+							const float Speed = EchoWalkSpeed
 								* FMath::Lerp(HeardSteerMinFrac, 1.f, FMath::Clamp(A.Urgency, 0.f, 1.f));
 							Velocities[EntityIndex] = FVector3f(Steer.X, Steer.Y, 0.f) * Speed;
 							Yaws[EntityIndex]       = FMath::RadiansToDegrees(FMath::Atan2(Steer.Y, Steer.X));
@@ -2804,12 +2832,12 @@ void UATR_EchoSubsystem::RunSteeringPass(float DeltaTime)
 				if (FlowJit > 0.f)
 					Flow = ATR_RotateVec2(Flow, (EchoHash01(EchoId, 0xF10Du) * 2.f - 1.f) * FlowJit);
 				Steer += Flow;
-				Speed = HordeWalkSpeed * FMath::Clamp(Strength, 0.f, 1.f);
+				Speed = EchoWalkSpeed * FMath::Clamp(Strength, 0.f, 1.f);
 			}
 			Steer += Sep * SepStrength;
 			if (Steer.IsNearlyZero()) return;
 			Steer.Normalize();
-			if (Speed <= 0.f) Speed = HordeWalkSpeed * SepOnlySpeedFrac; // gentle de-clumping when only separating
+			if (Speed <= 0.f) Speed = EchoWalkSpeed * SepOnlySpeedFrac; // gentle de-clumping when only separating
 
 			Velocities[EntityIndex] = FVector3f(Steer.X, Steer.Y, 0.f) * Speed;
 			Yaws[EntityIndex]       = FMath::RadiansToDegrees(FMath::Atan2(Steer.Y, Steer.X));
@@ -2832,7 +2860,7 @@ void UATR_EchoSubsystem::RunSteeringPass(float DeltaTime)
 		if (Steer.IsNearlyZero()) return;
 		Steer.Normalize();
 
-		Velocities[EntityIndex] = FVector3f(Steer.X, Steer.Y, 0.f) * HordeWalkSpeed;
+		Velocities[EntityIndex] = FVector3f(Steer.X, Steer.Y, 0.f) * EchoWalkSpeed;
 		Yaws[EntityIndex]       = FMath::RadiansToDegrees(FMath::Atan2(Steer.Y, Steer.X));
 		MarkEchoDirty(EntityIndex, EEchoDirtyFlags::Transform);
 	});

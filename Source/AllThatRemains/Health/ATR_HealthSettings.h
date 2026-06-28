@@ -31,9 +31,11 @@ public:
 	virtual FName GetCategoryName() const override { return FName("AllThatRemains"); }
 
 	// Defensive clamp of all settings to required invariants. Called from
-	// PostEditChangeProperty in-editor and from component init as a safety
-	// net so hand-edited config can't violate invariants.
+	// PostInitProperties at CDO load (once) and from PostEditChangeProperty
+	// on in-editor edits. Runtime callers do not need to re-clamp.
 	void ValidateAndClamp();
+
+	virtual void PostInitProperties() override;
 
 #if WITH_EDITOR
 	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;

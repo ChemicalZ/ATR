@@ -108,6 +108,8 @@ EStateTreeRunStatus FATR_EchoHandleObstacleTask::Tick(FStateTreeExecutionContext
 	if (!O.bHasObstacle) return EStateTreeRunStatus::Succeeded;
 
 	const UATR_EchoSettings* S = GetDefault<UATR_EchoSettings>();
+	if (!S) return EStateTreeRunStatus::Failed; // matches MeleeTask null-guard pattern
+
 	const float Now          = W->GetTimeSeconds();
 	const float EngageDist   = S->BarrierEngageDistanceCm;
 	const float AttackEvery  = S->BarrierAttackIntervalSeconds;

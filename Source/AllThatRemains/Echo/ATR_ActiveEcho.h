@@ -43,6 +43,12 @@ public:
 	UPROPERTY(ReplicatedUsing = OnRep_SourceIndex)
 	int32 SourceIndex = INDEX_NONE;
 
+	// Stable per-echo walk-speed multiplier (Echo|Simulation.HordeWalkSpeedVariation).
+	// Set by the subsystem at promotion from the echo's EchoId so a promoted walker keeps
+	// the same pace identity it had in the horde tier. Folded into every moving locomotion
+	// branch in ApplyStructuralStateToMovement(). 1 = baseline speed. Server-authoritative.
+	float SpeedScalar = 1.f;
+
 	// Local cache of Sub->AnimState[SourceIndex]. Flushed to SoA on demotion.
 	// Drive your AnimBlueprint from this.
 	UPROPERTY(ReplicatedUsing = OnRep_AnimStateCache, BlueprintReadOnly, Category = "Echo")
@@ -100,6 +106,11 @@ public:
 
 	// Called by the melee task whenever its grab releases (slip-away, task exit).
 	void NotifyGrabReleased();
+
+	// Called by a grabbed player (server) when they win the struggle and rip this grip loose.
+	// Drops the grip and staggers the echo (reuses the barge-stagger gate) so it can't immediately
+	// re-grab — the player's window to get away. Stagger length = Echo|Combat.GrabBreakStaggerSeconds.
+	void OnGrabBrokenByTarget();
 
 	// Re-derive CMC speed from the health model's cached capability flags:
 	// run = full speed, walk-only = limp (LimpSpeedScale), crawl = CrawlSpeed,
@@ -177,8 +188,16 @@ protected:
 	int32 ClientPrevSourceIndex = INDEX_NONE;
 
 	UFUNCTION() void OnRep_SourceIndex();
-	UFUNCTION() void OnRep_AnimStateCache();
-	UFUNCTION() void OnRep_EchoIntent();
+
+	// AnimBP / FX hooks. Empty native default — override in a Blueprint subclass
+	// for event-driven anim/intent transitions instead of polling.
+	UFUNCTION(BlueprintNativeEvent, Category = "Echo|Replication")
+	void OnRep_AnimStateCache();
+	virtual void OnRep_AnimStateCache_Implementation();
+
+	UFUNCTION(BlueprintNativeEvent, Category = "Echo|Replication")
+	void OnRep_EchoIntent();
+	virtual void OnRep_EchoIntent_Implementation();
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Team")
 	uint8 TeamNumber = 2;
@@ -206,7 +225,4 @@ protected:
 	// MaxWalkSpeed captured at BeginPlay (Blueprint-tuned baseline) so structural
 	// speed effects (limp/crawl) always scale from the undamaged value.
 	float BaseMaxWalkSpeed = 0.f;
-
-public:
-	virtual void Tick(float DeltaTime) override;
 };

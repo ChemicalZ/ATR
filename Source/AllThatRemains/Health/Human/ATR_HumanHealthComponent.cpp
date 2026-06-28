@@ -73,7 +73,7 @@ void UATR_HumanHealthComponent::BeginPlay()
 {
 	Super::BeginPlay();
 
-	GetMutableDefault<UATR_HealthSettings>()->ValidateAndClamp();
+	// HealthSettings CDO already clamped in its PostInitProperties.
 	Settings = GetDefault<UATR_HealthSettings>();
 
 	// Resolve data tables once; null is fine (code defaults take over).
@@ -297,8 +297,12 @@ void UATR_HumanHealthComponent::ApplyImmediateEffects(const FATR_DamageEvent& Ev
 
 		if (RegionRow.LungDamageScale > 0.f)
 		{
-			// One lung takes the hit.
-			float& Lung = FMath::RandBool() ? Vitals.LeftLungFunction01 : Vitals.RightLungFunction01;
+			// One lung takes the hit. Branch explicitly instead of binding a
+			// non-const reference through a ternary to a UPROPERTY field — the
+			// ternary form would silently bypass any future Push-model dirty
+			// hook on the chosen Vitals member.
+			const bool bLeftLung = FMath::RandBool();
+			float& Lung = bLeftLung ? Vitals.LeftLungFunction01 : Vitals.RightLungFunction01;
 			Lung = Saturate(Lung - OrganDamage * RegionRow.LungDamageScale);
 
 			// Deep chest punctures collapse the lung.
@@ -651,10 +655,14 @@ void UATR_HumanHealthComponent::SlowTick(const float Dt)
 		Vitals.Infection01 = Saturate(Vitals.Infection01 + D.Definition->SepsisPressure * D.State.Severity01 * 0.0001f * Dt);
 	}
 
-	// Cured diseases: past onset with severity beaten down to zero.
+	// Cured diseases: past onset, severity beaten down to zero. The previous
+	// `Stage01 > 0.1f` gate left low-progression diseases stuck in the array
+	// forever (immune fight could drive Severity to 0 before Stage01 crossed
+	// the threshold, so neither cured nor curable). Past-incubation alone is
+	// the correct "infection took hold" predicate.
 	Diseases.RemoveAll([](const FATR_ActiveDisease& D)
 	{
-		return D.State.IncubationRemaining <= 0.f && D.State.Stage01 > 0.1f && D.State.Severity01 <= 0.f;
+		return D.State.IncubationRemaining <= 0.f && D.State.Severity01 <= 0.f;
 	});
 
 	const float ExertionScale = 1.f + Exertion01 + (bShivering ? 0.5f : 0.f);
@@ -1060,10 +1068,29 @@ void UATR_HumanHealthComponent::Consume(const float Hydration01, const float Cal
 	Survival.NutritionQuality01 = FMath::Lerp(Survival.NutritionQuality01, Saturate(Quality01), Weight);
 }
 
-void UATR_HumanHealthComponent::SetSleeping(const bool bAsleep) { bSleeping = bAsleep; }
-void UATR_HumanHealthComponent::SetEnvironment(const FATR_EnvironmentState& NewEnvironment) { Environment = NewEnvironment; }
-void UATR_HumanHealthComponent::AddWetness(const float Amount01) { Survival.Wetness01 = Saturate(Survival.Wetness01 + Amount01); }
-void UATR_HumanHealthComponent::NotifyExertion(const float Intensity01) { Exertion01 = FMath::Max(Exertion01, Saturate(Intensity01)); }
+// Survival/env inputs are server-authoritative — clients calling them would only
+// desync local state from the server simulation. Sibling APIs (ApplyDamageEvent,
+// AdministerSubstance, ApplyTransfusion, ContractDisease) already gate the same way.
+void UATR_HumanHealthComponent::SetSleeping(const bool bAsleep)
+{
+	if (!GetOwner() || !GetOwner()->HasAuthority()) return;
+	bSleeping = bAsleep;
+}
+void UATR_HumanHealthComponent::SetEnvironment(const FATR_EnvironmentState& NewEnvironment)
+{
+	if (!GetOwner() || !GetOwner()->HasAuthority()) return;
+	Environment = NewEnvironment;
+}
+void UATR_HumanHealthComponent::AddWetness(const float Amount01)
+{
+	if (!GetOwner() || !GetOwner()->HasAuthority()) return;
+	Survival.Wetness01 = Saturate(Survival.Wetness01 + Amount01);
+}
+void UATR_HumanHealthComponent::NotifyExertion(const float Intensity01)
+{
+	if (!GetOwner() || !GetOwner()->HasAuthority()) return;
+	Exertion01 = FMath::Max(Exertion01, Saturate(Intensity01));
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Conditions
@@ -1099,7 +1126,10 @@ void UATR_HumanHealthComponent::SetCondition(const EATR_ConditionType Type, cons
 	C.Region = Region;
 	C.Severity01 = Saturate(Severity01);
 	C.ProgressionRate = ProgressionRate;
-	C.RemainingDuration = Duration;
+	// Normalize duration to the documented invariant: < 0 = indefinite, > 0 = timed.
+	// A literal 0 from a caller would otherwise hit SlowTick's `RemainingDuration == 0`
+	// expiry branch immediately and silently delete the condition next bucket.
+	C.RemainingDuration = (Duration > 0.f) ? Duration : -1.f;
 	C.SourceWoundId = SourceWoundId;
 	Conditions.Add(C);
 
@@ -1331,6 +1361,14 @@ void UATR_HumanHealthComponent::RecalculateSubstanceTotals()
 // ─────────────────────────────────────────────────────────────────────────────
 // Death & helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+void UATR_HumanHealthComponent::DebugKill(const EATR_DeathCause Cause)
+{
+	if (GetOwner() && GetOwner()->HasAuthority())
+	{
+		Die(Cause == EATR_DeathCause::None ? EATR_DeathCause::CatastrophicTrauma : Cause);
+	}
+}
 
 void UATR_HumanHealthComponent::Die(const EATR_DeathCause Cause)
 {

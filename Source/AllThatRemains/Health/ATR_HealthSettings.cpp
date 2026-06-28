@@ -44,6 +44,13 @@ void UATR_HealthSettings::ValidateAndClamp()
 	DebugMeleeRange = FMath::Clamp(DebugMeleeRange, 10.f, 100000.f);
 }
 
+void UATR_HealthSettings::PostInitProperties()
+{
+	Super::PostInitProperties();
+	// Idempotent clamp at CDO init — runtime callers no longer need to re-validate.
+	ValidateAndClamp();
+}
+
 #if WITH_EDITOR
 void UATR_HealthSettings::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {

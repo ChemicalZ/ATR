@@ -206,6 +206,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Health|Debug")
 	FString GetDebugString() const;
 
+	// Force death immediately (authority only). For verifying the death/respawn
+	// flow without waiting out the realistic bleed-out + grace timers. Routed from
+	// the pawn's `ATR_Kill` console exec.
+	UFUNCTION(BlueprintCallable, Category = "Health|Debug")
+	void DebugKill(EATR_DeathCause Cause = EATR_DeathCause::CatastrophicTrauma);
+
 private:
 	// ── Simulation buckets (see Update Frequencies in the design doc) ──────
 

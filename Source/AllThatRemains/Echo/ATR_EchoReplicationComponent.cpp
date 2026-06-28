@@ -22,10 +22,9 @@ void UATR_EchoReplicationComponent::BeginPlay()
 {
 	Super::BeginPlay();
 
-	UATR_EchoSettings* Settings = GetMutableDefault<UATR_EchoSettings>();
+	// Settings CDO already clamped in UATR_EchoSettings::PostInitProperties.
+	const UATR_EchoSettings* Settings = GetDefault<UATR_EchoSettings>();
 	if (!Settings) return;
-
-	Settings->ValidateAndClamp();
 
 	NearSnapshotHz = Settings->NearSnapshotHz;
 	MidSnapshotHz  = Settings->MidSnapshotHz;
@@ -292,7 +291,10 @@ void UATR_EchoReplicationComponent::Client_EchoSnapshotChunk_Implementation(cons
 		TArray<uint16> ToRemove;
 		for (auto& Pair : PendingChunks)
 		{
-			if (static_cast<uint16>(Chunk.Sequence - Pair.Key) > 4)
+			// Signed diff: out-of-order arrivals (Chunk older than Pair) would
+			// wrap to a huge positive uint16 and falsely prune still-assembling
+			// chunks. int16 gives -32768..32767 — only "ahead by >4" matches.
+			if (static_cast<int16>(Chunk.Sequence - Pair.Key) > 4)
 			{
 				if (Pair.Value.ExpectedChunkCount > 0 &&
 				    Pair.Value.ReceivedChunkIndices.Num() < Pair.Value.ExpectedChunkCount)

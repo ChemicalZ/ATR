@@ -5,6 +5,7 @@
 #include "ATR_EchoAILog.h"
 #include "../ATR_ActiveEcho.h"
 #include "../ATR_EchoSettings.h"
+#include "../../Player/ATR_Player.h"
 #include "StateTreeExecutionContext.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 
@@ -36,7 +37,14 @@ EStateTreeRunStatus FATR_EchoMeleeTask::Tick(FStateTreeExecutionContext& Context
 	AATR_EchoAIController* AIC = Cast<AATR_EchoAIController>(Context.GetOwner());
 	AATR_ActiveEcho* Pawn = AIC ? Cast<AATR_ActiveEcho>(AIC->GetPawn()) : nullptr;
 	if (!Pawn)
-		return EStateTreeRunStatus::Running; // can't act this frame; keep the move task driving
+	{
+		// Designed concurrent behavior: the move task drives even when this task
+		// can't act yet (waiting on possess). Visible at VeryVerbose so a stuck
+		// echo "in Melee but unpossessed" doesn't have to be guessed at.
+		UE_LOG(LogATR_EchoAI, VeryVerbose, TEXT("EchoMelee[%d]: tick without pawn — skipping"),
+			AIC ? AIC->GetEchoId() : INDEX_NONE);
+		return EStateTreeRunStatus::Running;
+	}
 
 	const int32 EchoId = AIC ? AIC->GetEchoId() : INDEX_NONE;
 
@@ -48,6 +56,8 @@ EStateTreeRunStatus FATR_EchoMeleeTask::Tick(FStateTreeExecutionContext& Context
 			Data.Grip     = EATR_EchoGripType::None;
 			Pawn->bBlockDemotion = false;
 			Pawn->NotifyGrabReleased();
+			if (AATR_Player* GrabbedPlayer = Cast<AATR_Player>(Data.Target))
+				GrabbedPlayer->UnregisterGrab(Pawn);
 			UE_LOG(LogATR_EchoAI, Verbose, TEXT("EchoMelee[%d]: RELEASE grab (%s)"), EchoId, Why);
 		}
 	};
@@ -89,6 +99,8 @@ EStateTreeRunStatus FATR_EchoMeleeTask::Tick(FStateTreeExecutionContext& Context
 			Data.GrabStartTime = Now;
 			Data.Grip          = Pawn->CurrentGrip; // resolved by TryGrabTarget_Implementation
 			Pawn->bBlockDemotion = true; // don't demote mid-grab
+			if (AATR_Player* GrabbedPlayer = Cast<AATR_Player>(Target))
+				GrabbedPlayer->RegisterGrab(Pawn, Pawn->CurrentGrip); // player applies drag/pull + owns the struggle
 			UE_LOG(LogATR_EchoAI, Verbose, TEXT("EchoMelee[%d]: GRAB %s (dist %.0f cm)"),
 				EchoId, *GetNameSafe(Target), Dist);
 		}
@@ -138,6 +150,8 @@ void FATR_EchoMeleeTask::ExitState(FStateTreeExecutionContext& Context, const FS
 			{
 				Pawn->bBlockDemotion = false;
 				Pawn->NotifyGrabReleased();
+				if (AATR_Player* GrabbedPlayer = Cast<AATR_Player>(Data.Target))
+					GrabbedPlayer->UnregisterGrab(Pawn);
 			}
 		Data.bGrabbed = false;
 		Data.Grip     = EATR_EchoGripType::None;

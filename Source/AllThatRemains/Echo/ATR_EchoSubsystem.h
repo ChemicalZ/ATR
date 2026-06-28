@@ -226,7 +226,7 @@ public:
 	float MustPromoteRadius = 800.f;
 
 	UPROPERTY(BlueprintReadOnly, Category = "Echo|Config")
-	float HordeWalkSpeed = 120.f;
+	float HordeWalkSpeed = 90.f;
 
 	UPROPERTY(BlueprintReadOnly, Category = "Echo|Config")
 	float PromoteRadius = 2500.f;
